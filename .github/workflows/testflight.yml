@@ -13,11 +13,6 @@ on:
   push:
     branches:
       - claude/build-project-br5tJ
-    paths-ignore:
-      - "**/*.md"
-      - "icons/**"
-      - "screen.png"
-      - "quick_link.py"
 
 concurrency:
   group: testflight-${{ github.ref }}
