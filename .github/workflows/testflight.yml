@@ -120,13 +120,14 @@ jobs:
 
       - name: Resolve Swift package dependencies
         run: |
-          set -eux
+          set -euxo pipefail
+          mkdir -p build/logs
           xcodebuild \
             -project "$WORKSPACE_PROJECT" \
             -scheme "$SCHEME" \
             -configuration "$CONFIGURATION" \
             -derivedDataPath "$DERIVED_DATA" \
-            -resolvePackageDependencies
+            -resolvePackageDependencies 2>&1 | tee build/logs/resolve.log
 
       - name: Archive
         env:
@@ -134,8 +135,8 @@ jobs:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         run: |
-          set -eux
-          mkdir -p build
+          set -euxo pipefail
+          mkdir -p build/logs
           xcodebuild \
             -project "$WORKSPACE_PROJECT" \
             -scheme "$SCHEME" \
@@ -151,7 +152,17 @@ jobs:
             CODE_SIGN_STYLE=Automatic \
             CURRENT_PROJECT_VERSION="${{ steps.ver.outputs.build_number }}" \
             ENABLE_USER_SCRIPT_SANDBOXING=NO \
-            archive
+            archive 2>&1 | tee build/logs/archive.log
+
+      - name: Tail archive log on failure
+        if: failure()
+        run: |
+          echo "::group::archive.log (last 400 lines)"
+          tail -n 400 build/logs/archive.log || true
+          echo "::endgroup::"
+          echo "::group::error/warning lines from archive.log"
+          grep -nE 'error:|warning:|Code Sign|Provisioning|fatal|failed|^\*\* ' build/logs/archive.log | tail -n 200 || true
+          echo "::endgroup::"
 
       - name: Generate exportOptions.plist
         env:
@@ -185,7 +196,8 @@ jobs:
           ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
         run: |
-          set -eux
+          set -euxo pipefail
+          mkdir -p build/logs
           xcodebuild \
             -exportArchive \
             -archivePath "$ARCHIVE_PATH" \
@@ -194,10 +206,22 @@ jobs:
             -allowProvisioningUpdates \
             -authenticationKeyPath "$ASC_KEY_PATH" \
             -authenticationKeyID "$ASC_KEY_ID" \
-            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" 2>&1 | tee build/logs/export.log
           ls -la "$EXPORT_DIR"
 
+      - name: Upload build logs artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            build/logs/**
+            build/exportOptions.plist
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Upload IPA artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: TurnBridge-ipa
