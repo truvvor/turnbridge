@@ -27,8 +27,8 @@ jobs:
       SCHEME: TurnBridge
       CONFIGURATION: Release
       WORKSPACE_PROJECT: TurnBridge.xcodeproj
-      APP_BUNDLE_ID: com.netlab.TurnBridge
-      EXT_BUNDLE_ID: com.netlab.TurnBridge.network-extension
+      APP_BUNDLE_ID: com.truvvor.turnbridge
+      EXT_BUNDLE_ID: com.truvvor.turnbridge.network-extension
       ARCHIVE_PATH: build/TurnBridge.xcarchive
       EXPORT_DIR: build/export
       DERIVED_DATA: build/DerivedData

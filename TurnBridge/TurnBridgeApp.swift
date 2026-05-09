@@ -29,7 +29,7 @@ struct TurnBridge: App {
             SharedLogger.debug("Using \(preExistingTunnelManager != nil ? "existing" : "new") tunnel manager")
 
             let protocolConfiguration = NETunnelProviderProtocol()
-            let currentAppBundleId = Bundle.main.bundleIdentifier ?? "com.netlab.TurnBridge"
+            let currentAppBundleId = Bundle.main.bundleIdentifier ?? "com.truvvor.turnbridge"
             protocolConfiguration.providerBundleIdentifier = "\(currentAppBundleId).network-extension"
 
             let cleanIP = peerAddr.components(separatedBy: ":").first ?? peerAddr
