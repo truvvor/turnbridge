@@ -1,0 +1,237 @@
+name: Build & TestFlight
+
+on:
+  workflow_dispatch:
+    inputs:
+      lane:
+        description: "What to do"
+        type: choice
+        default: upload
+        options:
+          - build-only
+          - upload
+  push:
+    branches:
+      - claude/build-project-br5tJ
+    paths-ignore:
+      - "**/*.md"
+      - "icons/**"
+      - "screen.png"
+      - "quick_link.py"
+
+concurrency:
+  group: testflight-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Archive & upload to TestFlight
+    runs-on: [self-hosted, macOS, ARM64]
+
+    env:
+      SCHEME: TurnBridge
+      CONFIGURATION: Release
+      WORKSPACE_PROJECT: TurnBridge.xcodeproj
+      APP_BUNDLE_ID: com.netlab.TurnBridge
+      EXT_BUNDLE_ID: com.netlab.TurnBridge.network-extension
+      ARCHIVE_PATH: build/TurnBridge.xcarchive
+      EXPORT_DIR: build/export
+      DERIVED_DATA: build/DerivedData
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Show toolchain
+        run: |
+          set -eux
+          sw_vers
+          xcode-select -p
+          xcodebuild -version
+          /usr/bin/which go && go version || true
+          /usr/bin/which make
+
+      - name: Ensure Go is on PATH for build script
+        run: |
+          set -eux
+          if ! command -v go >/dev/null 2>&1; then
+            echo "Go not found, installing via Homebrew"
+            brew install go
+          fi
+          echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+
+      - name: Decide whether to upload
+        id: mode
+        run: |
+          set -eux
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "upload=${{ github.event.inputs.lane == 'upload' }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "upload=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute build number
+        id: ver
+        run: |
+          set -eux
+          # Use a monotonically increasing build number from the run id.
+          # GITHUB_RUN_NUMBER is per-workflow and resets if the workflow is
+          # recreated, so add a base offset to stay above the App Store Connect
+          # high-water mark.
+          BASE=${TESTFLIGHT_BUILD_BASE:-100}
+          BUILD_NUMBER=$((BASE + GITHUB_RUN_NUMBER))
+          echo "build_number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "Using CFBundleVersion=$BUILD_NUMBER"
+
+      - name: Provision App Store Connect API key
+        if: steps.mode.outputs.upload == 'true'
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_KEY_P8_BASE64: ${{ secrets.ASC_KEY_P8_BASE64 }}
+        run: |
+          set -eu
+          if [ -z "${ASC_KEY_ID}" ] || [ -z "${ASC_KEY_P8_BASE64}" ]; then
+            echo "Missing ASC_KEY_ID or ASC_KEY_P8_BASE64 secret" >&2
+            exit 1
+          fi
+          KEY_DIR="$RUNNER_TEMP/asc_keys"
+          mkdir -p "$KEY_DIR"
+          KEY_PATH="$KEY_DIR/AuthKey_${ASC_KEY_ID}.p8"
+          printf '%s' "$ASC_KEY_P8_BASE64" | base64 --decode > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          echo "ASC_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+          # Also place a copy where xcrun altool / Transporter look by default
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          cp "$KEY_PATH" "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+          chmod 600 "$HOME/.appstoreconnect/private_keys/AuthKey_${ASC_KEY_ID}.p8"
+
+      - name: Sanity-check required secrets
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+        run: |
+          set -eu
+          missing=0
+          for v in APPLE_TEAM_ID ASC_ISSUER_ID ASC_KEY_ID; do
+            if [ -z "$(printenv $v)" ]; then
+              echo "::error::Secret $v is not set"
+              missing=1
+            fi
+          done
+          [ $missing -eq 0 ]
+
+      - name: Resolve Swift package dependencies
+        run: |
+          set -eux
+          xcodebuild \
+            -project "$WORKSPACE_PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration "$CONFIGURATION" \
+            -derivedDataPath "$DERIVED_DATA" \
+            -resolvePackageDependencies
+
+      - name: Archive
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -eux
+          mkdir -p build
+          xcodebuild \
+            -project "$WORKSPACE_PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration "$CONFIGURATION" \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$DERIVED_DATA" \
+            -archivePath "$ARCHIVE_PATH" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CODE_SIGN_STYLE=Automatic \
+            CURRENT_PROJECT_VERSION="${{ steps.ver.outputs.build_number }}" \
+            ENABLE_USER_SCRIPT_SANDBOXING=NO \
+            archive
+
+      - name: Generate exportOptions.plist
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -eu
+          cat > build/exportOptions.plist <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>app-store-connect</string>
+            <key>destination</key>
+            <string>export</string>
+            <key>signingStyle</key>
+            <string>automatic</string>
+            <key>teamID</key>
+            <string>${APPLE_TEAM_ID}</string>
+            <key>stripSwiftSymbols</key>
+            <true/>
+            <key>uploadSymbols</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+
+      - name: Export IPA
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -eux
+          xcodebuild \
+            -exportArchive \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportOptionsPlist build/exportOptions.plist \
+            -exportPath "$EXPORT_DIR" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+          ls -la "$EXPORT_DIR"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TurnBridge-ipa
+          path: build/export/*.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload to TestFlight
+        if: steps.mode.outputs.upload == 'true'
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -eux
+          IPA_PATH=$(ls "$EXPORT_DIR"/*.ipa | head -n1)
+          if [ -z "$IPA_PATH" ]; then
+            echo "::error::No IPA produced in $EXPORT_DIR"
+            exit 1
+          fi
+          xcrun altool \
+            --upload-app \
+            --type ios \
+            --file "$IPA_PATH" \
+            --apiKey "$ASC_KEY_ID" \
+            --apiIssuer "$ASC_ISSUER_ID"
+
+      - name: Cleanup ASC key
+        if: always()
+        run: |
+          set -eu
+          rm -f "$HOME/.appstoreconnect/private_keys/AuthKey_${{ secrets.ASC_KEY_ID }}.p8" || true
+          rm -rf "$RUNNER_TEMP/asc_keys" || true
