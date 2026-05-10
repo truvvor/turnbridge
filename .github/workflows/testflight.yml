@@ -118,6 +118,34 @@ jobs:
           done
           [ $missing -eq 0 ]
 
+      - name: Unlock login keychain for codesign
+        env:
+          MAC_KEYCHAIN_PASSWORD: ${{ secrets.MAC_KEYCHAIN_PASSWORD }}
+        run: |
+          set -eu
+          if [ -z "${MAC_KEYCHAIN_PASSWORD:-}" ]; then
+            echo "::error::MAC_KEYCHAIN_PASSWORD secret is not set"
+            echo "::error::Add the macOS login password of the runner user '$USER' as repo secret MAC_KEYCHAIN_PASSWORD"
+            exit 1
+          fi
+          KEYCHAIN_PATH="$HOME/Library/Keychains/login.keychain-db"
+          if [ ! -f "$KEYCHAIN_PATH" ]; then
+            # Fallback: take the first user keychain that exists
+            KEYCHAIN_PATH=$(security list-keychains -d user | sed -e 's/^[[:space:]]*"//' -e 's/"$//' | head -n1)
+          fi
+          echo "Using keychain: $KEYCHAIN_PATH"
+          # Keep it unlocked for the duration of the build
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$MAC_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          # Allow codesign / productbuild / other Apple tools to use private keys
+          # without an interactive UI prompt
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$MAC_KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH" >/dev/null
+          # Make sure it is in the user search list
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+
       - name: Resolve Swift package dependencies
         run: |
           set -euxo pipefail
