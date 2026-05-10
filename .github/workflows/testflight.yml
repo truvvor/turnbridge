@@ -122,29 +122,57 @@ jobs:
         env:
           MAC_KEYCHAIN_PASSWORD: ${{ secrets.MAC_KEYCHAIN_PASSWORD }}
         run: |
-          set -eu
+          set -u
           if [ -z "${MAC_KEYCHAIN_PASSWORD:-}" ]; then
             echo "::error::MAC_KEYCHAIN_PASSWORD secret is not set"
             echo "::error::Add the macOS login password of the runner user '$USER' as repo secret MAC_KEYCHAIN_PASSWORD"
             exit 1
           fi
+
           KEYCHAIN_PATH="$HOME/Library/Keychains/login.keychain-db"
           if [ ! -f "$KEYCHAIN_PATH" ]; then
-            # Fallback: take the first user keychain that exists
             KEYCHAIN_PATH=$(security list-keychains -d user | sed -e 's/^[[:space:]]*"//' -e 's/"$//' | head -n1)
           fi
           echo "Using keychain: $KEYCHAIN_PATH"
-          # Keep it unlocked for the duration of the build
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          echo "Current user search list:"
+          security list-keychains -d user
+
+          # 1. Unlock first — every other security op needs an unlocked keychain
           security unlock-keychain -p "$MAC_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          # Allow codesign / productbuild / other Apple tools to use private keys
-          # without an interactive UI prompt
+          rc=$?
+          echo "unlock-keychain rc=$rc"
+          if [ $rc -ne 0 ]; then
+            echo "::error::Failed to unlock keychain. The MAC_KEYCHAIN_PASSWORD secret does not match the password of $KEYCHAIN_PATH"
+            echo "::error::Verify by running on the runner: security unlock-keychain $KEYCHAIN_PATH (interactive). If that succeeds, refresh the secret value."
+            exit $rc
+          fi
+
+          # 2. Keep the keychain unlocked for the rest of the build (6h)
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH" || \
+            echo "::warning::set-keychain-settings rc=$? (non-fatal)"
+
+          # 3. Make sure the login keychain is in the user search list (additive — do not drop System.keychain etc)
+          EXISTING=$(security list-keychains -d user | tr -d '"' | xargs)
+          if ! printf '%s\n' $EXISTING | grep -Fxq "$KEYCHAIN_PATH"; then
+            security list-keychains -d user -s $EXISTING "$KEYCHAIN_PATH"
+            echo "Added $KEYCHAIN_PATH to user search list"
+          fi
+          security default-keychain -d user -s "$KEYCHAIN_PATH" || true
+
+          # 4. Allow codesign / productbuild / other Apple tools to access private keys without UI prompts
+          set +e
           security set-key-partition-list \
-            -S apple-tool:,apple:,codesign: \
+            -S apple-tool:,apple:,codesign:,productbuild: \
             -s -k "$MAC_KEYCHAIN_PASSWORD" \
-            "$KEYCHAIN_PATH" >/dev/null
-          # Make sure it is in the user search list
-          security list-keychains -d user -s "$KEYCHAIN_PATH"
+            "$KEYCHAIN_PATH" >/dev/null 2>&1
+          rc=$?
+          set -e
+          echo "set-key-partition-list rc=$rc"
+          if [ $rc -ne 0 ]; then
+            echo "::warning::set-key-partition-list rc=$rc — codesign may still prompt; continuing"
+          fi
+
+          echo "Keychain ready"
 
       - name: Resolve Swift package dependencies
         run: |
