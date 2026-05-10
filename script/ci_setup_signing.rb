@@ -29,6 +29,7 @@ require 'uri'
 require 'fileutils'
 require 'time'
 require 'cgi'
+require 'shellwords'
 
 KEY_ID         = ENV.fetch('ASC_KEY_ID')
 ISSUER_ID      = ENV.fetch('ASC_ISSUER_ID')
@@ -152,14 +153,55 @@ def import_p12!(p12_path)
          '-s', '-k', KEYCHAIN_PASS, KEYCHAIN)
 end
 
+def keychain_distribution_sha1s
+  out = `security find-identity -v -p codesigning #{Shellwords.escape(KEYCHAIN)} 2>/dev/null`
+  out.lines.grep(/Apple Distribution/i).map { |l| l[/[0-9A-F]{40}/] }.compact.map(&:upcase)
+end
+
 cert_resource_id = nil
+cert_sha1 = nil
 api_certs = list_distribution_certificates
-api_certs.each do |c|
-  cer_content = c.dig('attributes', 'certificateContent')
-  next unless cer_content && cert_matches_key?(cer_content, CERT_KEY_PEM)
-  cert_resource_id = c['id']
-  puts "Reusing Distribution cert #{c['id']} (matches cached private key)"
-  break
+
+# Strategy 1: prefer a Distribution cert that already exists in the login
+# keychain (i.e. its private key is locally available) AND is registered in
+# App Store Connect. This avoids creating duplicates if the user already had
+# a working signing identity from a previous Xcode session.
+keychain_sha1s = keychain_distribution_sha1s
+unless keychain_sha1s.empty?
+  best = nil
+  api_certs.each do |c|
+    cer_b64 = c.dig('attributes', 'certificateContent')
+    next unless cer_b64
+    sha1 = OpenSSL::Digest::SHA1.hexdigest(Base64.decode64(cer_b64)).upcase
+    next unless keychain_sha1s.include?(sha1)
+    exp = Time.parse(c.dig('attributes', 'expirationDate')) rescue Time.now
+    if best.nil? || exp > best[:exp]
+      best = { cert: c, sha1: sha1, exp: exp }
+    end
+  end
+
+  if best
+    cert_resource_id = best[:cert]['id']
+    cert_sha1 = best[:sha1]
+    cn = OpenSSL::X509::Certificate.new(Base64.decode64(best[:cert].dig('attributes', 'certificateContent')))
+                                    .subject.to_a.find { |f| f[0] == 'CN' }&.[](1)
+    puts "Using existing keychain Distribution cert (CN=#{cn}, api_id=#{cert_resource_id}, sha1=#{cert_sha1})"
+  end
+end
+
+# Strategy 2: an earlier run of this script created and cached a cert; reuse if it's still in API.
+if cert_resource_id.nil?
+  api_certs.each do |c|
+    cer_content = c.dig('attributes', 'certificateContent')
+    next unless cer_content && cert_matches_key?(cer_content, CERT_KEY_PEM)
+    cert_resource_id = c['id']
+    cert_sha1 = OpenSSL::Digest::SHA1.hexdigest(Base64.decode64(cer_content)).upcase
+    puts "Reusing API cert that matches cached key: #{c['id']} (sha1=#{cert_sha1})"
+    if File.exist?(CERT_P12)
+      import_p12!(CERT_P12)
+    end
+    break
+  end
 end
 
 if cert_resource_id.nil?
@@ -198,6 +240,7 @@ if cert_resource_id.nil?
   cer_b64  = data.dig('attributes', 'certificateContent')
   cer_der  = Base64.decode64(cer_b64)
   cer_x509 = OpenSSL::X509::Certificate.new(cer_der)
+  cert_sha1 = OpenSSL::Digest::SHA1.hexdigest(cer_der).upcase
 
   File.write(CERT_KEY_PEM, priv.to_pem)
   File.write(CERT_CER_PEM, cer_x509.to_pem)
@@ -206,16 +249,6 @@ if cert_resource_id.nil?
 
   import_p12!(CERT_P12)
   puts "Distribution cert ready: #{cert_resource_id}"
-else
-  if File.exist?(CERT_P12)
-    import_p12!(CERT_P12)
-  else
-    priv = OpenSSL::PKey::RSA.new(File.read(CERT_KEY_PEM))
-    cer  = OpenSSL::X509::Certificate.new(File.read(CERT_CER_PEM))
-    p12  = OpenSSL::PKCS12.create(P12_PASSWORD, 'Apple Distribution', priv, cer)
-    File.binwrite(CERT_P12, p12.to_der)
-    import_p12!(CERT_P12)
-  end
 end
 
 # -----------------------------------------------------------------------
@@ -313,6 +346,7 @@ if (gh_env = ENV['GITHUB_ENV'])
   File.open(gh_env, 'a') do |f|
     f.puts "PROFILE_APP_NAME=#{results[APP_BID][:name]}"
     f.puts "PROFILE_EXT_NAME=#{results[EXT_BID][:name]}"
+    f.puts "SIGNING_CERT_SHA1=#{cert_sha1}" if cert_sha1
   end
 end
 

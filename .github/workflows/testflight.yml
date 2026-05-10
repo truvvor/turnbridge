@@ -250,7 +250,7 @@ jobs:
             <key>teamID</key>
             <string>${APPLE_TEAM_ID}</string>
             <key>signingCertificate</key>
-            <string>Apple Distribution</string>
+            <string>${SIGNING_CERT_SHA1}</string>
             <key>provisioningProfiles</key>
             <dict>
               <key>${APP_BUNDLE_ID}</key>
