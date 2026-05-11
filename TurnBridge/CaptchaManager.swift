@@ -1,6 +1,7 @@
 import Foundation
 import NetworkExtension
 import UIKit
+import Combine
 
 @MainActor
 final class CaptchaManager: ObservableObject {
@@ -40,7 +41,8 @@ final class CaptchaManager: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
+            guard let self = self else { return }
+            Task { @MainActor in self.refresh() }
         }
 
         refresh()

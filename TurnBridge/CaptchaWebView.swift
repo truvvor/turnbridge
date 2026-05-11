@@ -1,5 +1,6 @@
 import SwiftUI
 import WebKit
+import Combine
 
 /// Sheet that loads the VK captcha page in a WKWebView, watches XHR / URL
 /// activity for a `success_token`, and reports the result back via
