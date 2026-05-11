@@ -13,7 +13,7 @@ struct GlobalSettingsView: View {
                 Toggle(isOn: $manualCaptcha) {
                     VStack(alignment: .leading) {
                         Text("Solve captcha manually")
-                        Text("Skip the auto-solver and show the VK challenge in a browser sheet instead.")
+                        Text("Show the VK challenge in a browser sheet instead of running the auto solver. Disables the kill switch (includeAllNetworks) for the session — required so the captcha page can load while the tunnel is still coming up.")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }

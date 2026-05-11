@@ -68,12 +68,19 @@ struct TurnBridge: App {
             let excludeCellular = defaults.object(forKey: "excludeCellularServices") as? Bool ?? false
             let excludeLAN = defaults.object(forKey: "excludeLocalNetworks") as? Bool ?? true
 
-            protocolConfiguration.includeAllNetworks = true
+            // Manual captcha mode needs the captcha web view in the main app
+            // to actually reach the internet *while the tunnel is still
+            // coming up*. iOS enforces includeAllNetworks strictly during the
+            // Connecting phase too, so leaving it on means the WebView can
+            // never load id.vk.ru to ask the user. Trade kill-switch for
+            // captcha solvability when this mode is on.
+            let manualCaptcha = ManualCaptchaSetting.isEnabled
+            protocolConfiguration.includeAllNetworks = !manualCaptcha
             protocolConfiguration.excludeAPNs = excludeAPNs
             protocolConfiguration.excludeCellularServices = excludeCellular
             protocolConfiguration.excludeLocalNetworks = excludeLAN
 
-            SharedLogger.debug("Routing: LAN=\(excludeLAN), APNs=\(excludeAPNs), Cellular=\(excludeCellular)")
+            SharedLogger.debug("Routing: includeAll=\(!manualCaptcha) (manualCaptcha=\(manualCaptcha)), LAN=\(excludeLAN), APNs=\(excludeAPNs), Cellular=\(excludeCellular)")
 
             tunnelManager.protocolConfiguration = protocolConfiguration
             tunnelManager.isEnabled = true
