@@ -37,7 +37,9 @@ struct CaptchaWebView: View {
                     },
                     onStatus: { s in status = s }
                 )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .navigationTitle("Verify human")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -52,7 +54,11 @@ struct CaptchaWebView: View {
                     }
                 }
             }
+            .onAppear {
+                SharedLogger.info("Captcha sheet appeared. redirect_uri=\(redirectUri)", source: .app)
+            }
         }
+        .navigationViewStyle(.stack)
     }
 }
 
@@ -83,12 +89,20 @@ private struct CaptchaWKWebView: UIViewRepresentable {
         }
         config.websiteDataStore = .nonPersistent()
 
-        let webView = WKWebView(frame: .zero, configuration: config)
+        let webView = WKWebView(frame: UIScreen.main.bounds, configuration: config)
         webView.navigationDelegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = true
+        webView.backgroundColor = .systemBackground
+        webView.scrollView.backgroundColor = .systemBackground
+        webView.isOpaque = true
 
         if let url = url {
+            SharedLogger.info("CaptchaWebView loading URL: \(url.absoluteString)", source: .app)
+            onStatus("Loading…")
             webView.load(URLRequest(url: url))
+        } else {
+            SharedLogger.error("CaptchaWebView: URL is nil — won't load", source: .app)
+            onStatus("Bad captcha URL")
         }
         return webView
     }
@@ -137,6 +151,29 @@ private struct CaptchaWKWebView: UIViewRepresentable {
                 }
             }
             decisionHandler(.allow)
+        }
+
+        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+            onStatus("Loading captcha…")
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            SharedLogger.info("CaptchaWebView: page finished loading: \(webView.url?.absoluteString ?? "?")", source: .app)
+            onStatus("Solve the VK challenge below")
+        }
+
+        func webView(_ webView: WKWebView,
+                     didFail navigation: WKNavigation!,
+                     withError error: Error) {
+            SharedLogger.error("CaptchaWebView: navigation failed: \(error.localizedDescription)", source: .app)
+            onStatus("Failed: \(error.localizedDescription)")
+        }
+
+        func webView(_ webView: WKWebView,
+                     didFailProvisionalNavigation navigation: WKNavigation!,
+                     withError error: Error) {
+            SharedLogger.error("CaptchaWebView: provisional navigation failed: \(error.localizedDescription)", source: .app)
+            onStatus("Failed: \(error.localizedDescription)")
         }
 
         private func tokenFromURL(_ url: URL) -> String {
