@@ -7,10 +7,30 @@ import NetworkExtension
 
 @main
 struct TurnBridge: App {
+    @StateObject private var captchaManager = CaptchaManager.shared
+
     var body: some Scene {
         WindowGroup {
             ContentView(app: self)
+                .onAppear { captchaManager.start() }
+                .sheet(item: Binding(
+                    get: { captchaManager.pending.map(IdentifiedCaptcha.init) },
+                    set: { newValue in
+                        if newValue == nil {
+                            Task { await captchaManager.cancel(reason: "sheet dismissed") }
+                        }
+                    }
+                )) { identified in
+                    CaptchaWebView(redirectUri: identified.request.redirectUri,
+                                   manager: captchaManager)
+                        .interactiveDismissDisabled()
+                }
         }
+    }
+
+    private struct IdentifiedCaptcha: Identifiable {
+        let request: CaptchaIPC.PendingRequest
+        var id: String { request.requestId }
     }
     
     func turnOnTunnel(vkLink: String, peerAddr: String, listenAddr: String, nValue: Int, wgQuickConfig: String, completionHandler: @escaping (Bool) -> Void) {

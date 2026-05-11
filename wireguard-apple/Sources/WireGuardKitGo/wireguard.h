@@ -37,4 +37,10 @@ extern void StopProxy(void);
 extern void ProxySetLogger(void *context, logger_fn_t logger_fn);
 extern int ProxyWaitReady(int timeoutMs);
 
+typedef void (*manual_captcha_cb_t)(const char *request_id, const char *redirect_uri);
+extern void TurnBridgeSetManualCaptchaCallback(manual_captcha_cb_t cb);
+extern void TurnBridgeSubmitManualCaptchaToken(const char *request_id, const char *token);
+extern void TurnBridgeCancelManualCaptcha(const char *request_id, const char *reason);
+extern void TurnBridgeSetManualCaptchaMode(int enabled);
+
 #endif

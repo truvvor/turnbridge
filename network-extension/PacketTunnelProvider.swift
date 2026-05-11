@@ -81,6 +81,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         SharedLogger.info("Starting TURN proxy...", source: .tunnel)
 
         ProxySetLogger(nil, goProxyCLoggerCallback)
+        CaptchaBridge.install()
+
+        let manualCaptchaEnabled = UserDefaults(suiteName: CaptchaIPC.appGroupID)?
+            .bool(forKey: "manualCaptcha") ?? false
+        TurnBridgeSetManualCaptchaMode(manualCaptchaEnabled ? 1 : 0)
+        SharedLogger.info("Captcha mode: \(manualCaptchaEnabled ? "manual (browser sheet)" : "auto (in-tunnel solver)")", source: .tunnel)
 
         DispatchQueue.global(qos: .userInteractive).async {
             StartProxy(vkLink, peerAddr, listenAddr, nValue)
@@ -140,9 +146,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     
 
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
-        if let handler = completionHandler {
-            handler(messageData)
-        }
+        let response = CaptchaBridge.handleAppMessage(messageData) ?? messageData
+        completionHandler?(response)
     }
 
     override func sleep(completionHandler: @escaping () -> Void) {

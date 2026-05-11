@@ -5,8 +5,24 @@ struct GlobalSettingsView: View {
     @AppStorage("excludeCellularServices") private var excludeCellularServices = false
     @AppStorage("excludeLocalNetworks") private var excludeLocalNetworks = true
 
+    @State private var manualCaptcha: Bool = ManualCaptchaSetting.isEnabled
+
     var body: some View {
         Form {
+            Section(header: Text("Captcha")) {
+                Toggle(isOn: $manualCaptcha) {
+                    VStack(alignment: .leading) {
+                        Text("Solve captcha manually")
+                        Text("Skip the auto-solver and show the VK challenge in a browser sheet instead.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .onChange(of: manualCaptcha) { newValue in
+                    ManualCaptchaSetting.isEnabled = newValue
+                }
+            }
+
             Section(header: Text("General")) {
                 NavigationLink(destination: AboutView()) {
                     Label(
