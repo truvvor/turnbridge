@@ -88,17 +88,23 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         TurnBridgeSetManualCaptchaMode(manualCaptchaEnabled ? 1 : 0)
         SharedLogger.info("Captcha mode: \(manualCaptchaEnabled ? "manual (browser sheet)" : "auto (in-tunnel solver)")", source: .tunnel)
 
+        // Manual captcha is human-driven, so give the user time to actually
+        // solve the challenge before declaring DTLS dead. Auto mode keeps
+        // the original 12s budget — if the solver can't bash through in
+        // that window something else is wrong and we want fast failure.
+        let dtlsReadyTimeoutMs: Int32 = manualCaptchaEnabled ? 300_000 : 12_000
+
         DispatchQueue.global(qos: .userInteractive).async {
             StartProxy(vkLink, peerAddr, listenAddr, nValue)
         }
 
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
-            let ready = ProxyWaitReady(12000)
+            let ready = ProxyWaitReady(dtlsReadyTimeoutMs)
             guard let self = self else { return }
 
             if ready == 0 {
                 sharedLogger.error("DTLS connection timeout!")
-                SharedLogger.error("DTLS connection timeout (12s)", source: .tunnel)
+                SharedLogger.error("DTLS connection timeout (\(dtlsReadyTimeoutMs / 1000)s)", source: .tunnel)
                 completionHandler(PacketTunnelProviderError.invalidProtocolConfiguration)
                 return
             }
