@@ -43,6 +43,43 @@ var proxyLoggerFunc C.proxy_logger_fn_t
 var proxyLoggerCtx unsafe.Pointer
 var proxyCancel context.CancelFunc
 
+// Session registry — every live DTLS/TURN session registers its
+// cancel func so ProxyForceReconnect() can tear them all down at once
+// (e.g. when iOS wakes the device after sleep and we want fresh
+// allocations before WireGuard resumes pumping packets).
+var (
+	sessionMu       sync.Mutex
+	sessionCancels  = map[uint64]context.CancelFunc{}
+	sessionIDSource uint64
+)
+
+func registerSession(cancel context.CancelFunc) func() {
+	id := atomic.AddUint64(&sessionIDSource, 1)
+	sessionMu.Lock()
+	sessionCancels[id] = cancel
+	sessionMu.Unlock()
+	return func() {
+		sessionMu.Lock()
+		delete(sessionCancels, id)
+		sessionMu.Unlock()
+	}
+}
+
+//export ProxyForceReconnect
+func ProxyForceReconnect() {
+	sessionMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(sessionCancels))
+	for _, c := range sessionCancels {
+		cancels = append(cancels, c)
+	}
+	sessionMu.Unlock()
+	for _, c := range cancels {
+		c()
+	}
+	log.Printf("ProxyForceReconnect: cancelled %d live session(s)", len(cancels))
+}
+
+
 //export ProxySetLogger
 func ProxySetLogger(context unsafe.Pointer, loggerFn C.proxy_logger_fn_t) {
     proxyLoggerCtx = context
@@ -259,6 +296,8 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
     }()
     dtlsctx, dtlscancel := context.WithCancel(ctx)
     defer dtlscancel()
+    unregister := registerSession(dtlscancel)
+    defer unregister()
     var conn1, conn2 net.PacketConn
     conn1, conn2 = connutil.AsyncPacketPipe()
     go func() {
@@ -495,6 +534,8 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	wg := sync.WaitGroup{}
 	wg.Add(2)
 	turnctx, turncancel := context.WithCancel(context.Background())
+	unregister := registerSession(turncancel)
+	defer unregister()
 	context.AfterFunc(turnctx, func() {
 		if err := relayConn.SetDeadline(time.Now()); err != nil {
 			log.Printf("Failed to set relay deadline: %s", err)
