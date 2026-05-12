@@ -111,6 +111,11 @@ func (e *VkCaptchaError) IsCaptchaError() bool {
 }
 
 func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError) (string, error) {
+    if manualCaptchaForcedMode() {
+        log.Printf("[Captcha] Manual mode enabled — handing the challenge to the UI")
+        return requestManualCaptcha(captchaErr.RedirectUri, 180*time.Second)
+    }
+
     time.Sleep(time.Duration(1500+mathrand.Intn(1000)) * time.Millisecond)
 
     log.Printf("[Captcha] Solving Not Robot Captcha...")

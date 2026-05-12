@@ -372,6 +372,31 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
         listenConn.SetDeadline(time.Now())
         dtlsConn.SetDeadline(time.Now())
     })
+
+    // Watchdog: if no inbound bytes from dtlsConn for >60s, force a
+    // restart. With WG's PersistentKeepalive=25 we should be seeing
+    // traffic every few seconds; a long silence means the TURN
+    // allocation died or the network changed under us.
+    var lastRxNanos atomic.Int64
+    lastRxNanos.Store(time.Now().UnixNano())
+    go func() {
+        ticker := time.NewTicker(15 * time.Second)
+        defer ticker.Stop()
+        for {
+            select {
+            case <-dtlsctx.Done():
+                return
+            case now := <-ticker.C:
+                last := time.Unix(0, lastRxNanos.Load())
+                if now.Sub(last) > 60*time.Second {
+                    log.Printf("Watchdog: no inbound DTLS traffic for %s — forcing restart", now.Sub(last).Round(time.Second))
+                    dtlscancel()
+                    return
+                }
+            }
+        }
+    }()
+
     var addr atomic.Value
     go func() {
         defer wg.Done()
@@ -414,6 +439,7 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
                 log.Printf("Failed: %s", err1)
                 return
             }
+            lastRxNanos.Store(time.Now().UnixNano())
             addr1, ok := addr.Load().(net.Addr)
             if !ok {
                 log.Printf("Failed: no listener ip")
@@ -768,6 +794,7 @@ func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
 				log.Printf("Falling back to reusing a previous identity...")
 				c := pool[idx%len(pool)]
 				idx++
+				cTime = time.Now()
 				return c.user, c.pass, c.addr, nil
 			}
 			return "", "", "", err
@@ -775,6 +802,10 @@ func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
 
 		c := pool[idx%len(pool)]
 		idx++
+		// Refresh the cache deadline on every reuse so reconnect storms
+		// after a long-lived session don't suddenly evict the pool and
+		// force a fresh captcha.
+		cTime = time.Now()
 		return c.user, c.pass, c.addr, nil
 	}
 }
