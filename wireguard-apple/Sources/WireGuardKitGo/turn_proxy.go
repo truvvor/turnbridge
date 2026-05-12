@@ -252,6 +252,10 @@ func dtlsFunc(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr) (net.
 func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}, c1 chan<- error) {
     var err error = nil
     defer func() { c1 <- err }()
+    sessionStart := time.Now()
+    defer func() {
+        log.Printf("DTLS session lifetime=%s exit=%v", time.Since(sessionStart).Round(time.Millisecond), err)
+    }()
     dtlsctx, dtlscancel := context.WithCancel(ctx)
     defer dtlscancel()
     var conn1, conn2 net.PacketConn
@@ -375,6 +379,10 @@ type turnParams struct {
 func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UDPAddr, conn2 net.PacketConn, c chan<- error) {
 	var err error = nil
 	defer func() { c <- err }()
+	sessionStart := time.Now()
+	defer func() {
+		log.Printf("TURN session lifetime=%s exit=%v", time.Since(sessionStart).Round(time.Millisecond), err)
+	}()
 	user, pass, url, err1 := turnParams.getCreds(turnParams.link)
 	if err1 != nil {
 		err = fmt.Errorf("failed to get TURN credentials: %s", err1)
