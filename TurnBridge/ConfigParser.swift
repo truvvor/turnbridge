@@ -11,6 +11,8 @@ struct TurnConfigImport: Codable {
     let n: Int
     let wg: String
     let name: String?
+    /// Optional: transport to TURN server. true=UDP (default), false=TCP.
+    let udp: Bool?
 }
 
 enum ConfigParseError: LocalizedError {

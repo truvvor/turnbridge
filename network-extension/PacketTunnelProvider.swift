@@ -76,14 +76,17 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
         let nValue = Int32(nValueInt)
+        // Default true for backward-compat with profiles saved before this field existed.
+        let useUDP = (providerConfiguration["useUDP"] as? Bool) ?? true
+        let udpFlag: Int32 = useUDP ? 1 : 0
 
-        SharedLogger.info("Peer: \(peerAddr), Listen: \(listenAddr), N: \(nValue)", source: .tunnel)
+        SharedLogger.info("Peer: \(peerAddr), Listen: \(listenAddr), N: \(nValue), UDP: \(useUDP)", source: .tunnel)
         SharedLogger.info("Starting TURN proxy...", source: .tunnel)
 
         ProxySetLogger(nil, goProxyCLoggerCallback)
 
         DispatchQueue.global(qos: .userInteractive).async {
-            StartProxy(vkLink, peerAddr, listenAddr, nValue)
+            StartProxy(vkLink, peerAddr, listenAddr, nValue, udpFlag)
         }
 
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in

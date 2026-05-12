@@ -747,7 +747,7 @@ func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
 }
 
 //export StartProxy
-func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int) {
+func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, cUDP C.int) {
     select { case <-proxyReady: default: }
 
     link := C.GoString(cLink)
@@ -760,7 +760,10 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int) 
     host := ""
     port := ""
     n := int(cN)
-    udp := true
+    // udp transport to TURN. true=plain UDP (faster, fragile under loss),
+    // false=TCP STUNConn (survives short cellular blips at the cost of HoL).
+    udp := cUDP != 0
+    log.Printf("StartProxy: peer=%s n=%d udp=%v", peerAddrStr, n, udp)
 
     ctx, cancel := context.WithCancel(context.Background())
     proxyCancel = cancel

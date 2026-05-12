@@ -293,6 +293,7 @@ struct ContentView: View {
                 peerAddr: profile.peerAddr,
                 listenAddr: profile.listenAddr,
                 nValue: profile.nValue,
+                useUDP: profile.useUDP,
                 wgQuickConfig: profile.wgQuickConfig
             ) { isSuccess in
                 if !isSuccess {
@@ -332,6 +333,7 @@ struct ContentView: View {
                 peerAddr: config.peer,
                 listenAddr: config.listen,
                 nValue: config.n,
+                useUDP: config.udp ?? true,
                 wgQuickConfig: config.wg
             )
             store.addProfile(profile)
