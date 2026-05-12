@@ -147,6 +147,15 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
+    private func describe(_ status: NWPath.Status) -> String {
+        switch status {
+        case .satisfied:          return "satisfied"
+        case .unsatisfied:        return "unsatisfied"
+        case .requiresConnection: return "requiresConnection"
+        @unknown default:         return "unknown"
+        }
+    }
+
     private func startNetworkMonitoring() {
         guard pathMonitor == nil else { return }
         let monitor = NWPathMonitor()
@@ -159,31 +168,34 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             ].compactMap { $0 }
             let label = descriptors.isEmpty ? "unknown" : descriptors.joined(separator: "+")
             let prevStatus = self.lastPathStatus
-            let prevLabel = self.lastPathInterfaceLabel
+            let prevLabel = self.lastPathInterfaceLabel ?? "?"
             self.lastPathStatus = path.status
             self.lastPathInterfaceLabel = label
+
+            let curStatusStr = self.describe(path.status)
 
             // Cellular flaps the path on PDP-context refreshes / tower
             // handovers — same interface kind, status stays .satisfied, but
             // an event fires every ~20s. Restarting on each one tears down
             // a working DTLS for no reason. We only restart when something
-            // observable actually changed: interface kind flipped (wifi ↔
-            // cellular), or the path was previously unavailable and is now
-            // satisfied. Pure-noise events are dropped silently; the
+            // observable actually changed: interface kind flipped (wifi
+            // <-> cellular), or the path was previously unavailable and is
+            // now satisfied. Pure-noise events are dropped silently; the
             // watchdog still catches real DTLS death.
             guard let prevStatus = prevStatus else {
-                SharedLogger.info("NWPath initial: status=\(path.status), via=\(label)", source: .tunnel)
+                SharedLogger.info("NWPath initial: status=\(curStatusStr), via=\(label)", source: .tunnel)
                 return
             }
-            let interfaceFlipped = (prevLabel ?? "") != label
-            let recovered = prevStatus != .satisfied && path.status == .satisfied
+            let prevStatusStr = self.describe(prevStatus)
+            let interfaceFlipped = prevLabel != label
+            let recovered = prevStatus != NWPath.Status.satisfied && path.status == NWPath.Status.satisfied
             if !interfaceFlipped && !recovered {
                 return
             }
-            SharedLogger.info("NWPath change: \(prevLabel ?? "?")/\(prevStatus) → \(label)/\(path.status)", source: .tunnel)
-            if path.status == .satisfied {
+            SharedLogger.info("NWPath change: \(prevLabel)/\(prevStatusStr) -> \(label)/\(curStatusStr)", source: .tunnel)
+            if path.status == NWPath.Status.satisfied {
                 let reason = interfaceFlipped
-                    ? "interface flip \(prevLabel ?? "?") → \(label)"
+                    ? "interface flip \(prevLabel) -> \(label)"
                     : "path recovered to \(label)"
                 self.restartTransport(reason: reason)
             }
