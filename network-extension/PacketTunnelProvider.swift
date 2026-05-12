@@ -3,6 +3,7 @@
 //
 
 import NetworkExtension
+import Network
 import WireGuardKit
 import WireGuardKitGo
 import os
@@ -17,6 +18,8 @@ enum PacketTunnelProviderError: String, Error {
 private let goProxyCLoggerCallback: @convention(c) (UnsafeMutableRawPointer?, Int32, UnsafePointer<CChar>?) -> Void = { context, level, messageCStr in
     guard let cStr = messageCStr else { return }
     let message = String(cString: cStr).trimmingCharacters(in: .newlines)
+
+    TransportHealthMonitor.observe(message)
 
     if level == 1 {
         sharedLogger.error("[TP]: \(message, privacy: .public)")
@@ -35,6 +38,23 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             SharedLogger.info(message, source: .wireguard)
         }
     }()
+
+    private var pathMonitor: NWPathMonitor?
+    private var pathMonitorReceivedFirstUpdate = false
+    private var lastTransportRestartAt = Date.distantPast
+
+    /// Tear down the current TURN/DTLS cycle and let the proxy spin up
+    /// fresh inner connections, reusing cached credentials when possible
+    /// (so no captcha re-prompt). Debounced to 5s to avoid stampedes when
+    /// several signals fire at once (wake + network change).
+    private func restartTransport(reason: String) {
+        if Date().timeIntervalSince(lastTransportRestartAt) < 5 {
+            return
+        }
+        lastTransportRestartAt = Date()
+        SharedLogger.info("Transport restart: \(reason)", source: .tunnel)
+        RestartProxy()
+    }
 
     
     override func startTunnel(options: [String : NSObject]?, completionHandler: @escaping (Error?) -> Void) {
@@ -119,18 +139,51 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     let interfaceName = self.adapter.interfaceName ?? "unknown"
                     sharedLogger.log("Tunnel interface is \(interfaceName)")
                     SharedLogger.info("Tunnel up on interface \(interfaceName)", source: .wireguard)
+                    self.startNetworkMonitoring()
                 }
                 completionHandler(adapterError)
             }
         }
     }
 
+    private func startNetworkMonitoring() {
+        guard pathMonitor == nil else { return }
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard let self = self else { return }
+            let descriptors: [String] = [
+                path.usesInterfaceType(.wifi) ? "wifi" : nil,
+                path.usesInterfaceType(.cellular) ? "cellular" : nil,
+                path.usesInterfaceType(.wiredEthernet) ? "ethernet" : nil
+            ].compactMap { $0 }
+            let label = descriptors.isEmpty ? "unknown" : descriptors.joined(separator: "+")
+            SharedLogger.info("NWPath update: status=\(path.status), via=\(label)", source: .tunnel)
+            // The first update fires immediately after start() — it just
+            // describes the current path, no need to bounce the transport.
+            if !self.pathMonitorReceivedFirstUpdate {
+                self.pathMonitorReceivedFirstUpdate = true
+                return
+            }
+            if path.status == .satisfied {
+                self.restartTransport(reason: "network change to \(label)")
+            }
+        }
+        monitor.start(queue: DispatchQueue.global(qos: .utility))
+        pathMonitor = monitor
+        SharedLogger.debug("NWPathMonitor started", source: .tunnel)
+    }
+
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         sharedLogger.log("Stopping tunnel")
         SharedLogger.info("Stopping tunnel (reason: \(reason.rawValue))", source: .tunnel)
 
+        pathMonitor?.cancel()
+        pathMonitor = nil
+        pathMonitorReceivedFirstUpdate = false
+
         StopProxy()
         SharedLogger.info("TURN proxy stopped", source: .tunnel)
+        TransportHealthMonitor.reset()
 
         adapter.stop { [weak self] error in
             guard self != nil else { return }
@@ -157,11 +210,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     override func sleep(completionHandler: @escaping () -> Void) {
-        // Add code here to get ready to sleep.
+        SharedLogger.debug("Tunnel sleep requested", source: .tunnel)
         completionHandler()
     }
 
     override func wake() {
-        // Add code here to wake up.
+        SharedLogger.info("Tunnel wake — restarting transport", source: .tunnel)
+        restartTransport(reason: "device wake")
     }
 }

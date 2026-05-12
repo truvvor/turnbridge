@@ -11,6 +11,7 @@ struct ContentView: View {
     var app: TurnBridge
 
     @State private var vpnStatus: NEVPNStatus = .disconnected
+    @StateObject private var transportHealth = TransportHealthState()
     @StateObject private var store = ProfileStore()
 
     @State private var showImportModal = false
@@ -45,6 +46,12 @@ struct ContentView: View {
                         .padding(.top, 12)
                         .padding(.horizontal, 40)
                         .disabled(vpnStatus != .disconnected)
+                }
+
+                if vpnStatus == .connected {
+                    TransportHealthBanner(isStalled: transportHealth.isStalled)
+                        .padding(.top, 8)
+                        .animation(.easeInOut, value: transportHealth.isStalled)
                 }
 
                 Spacer()
@@ -118,7 +125,11 @@ struct ContentView: View {
                     SettingsView(store: store, profileID: sheet.profileID, isNewProfile: sheet.isNew)
                 }
             }
-            .onAppear(perform: checkInitialStatus)
+            .onAppear {
+                checkInitialStatus()
+                transportHealth.start()
+            }
+            .onDisappear { transportHealth.stop() }
             .onReceive(NotificationCenter.default.publisher(for: .NEVPNStatusDidChange)) { notification in
                 if let connection = notification.object as? NEVPNConnection {
                     let newStatus = connection.status
