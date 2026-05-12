@@ -713,8 +713,11 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int) 
     peerAddrStr := C.GoString(cPeerAddr)
     localAddrStr := C.GoString(cLocalAddr)
     
+    // host/port: empty by default so we use what VK API returned in
+    // turn_server.urls[0]. Override only if you know the TURN endpoint
+    // shouldn't track what VK responds with (e.g. pinning a stable IP).
     host := ""
-    port := "19302"
+    port := ""
     n := int(cN)
     udp := true
 
