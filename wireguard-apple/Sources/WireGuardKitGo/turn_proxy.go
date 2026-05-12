@@ -579,6 +579,11 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 				return
 			}
 		}()
+		// Same buffer concern as listenConn, but on the wire side: a
+		// page-load burst arrives at the device from the relay over a
+		// 30–100 ms RTT path, and any backlog the kernel can't queue
+		// gets dropped silently — TCP then retransmits and stalls.
+		tuneUDPBuffers("turnConn", conn)
 		turnConn = &connectedUDPConn{conn}
 	} else {
 		conn, err2 := d.DialContext(ctx1, "tcp", turnServerAddr) // nolint: noctx
@@ -936,6 +941,12 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
 		log.Printf("Failed to listen: %s", err)
 		return
 	}
+	// Bump the WG↔proxy UDP socket buffers. Default iOS UDP recv buffer
+	// is ~196 KB; a single page load can burst 50–100 1.2 KB packets at
+	// once, overflowing the kernel queue before our read goroutine
+	// drains it. The kernel may cap the request below 4 MB depending on
+	// kern.ipc.maxsockbuf — log what we actually got.
+	tuneUDPBuffers("listenConn", listenConn)
 	
 	context.AfterFunc(ctx, func() {
 		if closeErr := listenConn.Close(); closeErr != nil {
