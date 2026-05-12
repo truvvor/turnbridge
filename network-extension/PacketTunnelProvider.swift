@@ -40,7 +40,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }()
 
     private var pathMonitor: NWPathMonitor?
-    private var pathMonitorReceivedFirstUpdate = false
+    private var lastPathStatus: NWPath.Status?
+    private var lastPathInterfaceLabel: String?
     private var lastTransportRestartAt = Date.distantPast
 
     /// Tear down the current TURN/DTLS cycle and let the proxy spin up
@@ -157,15 +158,34 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 path.usesInterfaceType(.wiredEthernet) ? "ethernet" : nil
             ].compactMap { $0 }
             let label = descriptors.isEmpty ? "unknown" : descriptors.joined(separator: "+")
-            SharedLogger.info("NWPath update: status=\(path.status), via=\(label)", source: .tunnel)
-            // The first update fires immediately after start() — it just
-            // describes the current path, no need to bounce the transport.
-            if !self.pathMonitorReceivedFirstUpdate {
-                self.pathMonitorReceivedFirstUpdate = true
+            let prevStatus = self.lastPathStatus
+            let prevLabel = self.lastPathInterfaceLabel
+            self.lastPathStatus = path.status
+            self.lastPathInterfaceLabel = label
+
+            // Cellular flaps the path on PDP-context refreshes / tower
+            // handovers — same interface kind, status stays .satisfied, but
+            // an event fires every ~20s. Restarting on each one tears down
+            // a working DTLS for no reason. We only restart when something
+            // observable actually changed: interface kind flipped (wifi ↔
+            // cellular), or the path was previously unavailable and is now
+            // satisfied. Pure-noise events are dropped silently; the
+            // watchdog still catches real DTLS death.
+            guard let prevStatus = prevStatus else {
+                SharedLogger.info("NWPath initial: status=\(path.status), via=\(label)", source: .tunnel)
                 return
             }
+            let interfaceFlipped = (prevLabel ?? "") != label
+            let recovered = prevStatus != .satisfied && path.status == .satisfied
+            if !interfaceFlipped && !recovered {
+                return
+            }
+            SharedLogger.info("NWPath change: \(prevLabel ?? "?")/\(prevStatus) → \(label)/\(path.status)", source: .tunnel)
             if path.status == .satisfied {
-                self.restartTransport(reason: "network change to \(label)")
+                let reason = interfaceFlipped
+                    ? "interface flip \(prevLabel ?? "?") → \(label)"
+                    : "path recovered to \(label)"
+                self.restartTransport(reason: reason)
             }
         }
         monitor.start(queue: DispatchQueue.global(qos: .utility))
@@ -179,7 +199,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
         pathMonitor?.cancel()
         pathMonitor = nil
-        pathMonitorReceivedFirstUpdate = false
+        lastPathStatus = nil
+        lastPathInterfaceLabel = nil
 
         StopProxy()
         SharedLogger.info("TURN proxy stopped", source: .tunnel)
