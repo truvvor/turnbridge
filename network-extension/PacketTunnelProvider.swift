@@ -40,7 +40,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }()
 
     private var pathMonitor: NWPathMonitor?
-    private var lastPathStatus: NWPath.Status?
+    private var lastPathStatus: Network.NWPath.Status?
     private var lastPathInterfaceLabel: String?
     private var lastTransportRestartAt = Date.distantPast
 
@@ -147,7 +147,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    private func describe(_ status: NWPath.Status) -> String {
+    private func describe(_ status: Network.NWPath.Status) -> String {
         switch status {
         case .satisfied:          return "satisfied"
         case .unsatisfied:        return "unsatisfied"
@@ -188,12 +188,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             }
             let prevStatusStr = self.describe(prevStatus)
             let interfaceFlipped = prevLabel != label
-            let recovered = prevStatus != NWPath.Status.satisfied && path.status == NWPath.Status.satisfied
+            let recovered = prevStatus != Network.NWPath.Status.satisfied && path.status == Network.NWPath.Status.satisfied
             if !interfaceFlipped && !recovered {
                 return
             }
             SharedLogger.info("NWPath change: \(prevLabel)/\(prevStatusStr) -> \(label)/\(curStatusStr)", source: .tunnel)
-            if path.status == NWPath.Status.satisfied {
+            if path.status == Network.NWPath.Status.satisfied {
                 let reason = interfaceFlipped
                     ? "interface flip \(prevLabel) -> \(label)"
                     : "path recovered to \(label)"
