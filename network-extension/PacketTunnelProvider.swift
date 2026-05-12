@@ -157,30 +157,50 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    /// Dump what the NEPacketTunnelNetworkSettings actually told iOS to
-    /// route into the tunnel. With `manualCaptcha=true` the app sets
-    /// `includeAll=false` so the captcha sheet can hit VK directly, but
-    /// then the user's browser traffic ALSO bypasses the tunnel — every
-    /// URL the user opens goes straight to WiFi/cell, and the tunnel
-    /// only carries WG control-plane keepalives. This log makes that
-    /// state explicit instead of having to guess from byte counters.
+    /// Dump what is actually going into the tunnel. The previous version
+    /// of this method read `routeLAN`/`manualCaptcha` from
+    /// `providerConfiguration`, but the app never puts those keys
+    /// there — it bakes the routing decision into the WG peer's
+    /// `AllowedIPs` and reads `manualCaptcha` from the App Group's
+    /// shared UserDefaults. The result: this log was reporting false
+    /// for everything regardless of the actual UI state. Fixed to read
+    /// the same sources the rest of the extension uses.
     private func logRouteScope() {
-        guard let settings = self.protocolConfiguration as? NETunnelProviderProtocol,
-              let cfg = settings.providerConfiguration else {
-            return
+        // Manual-captcha flag is the app-group setting that the rest of
+        // PacketTunnelProvider already reads (see startTunnel:104).
+        let manualCap = UserDefaults(suiteName: CaptchaIPC.appGroupID)?
+            .bool(forKey: "manualCaptcha") ?? false
+
+        // The peer's AllowedIPs is the source of truth for what the OS
+        // routes into utun. With AllowedIPs=0.0.0.0/0, ::/0 everything
+        // goes through; with a narrow LAN list, the user's browser
+        // traffic exits via the underlying interface and only LAN/peer
+        // traffic uses the tunnel.
+        var allowedIPs: [String] = []
+        if let settings = self.protocolConfiguration as? NETunnelProviderProtocol,
+           let cfg = settings.providerConfiguration,
+           let wgQuick = cfg["wgQuickConfig"] as? String {
+            for raw in wgQuick.split(separator: "\n") {
+                let line = raw.trimmingCharacters(in: .whitespaces)
+                if line.lowercased().hasPrefix("allowedips") {
+                    if let eq = line.firstIndex(of: "=") {
+                        let value = line[line.index(after: eq)...]
+                            .trimmingCharacters(in: .whitespaces)
+                        allowedIPs = value.split(separator: ",")
+                            .map { $0.trimmingCharacters(in: .whitespaces) }
+                    }
+                }
+            }
         }
-        let includeAll = (cfg["includeAll"] as? Bool) ?? false
-        let lan        = (cfg["routeLAN"] as? Bool) ?? false
-        let apns       = (cfg["routeAPNs"] as? Bool) ?? false
-        let cell       = (cfg["routeCellular"] as? Bool) ?? false
-        let manualCap  = (cfg["manualCaptcha"] as? Bool) ?? false
+
+        let isFullTunnel = allowedIPs.contains { $0 == "0.0.0.0/0" || $0 == "::/0" }
         SharedLogger.info(
-            "Tunnel routing scope: includeAll=\(includeAll) lan=\(lan) apns=\(apns) cellular=\(cell) manualCaptcha=\(manualCap)",
+            "Tunnel routing scope: AllowedIPs=\(allowedIPs.isEmpty ? "?" : allowedIPs.joined(separator: ",")) fullTunnel=\(isFullTunnel) manualCaptcha=\(manualCap)",
             source: .tunnel
         )
-        if !includeAll {
+        if !isFullTunnel {
             SharedLogger.info(
-                "Split routing active — user traffic to public IPs goes around the tunnel via the underlying network",
+                "Split tunnel: only AllowedIPs subnets go via utun, the user's browser traffic exits via the underlying network",
                 source: .tunnel
             )
         }
