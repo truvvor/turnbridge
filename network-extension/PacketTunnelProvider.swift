@@ -97,8 +97,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
         let nValue = Int32(nValueInt)
+        // Default true for backward-compat with profiles saved before this field existed.
+        let useUDP = (providerConfiguration["useUDP"] as? Bool) ?? true
+        let udpFlag: Int32 = useUDP ? 1 : 0
 
-        SharedLogger.info("Peer: \(peerAddr), Listen: \(listenAddr), N: \(nValue)", source: .tunnel)
+        SharedLogger.info("Peer: \(peerAddr), Listen: \(listenAddr), N: \(nValue), UDP: \(useUDP)", source: .tunnel)
         SharedLogger.info("Starting TURN proxy...", source: .tunnel)
 
         ProxySetLogger(nil, goProxyCLoggerCallback)
@@ -116,7 +119,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let dtlsReadyTimeoutMs: Int32 = manualCaptchaEnabled ? 300_000 : 12_000
 
         DispatchQueue.global(qos: .userInteractive).async {
-            StartProxy(vkLink, peerAddr, listenAddr, nValue)
+            StartProxy(vkLink, peerAddr, listenAddr, nValue, udpFlag)
         }
 
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
@@ -243,12 +246,32 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     override func sleep(completionHandler: @escaping () -> Void) {
-        SharedLogger.debug("Tunnel sleep requested", source: .tunnel)
+        // iOS is about to suspend us. Don't tear anything down (iOS will
+        // resume us via wake()), but record the moment so wake() can decide
+        // whether the gap was long enough to need a fresh TURN allocation.
+        sharedLogger.log("System sleep — flagging proxy for reconnect on wake")
+        SharedLogger.info("System sleep — flagging proxy for reconnect on wake", source: .tunnel)
+        Self.lastSleepAt = Date()
         completionHandler()
     }
 
     override func wake() {
-        SharedLogger.info("Tunnel wake — restarting transport", source: .tunnel)
-        restartTransport(reason: "device wake")
+        // After a sleep iOS thaws our Go runtime, but the TURN allocation
+        // and DTLS session held by the embedded vk-turn-proxy client are
+        // almost certainly stale — VK TURN drops idle channels, NAT
+        // mappings on the cellular side have expired, and pion/dtls
+        // sequence numbers can be outside the replay window. Force a
+        // clean reconnect before WireGuard starts pumping packets through
+        // zombie sockets.
+        let gap = Self.lastSleepAt.map { Date().timeIntervalSince($0) } ?? 0
+        sharedLogger.log("System wake — gap=\(String(format: "%.1f", gap))s, forcing TURN/DTLS reconnect")
+        SharedLogger.info("System wake — gap=\(String(format: "%.1f", gap))s, forcing TURN/DTLS reconnect", source: .tunnel)
+        ProxyForceReconnect()
+        Self.lastSleepAt = nil
     }
+
+    // Records when iOS told us to sleep so wake() can log the suspension gap.
+    // Static because PacketTunnelProvider instances are owned by the system
+    // and we want to survive whatever lifecycle iOS chooses.
+    private static var lastSleepAt: Date?
 }

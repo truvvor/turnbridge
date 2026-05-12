@@ -21,6 +21,7 @@ import (
     "fmt"
     "io"
     "log"
+    "math/rand"
     "net"
     "net/http"
 	neturl "net/url"
@@ -42,40 +43,42 @@ var proxyLoggerFunc C.proxy_logger_fn_t
 var proxyLoggerCtx unsafe.Pointer
 var proxyCancel context.CancelFunc
 
-// activeDtlsCancels tracks the in-flight dtlsCancel functions of every
-// oneDtlsConnection goroutine so RestartProxy() can tear them all down
-// without restarting the whole proxy.
+// Session registry — every live DTLS/TURN session registers its
+// cancel func so ProxyForceReconnect() can tear them all down at once
+// (e.g. when iOS wakes the device after sleep and we want fresh
+// allocations before WireGuard resumes pumping packets).
 var (
-    activeDtlsCancelsMu sync.Mutex
-    activeDtlsCancels   = make(map[uint64]context.CancelFunc)
-    activeDtlsCancelID  uint64
+	sessionMu       sync.Mutex
+	sessionCancels  = map[uint64]context.CancelFunc{}
+	sessionIDSource uint64
 )
 
-func registerActiveDtlsCancel(cancel context.CancelFunc) func() {
-    activeDtlsCancelsMu.Lock()
-    activeDtlsCancelID++
-    id := activeDtlsCancelID
-    activeDtlsCancels[id] = cancel
-    activeDtlsCancelsMu.Unlock()
-    return func() {
-        activeDtlsCancelsMu.Lock()
-        delete(activeDtlsCancels, id)
-        activeDtlsCancelsMu.Unlock()
-    }
+func registerSession(cancel context.CancelFunc) func() {
+	id := atomic.AddUint64(&sessionIDSource, 1)
+	sessionMu.Lock()
+	sessionCancels[id] = cancel
+	sessionMu.Unlock()
+	return func() {
+		sessionMu.Lock()
+		delete(sessionCancels, id)
+		sessionMu.Unlock()
+	}
 }
 
-func cancelAllActiveDtls() int {
-    activeDtlsCancelsMu.Lock()
-    cancels := make([]context.CancelFunc, 0, len(activeDtlsCancels))
-    for _, c := range activeDtlsCancels {
-        cancels = append(cancels, c)
-    }
-    activeDtlsCancelsMu.Unlock()
-    for _, c := range cancels {
-        c()
-    }
-    return len(cancels)
+//export ProxyForceReconnect
+func ProxyForceReconnect() {
+	sessionMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(sessionCancels))
+	for _, c := range sessionCancels {
+		cancels = append(cancels, c)
+	}
+	sessionMu.Unlock()
+	for _, c := range cancels {
+		c()
+	}
+	log.Printf("ProxyForceReconnect: cancelled %d live session(s)", len(cancels))
 }
+
 
 //export ProxySetLogger
 func ProxySetLogger(context unsafe.Pointer, loggerFn C.proxy_logger_fn_t) {
@@ -287,10 +290,14 @@ func dtlsFunc(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr) (net.
 func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}, c1 chan<- error) {
     var err error = nil
     defer func() { c1 <- err }()
+    sessionStart := time.Now()
+    defer func() {
+        log.Printf("DTLS session lifetime=%s exit=%v", time.Since(sessionStart).Round(time.Millisecond), err)
+    }()
     dtlsctx, dtlscancel := context.WithCancel(ctx)
     defer dtlscancel()
-    deregisterCancel := registerActiveDtlsCancel(dtlscancel)
-    defer deregisterCancel()
+    unregister := registerSession(dtlscancel)
+    defer unregister()
     var conn1, conn2 net.PacketConn
     conn1, conn2 = connutil.AsyncPacketPipe()
     go func() {
@@ -322,6 +329,39 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
             case <-dtlsctx.Done():
                 return
             case okchan <- struct{}{}:
+            }
+        }
+    }()
+
+    // Application-level keepalive over DTLS.
+    //
+    // WireGuard's PersistentKeepalive=25 only fires when WG itself is
+    // running. When iOS throttles or briefly suspends the Network
+    // Extension, WG's goroutine can miss its tick and the DTLS path
+    // goes silent — the VK TURN relay then drops the channel binding
+    // as 'idle' and the next real packet finds a dead path.
+    //
+    // We send a tiny sentinel packet over the DTLS conn every 5s so
+    // the TURN ChannelData is refreshed regardless of WG state.
+    //
+    // Sentinel: 0xFF 0xFF 0xFF 0xFF — invalid first byte for any
+    // WireGuard message type (valid: 0x01-0x04) and below WG's 32-byte
+    // minimum, so server-side vk-turn-proxy can drop it cheaply before
+    // forwarding to wg-quick@wg0. See companion patch in
+    // truvvor/vk-turn-proxy server/.
+    go func() {
+        keepalive := []byte{0xFF, 0xFF, 0xFF, 0xFF}
+        ticker := time.NewTicker(5 * time.Second)
+        defer ticker.Stop()
+        for {
+            select {
+            case <-dtlsctx.Done():
+                return
+            case <-ticker.C:
+                if _, werr := dtlsConn.Write(keepalive); werr != nil {
+                    log.Printf("keepalive write failed: %s", werr)
+                    return
+                }
             }
         }
     }()
@@ -438,6 +478,10 @@ type turnParams struct {
 func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UDPAddr, conn2 net.PacketConn, c chan<- error) {
 	var err error = nil
 	defer func() { c <- err }()
+	sessionStart := time.Now()
+	defer func() {
+		log.Printf("TURN session lifetime=%s exit=%v", time.Since(sessionStart).Round(time.Millisecond), err)
+	}()
 	user, pass, url, err1 := turnParams.getCreds(turnParams.link)
 	if err1 != nil {
 		err = fmt.Errorf("failed to get TURN credentials: %s", err1)
@@ -549,6 +593,8 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	wg := sync.WaitGroup{}
 	wg.Add(2)
 	turnctx, turncancel := context.WithCancel(context.Background())
+	unregister := registerSession(turncancel)
+	defer unregister()
 	context.AfterFunc(turnctx, func() {
 		if err := relayConn.SetDeadline(time.Now()); err != nil {
 			log.Printf("Failed to set relay deadline: %s", err)
@@ -624,7 +670,31 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	}
 }
 
+// reconnectBackoff produces a capped exponential backoff with jitter.
+// Caller uses it like:
+//   wait := reconnectBackoff(prev, success)
+//   time.Sleep(wait)
+// On success it returns 0 (caller resets state and continues immediately).
+func reconnectBackoff(prev time.Duration, success bool) time.Duration {
+	if success {
+		return 0
+	}
+	if prev <= 0 {
+		prev = 500 * time.Millisecond
+	} else {
+		prev *= 2
+	}
+	const maxBackoff = 30 * time.Second
+	if prev > maxBackoff {
+		prev = maxBackoff
+	}
+	// Add jitter +/- 25% so reconnects don't synchronise across N parallel streams.
+	jitter := time.Duration(rand.Int63n(int64(prev / 2))) - prev/4
+	return prev + jitter
+}
+
 func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConnChan <-chan net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}) {
+	var backoff time.Duration
 	for {
 		select {
 		case <-ctx.Done():
@@ -632,14 +702,27 @@ func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConnCha
 		case listenConn := <-listenConnChan:
 			c := make(chan error)
 			go oneDtlsConnection(ctx, peer, listenConn, connchan, okchan, c)
-			if err := <-c; err != nil {
+			err := <-c
+			if err != nil {
 				log.Printf("%s", err)
+				backoff = reconnectBackoff(backoff, false)
+				if backoff > 0 {
+					log.Printf("DTLS reconnect in %s", backoff.Round(time.Millisecond))
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(backoff):
+					}
+				}
+			} else {
+				backoff = reconnectBackoff(backoff, true)
 			}
 		}
 	}
 }
 
 func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *net.UDPAddr, connchan <-chan net.PacketConn, t <-chan time.Time) {
+	var backoff time.Duration
 	for {
 		select {
 		case <-ctx.Done():
@@ -649,8 +732,20 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 			case <-t:
 				c := make(chan error)
 				go oneTurnConnection(ctx, turnParams, peer, conn2, c)
-				if err := <-c; err != nil {
+				err := <-c
+				if err != nil {
 					log.Printf("%s", err)
+					backoff = reconnectBackoff(backoff, false)
+					if backoff > 0 {
+						log.Printf("TURN reconnect in %s", backoff.Round(time.Millisecond))
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(backoff):
+						}
+					}
+				} else {
+					backoff = reconnectBackoff(backoff, true)
 				}
 			default:
 			}
@@ -716,17 +811,23 @@ func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
 }
 
 //export StartProxy
-func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int) {
+func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, cUDP C.int) {
     select { case <-proxyReady: default: }
 
     link := C.GoString(cLink)
     peerAddrStr := C.GoString(cPeerAddr)
     localAddrStr := C.GoString(cLocalAddr)
     
+    // host/port: empty by default so we use what VK API returned in
+    // turn_server.urls[0]. Override only if you know the TURN endpoint
+    // shouldn't track what VK responds with (e.g. pinning a stable IP).
     host := ""
-    port := "19302"
+    port := ""
     n := int(cN)
-    udp := true
+    // udp transport to TURN. true=plain UDP (faster, fragile under loss),
+    // false=TCP STUNConn (survives short cellular blips at the cost of HoL).
+    udp := cUDP != 0
+    log.Printf("StartProxy: peer=%s n=%d udp=%v", peerAddrStr, n, udp)
 
     ctx, cancel := context.WithCancel(context.Background())
     proxyCancel = cancel

@@ -84,6 +84,7 @@ class ProfileStore: ObservableObject {
             peerAddr: defaults.string(forKey: "peerAddr") ?? "",
             listenAddr: defaults.string(forKey: "listenAddr") ?? "127.0.0.1:9000",
             nValue: max(defaults.integer(forKey: "nValue"), 1),
+            useUDP: true,
             wgQuickConfig: defaults.string(forKey: "wgQuickConfig") ?? ""
         )
         profiles = [profile]

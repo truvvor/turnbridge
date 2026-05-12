@@ -7,6 +7,9 @@ config = {
     "peer": "YOUR_SERVER_IP:PORT",
     "listen": "127.0.0.1:9000",
     "n": 1,
+    # Optional. true=UDP transport to TURN (default), false=TCP (more
+    # reliable on flaky cellular at the cost of head-of-line blocking).
+    "udp": True,
     "wg": """[Interface]
 PrivateKey = YOUR_CLIENT_PRIVATE_KEY
 Address = 10.100.0.2/32
