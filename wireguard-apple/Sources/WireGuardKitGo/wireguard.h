@@ -32,9 +32,10 @@ extern char *LibXrayStopXray();
 extern char *LibXrayXrayVersion();
 extern char* LibXraySetSockCallback(libxray_sockcallback cb, void* ctx);
 
-extern void StartProxy(const char *link, const char *peerAddrStr, const char *localAddrStr, int n);
+extern void StartProxy(const char *link, const char *peerAddrStr, const char *localAddrStr, int n, int udp);
 extern void StopProxy(void);
 extern void RestartProxy(void);
+extern void ProxyForceReconnect(void);
 extern void ProxySetLogger(void *context, logger_fn_t logger_fn);
 extern int ProxyWaitReady(int timeoutMs);
 
