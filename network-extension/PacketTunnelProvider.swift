@@ -44,6 +44,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var lastPathInterfaceLabel: String?
     private var lastTransportRestartAt = Date.distantPast
 
+    // WG byte counters logged every 10s by startWireGuardStatsLogger().
+    private var wgStatsTimer: DispatchSourceTimer?
+    private var lastWGRxBytes: UInt64 = 0
+    private var lastWGTxBytes: UInt64 = 0
+
     /// Tear down the current TURN/DTLS cycle and let the proxy spin up
     /// fresh inner connections, reusing cached credentials when possible
     /// (so no captcha re-prompt). Debounced to 5s to avoid stampedes when
@@ -143,11 +148,82 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                     let interfaceName = self.adapter.interfaceName ?? "unknown"
                     sharedLogger.log("Tunnel interface is \(interfaceName)")
                     SharedLogger.info("Tunnel up on interface \(interfaceName)", source: .wireguard)
+                    self.logRouteScope()
+                    self.startWireGuardStatsLogger()
                     self.startNetworkMonitoring()
                 }
                 completionHandler(adapterError)
             }
         }
+    }
+
+    /// Dump what the NEPacketTunnelNetworkSettings actually told iOS to
+    /// route into the tunnel. With `manualCaptcha=true` the app sets
+    /// `includeAll=false` so the captcha sheet can hit VK directly, but
+    /// then the user's browser traffic ALSO bypasses the tunnel — every
+    /// URL the user opens goes straight to WiFi/cell, and the tunnel
+    /// only carries WG control-plane keepalives. This log makes that
+    /// state explicit instead of having to guess from byte counters.
+    private func logRouteScope() {
+        guard let settings = self.protocolConfiguration as? NETunnelProviderProtocol,
+              let cfg = settings.providerConfiguration else {
+            return
+        }
+        let includeAll = (cfg["includeAll"] as? Bool) ?? false
+        let lan        = (cfg["routeLAN"] as? Bool) ?? false
+        let apns       = (cfg["routeAPNs"] as? Bool) ?? false
+        let cell       = (cfg["routeCellular"] as? Bool) ?? false
+        let manualCap  = (cfg["manualCaptcha"] as? Bool) ?? false
+        SharedLogger.info(
+            "Tunnel routing scope: includeAll=\(includeAll) lan=\(lan) apns=\(apns) cellular=\(cell) manualCaptcha=\(manualCap)",
+            source: .tunnel
+        )
+        if !includeAll {
+            SharedLogger.info(
+                "Split routing active — user traffic to public IPs goes around the tunnel via the underlying network",
+                source: .tunnel
+            )
+        }
+    }
+
+    /// Poll WireGuardAdapter every 10s for rx/tx counters and log them
+    /// alongside the Go-side DTLS/TURN byte counters. If WG itself sees
+    /// zero application bytes, the issue is above WG (TUN routing). If
+    /// WG sees bytes but the Go side stays at zero, the issue is in the
+    /// proxy. The deltas make it possible to tell at a glance whether
+    /// traffic is flowing.
+    private func startWireGuardStatsLogger() {
+        guard wgStatsTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now() + 10, repeating: 10)
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            self.adapter.getRuntimeConfiguration { config in
+                guard let config = config else {
+                    SharedLogger.debug("WG stats: getRuntimeConfiguration returned nil", source: .wireguard)
+                    return
+                }
+                var rx: UInt64 = 0
+                var tx: UInt64 = 0
+                for line in config.split(separator: "\n") {
+                    if line.hasPrefix("rx_bytes=") {
+                        rx = UInt64(line.dropFirst("rx_bytes=".count)) ?? 0
+                    } else if line.hasPrefix("tx_bytes=") {
+                        tx = UInt64(line.dropFirst("tx_bytes=".count)) ?? 0
+                    }
+                }
+                let dRx = rx &- self.lastWGRxBytes
+                let dTx = tx &- self.lastWGTxBytes
+                self.lastWGRxBytes = rx
+                self.lastWGTxBytes = tx
+                SharedLogger.info(
+                    "WG bytes rx=\(rx) (Δ+\(dRx)) tx=\(tx) (Δ+\(dTx))",
+                    source: .wireguard
+                )
+            }
+        }
+        timer.resume()
+        wgStatsTimer = timer
     }
 
     private func describe(_ status: Network.NWPath.Status) -> String {
@@ -216,6 +292,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         pathMonitor = nil
         lastPathStatus = nil
         lastPathInterfaceLabel = nil
+
+        wgStatsTimer?.cancel()
+        wgStatsTimer = nil
+        lastWGRxBytes = 0
+        lastWGTxBytes = 0
 
         StopProxy()
         SharedLogger.info("TURN proxy stopped", source: .tunnel)

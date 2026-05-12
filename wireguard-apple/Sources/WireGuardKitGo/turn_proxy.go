@@ -291,8 +291,22 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
     var err error = nil
     defer func() { c1 <- err }()
     sessionStart := time.Now()
+
+    // Data-plane byte counters for this DTLS session. The two directions:
+    //   wgToDtls:   bytes read from listenConn (WG ciphertext at :9000)
+    //               and written into dtlsConn (towards the TURN relay).
+    //   dtlsToWg:   bytes read from dtlsConn (decrypted DTLS payload
+    //               coming back from the relay) and written into
+    //               listenConn (towards the WG client).
+    // A periodic logger below prints both totals and 10s deltas so we
+    // can tell whether user traffic is actually flowing through the
+    // tunnel or whether it's just WG control-plane keepalives.
+    var wgToDtls, dtlsToWg atomic.Uint64
+
     defer func() {
-        log.Printf("DTLS session lifetime=%s exit=%v", time.Since(sessionStart).Round(time.Millisecond), err)
+        log.Printf("DTLS session lifetime=%s wg→dtls=%dB dtls→wg=%dB exit=%v",
+            time.Since(sessionStart).Round(time.Millisecond),
+            wgToDtls.Load(), dtlsToWg.Load(), err)
     }()
     dtlsctx, dtlscancel := context.WithCancel(ctx)
     defer dtlscancel()
@@ -398,6 +412,30 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
     }()
 
     var addr atomic.Value
+
+    // Every 10s, dump the current totals and the deltas since the last
+    // tick. If user opens a website and these stay at +0 in both
+    // directions, no user traffic is reaching the DTLS layer (most
+    // likely the routing config is sending the request straight to
+    // WiFi/cellular, bypassing the tunnel entirely).
+    go func() {
+        ticker := time.NewTicker(10 * time.Second)
+        defer ticker.Stop()
+        var prevTx, prevRx uint64
+        for {
+            select {
+            case <-dtlsctx.Done():
+                return
+            case <-ticker.C:
+                tx := wgToDtls.Load()
+                rx := dtlsToWg.Load()
+                log.Printf("DTLS bytes wg→dtls=%d (Δ+%d) dtls→wg=%d (Δ+%d)",
+                    tx, tx-prevTx, rx, rx-prevRx)
+                prevTx, prevRx = tx, rx
+            }
+        }
+    }()
+
     go func() {
         defer wg.Done()
         defer dtlscancel()
@@ -421,6 +459,7 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
                 log.Printf("Failed: %s", err1)
                 return
             }
+            wgToDtls.Add(uint64(n))
         }
     }()
 
@@ -451,6 +490,7 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
                 log.Printf("Failed: %s", err1)
                 return
             }
+            dtlsToWg.Add(uint64(n))
         }
     }()
 
@@ -479,8 +519,22 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	var err error = nil
 	defer func() { c <- err }()
 	sessionStart := time.Now()
+
+	// Data-plane byte counters on the TURN side. The two directions:
+	//   conn2ToRelay: bytes read from conn2 (decrypted DTLS output that
+	//                 represents the WG packet) and written into
+	//                 relayConn (towards the WG server via the TURN
+	//                 server's relay).
+	//   relayToConn2: bytes coming back from the relay and pushed into
+	//                 conn2 (which DTLS will re-encrypt for the client).
+	// Periodic logger below mirrors the DTLS-side counters so a missing
+	// data path can be pinpointed to either the DTLS or TURN layer.
+	var conn2ToRelay, relayToConn2 atomic.Uint64
+
 	defer func() {
-		log.Printf("TURN session lifetime=%s exit=%v", time.Since(sessionStart).Round(time.Millisecond), err)
+		log.Printf("TURN session lifetime=%s conn2→relay=%dB relay→conn2=%dB exit=%v",
+			time.Since(sessionStart).Round(time.Millisecond),
+			conn2ToRelay.Load(), relayToConn2.Load(), err)
 	}()
 	user, pass, url, err1 := turnParams.getCreds(turnParams.link)
 	if err1 != nil {
@@ -628,6 +682,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 				log.Printf("Failed: %s", err1)
 				return
 			}
+			conn2ToRelay.Add(uint64(n))
 		}
 	}()
 
@@ -657,6 +712,27 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 			if err1 != nil {
 				log.Printf("Failed: %s", err1)
 				return
+			}
+			relayToConn2.Add(uint64(n))
+		}
+	}()
+
+	// Periodic counter dump every 10s so we can see whether the relay
+	// is actually carrying bytes or only the wakeup keepalives.
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		var prevTx, prevRx uint64
+		for {
+			select {
+			case <-turnctx.Done():
+				return
+			case <-ticker.C:
+				tx := conn2ToRelay.Load()
+				rx := relayToConn2.Load()
+				log.Printf("TURN bytes conn2→relay=%d (Δ+%d) relay→conn2=%d (Δ+%d)",
+					tx, tx-prevTx, rx, rx-prevRx)
+				prevTx, prevRx = tx, rx
 			}
 		}
 	}()
