@@ -333,6 +333,39 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
         }
     }()
 
+    // Application-level keepalive over DTLS.
+    //
+    // WireGuard's PersistentKeepalive=25 only fires when WG itself is
+    // running. When iOS throttles or briefly suspends the Network
+    // Extension, WG's goroutine can miss its tick and the DTLS path
+    // goes silent — the VK TURN relay then drops the channel binding
+    // as 'idle' and the next real packet finds a dead path.
+    //
+    // We send a tiny sentinel packet over the DTLS conn every 5s so
+    // the TURN ChannelData is refreshed regardless of WG state.
+    //
+    // Sentinel: 0xFF 0xFF 0xFF 0xFF — invalid first byte for any
+    // WireGuard message type (valid: 0x01-0x04) and below WG's 32-byte
+    // minimum, so server-side vk-turn-proxy can drop it cheaply before
+    // forwarding to wg-quick@wg0. See companion patch in
+    // truvvor/vk-turn-proxy server/.
+    go func() {
+        keepalive := []byte{0xFF, 0xFF, 0xFF, 0xFF}
+        ticker := time.NewTicker(5 * time.Second)
+        defer ticker.Stop()
+        for {
+            select {
+            case <-dtlsctx.Done():
+                return
+            case <-ticker.C:
+                if _, werr := dtlsConn.Write(keepalive); werr != nil {
+                    log.Printf("keepalive write failed: %s", werr)
+                    return
+                }
+            }
+        }
+    }()
+
     wg := sync.WaitGroup{}
     wg.Add(2)
     context.AfterFunc(dtlsctx, func() {
