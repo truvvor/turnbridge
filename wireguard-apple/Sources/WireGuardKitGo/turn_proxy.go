@@ -21,6 +21,7 @@ import (
     "fmt"
     "io"
     "log"
+    "math/rand"
     "net"
     "net/http"
 	neturl "net/url"
@@ -569,7 +570,31 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	}
 }
 
+// reconnectBackoff produces a capped exponential backoff with jitter.
+// Caller uses it like:
+//   wait := reconnectBackoff(prev, success)
+//   time.Sleep(wait)
+// On success it returns 0 (caller resets state and continues immediately).
+func reconnectBackoff(prev time.Duration, success bool) time.Duration {
+	if success {
+		return 0
+	}
+	if prev <= 0 {
+		prev = 500 * time.Millisecond
+	} else {
+		prev *= 2
+	}
+	const maxBackoff = 30 * time.Second
+	if prev > maxBackoff {
+		prev = maxBackoff
+	}
+	// Add jitter +/- 25% so reconnects don't synchronise across N parallel streams.
+	jitter := time.Duration(rand.Int63n(int64(prev / 2))) - prev/4
+	return prev + jitter
+}
+
 func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConnChan <-chan net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}) {
+	var backoff time.Duration
 	for {
 		select {
 		case <-ctx.Done():
@@ -577,14 +602,27 @@ func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConnCha
 		case listenConn := <-listenConnChan:
 			c := make(chan error)
 			go oneDtlsConnection(ctx, peer, listenConn, connchan, okchan, c)
-			if err := <-c; err != nil {
+			err := <-c
+			if err != nil {
 				log.Printf("%s", err)
+				backoff = reconnectBackoff(backoff, false)
+				if backoff > 0 {
+					log.Printf("DTLS reconnect in %s", backoff.Round(time.Millisecond))
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(backoff):
+					}
+				}
+			} else {
+				backoff = reconnectBackoff(backoff, true)
 			}
 		}
 	}
 }
 
 func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *net.UDPAddr, connchan <-chan net.PacketConn, t <-chan time.Time) {
+	var backoff time.Duration
 	for {
 		select {
 		case <-ctx.Done():
@@ -594,8 +632,20 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 			case <-t:
 				c := make(chan error)
 				go oneTurnConnection(ctx, turnParams, peer, conn2, c)
-				if err := <-c; err != nil {
+				err := <-c
+				if err != nil {
 					log.Printf("%s", err)
+					backoff = reconnectBackoff(backoff, false)
+					if backoff > 0 {
+						log.Printf("TURN reconnect in %s", backoff.Round(time.Millisecond))
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(backoff):
+						}
+					}
+				} else {
+					backoff = reconnectBackoff(backoff, true)
 				}
 			default:
 			}
