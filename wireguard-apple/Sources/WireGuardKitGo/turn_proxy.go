@@ -947,22 +947,48 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
 	// drains it. The kernel may cap the request below 4 MB depending on
 	// kern.ipc.maxsockbuf — log what we actually got.
 	tuneUDPBuffers("listenConn", listenConn)
-	
+
 	context.AfterFunc(ctx, func() {
 		if closeErr := listenConn.Close(); closeErr != nil {
 			log.Printf("Failed to close local connection: %s", closeErr)
 		}
 	})
 
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case listenConnChan <- listenConn:
+	// Per-session fan-out of the shared listenConn. Without this, all
+	// N oneDtlsConnection goroutines call ReadFrom on the same UDP
+	// socket, the kernel wakes only one of them, and the other N-1
+	// sessions sit idle — silently defeating nValue>1. The dispatcher
+	// reads once and round-robins each WG packet to one of N
+	// fanoutPacketConn channels; each session reads from its own.
+	// Writes still go straight back to the real listenConn so replies
+	// from any session reach the WG client.
+	fanouts := make([]*fanoutPacketConn, n)
+	for i := range fanouts {
+		fanouts[i] = newFanoutPacketConn(i, listenConn)
+	}
+	startFanoutDispatcher(ctx, listenConn, fanouts)
+	log.Printf("fanout: dispatcher up with %d virtual conn(s)", n)
+
+	// Each oneDtlsConnectionLoop wants a chan that endlessly redelivers
+	// its private listen-side conn. Spawn one such chan per fanout.
+	makeFanoutChan := func(f net.PacketConn) chan net.PacketConn {
+		ch := make(chan net.PacketConn)
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case ch <- f:
+				}
 			}
-		}
-	}()
+		}()
+		return ch
+	}
+
+	// listenConnChan kept for the type signature only — the original
+	// goroutine that fed the shared listenConn is replaced by the
+	// per-fanout chans below.
+	_ = listenConnChan
 
     wg1 := sync.WaitGroup{}
 	t := time.Tick(200 * time.Millisecond)
@@ -970,8 +996,12 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
 	okchan := make(chan struct{})
 	connchan := make(chan net.PacketConn)
 
+	// Session 0 first; later sessions wait until it has solved captcha
+	// and we know the upstream is alive (okchan signal). Otherwise we'd
+	// fire N parallel captcha challenges at the user.
+	firstFanoutChan := makeFanoutChan(fanouts[0])
 	wg1.Go(func() {
-		oneDtlsConnectionLoop(ctx, peer, listenConnChan, connchan, okchan)
+		oneDtlsConnectionLoop(ctx, peer, firstFanoutChan, connchan, okchan)
 	})
 	wg1.Go(func() {
 		oneTurnConnectionLoop(ctx, params, peer, connchan, t)
@@ -982,17 +1012,18 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
 	case <-ctx.Done():
 	}
 
-	for i := 0; i < n-1; i++ {
+	for i := 1; i < n; i++ {
+		fanoutChan := makeFanoutChan(fanouts[i])
 		cChan := make(chan net.PacketConn)
 		wg1.Go(func() {
-			oneDtlsConnectionLoop(ctx, peer, listenConnChan, cChan, nil)
+			oneDtlsConnectionLoop(ctx, peer, fanoutChan, cChan, nil)
 		})
 		wg1.Go(func() {
 			oneTurnConnectionLoop(ctx, params, peer, cChan, t)
 		})
 	}
 
-    log.Printf("Proxy started on %s", localAddrStr)
+    log.Printf("Proxy started on %s with %d parallel TURN session(s)", localAddrStr, n)
     wg1.Wait()
 }
 
