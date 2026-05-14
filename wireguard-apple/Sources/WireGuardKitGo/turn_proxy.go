@@ -840,11 +840,25 @@ type turnCred struct {
 	user, pass, addr string
 }
 
+// Max concurrent captcha solves against VK. Fully-parallel solves at
+// N=30 trigger VK's anti-bot rate-limit (`ERROR_LIMIT` on
+// captcha.isNotRobot, `status: ERROR` on slider getContent) and the
+// per-IP TURN allocation cap (error 486). Five concurrent solves keeps
+// the captcha pipeline well under VK's threshold while still scaling
+// throughput roughly 5× over fully-serial (which was the d917a0e
+// motivation in the first place).
+const maxConcurrentCaptchaSolves = 5
+
 func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
 	var mu sync.Mutex
 	var pool []turnCred
 	var cTime time.Time
 	var idx int
+
+	// Bounded-concurrency gate for captcha solves. Buffered channel
+	// acts as a semaphore: at most cap(solveSlot) goroutines hold a
+	// slot at a time, the rest block on send until a slot is released.
+	solveSlot := make(chan struct{}, maxConcurrentCaptchaSolves)
 
 	return func(link string) (string, string, string, error) {
 		mu.Lock()
@@ -855,7 +869,8 @@ func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
 		}
 
 		// Cache-hit fast path: pool already at capacity, hand out a
-		// rotating cached cred and bail.
+		// rotating cached cred and bail. This path never touches the
+		// solve semaphore — only cold solves are throttled.
 		if len(pool) >= poolSize {
 			c := pool[idx%len(pool)]
 			idx++
@@ -864,16 +879,21 @@ func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
 			return c.user, c.pass, c.addr, nil
 		}
 
-		// Cache-miss slow path: release the mutex during the captcha
-		// solve so N parallel callers (one per TURN session) actually
-		// fetch concurrently instead of serialising on this lock.
-		// Previously this mutex was held across f(link), which made
-		// nValue=30 take ~3 minutes (30 × 5–6 s) to warm the pool.
-		// The pre-existing 1 s "API rate-limit" sleep is also gone —
-		// it was meaningless under serialised access and actively
-		// harmful when callers run in parallel.
+		// Cache-miss slow path: release the mutex, take a solve slot,
+		// then call f(link). The mutex is dropped first so we don't
+		// serialise on it while waiting for a slot, and we don't hold
+		// it across the slow solve either.
 		mu.Unlock()
+
+		solveSlot <- struct{}{}
+		// 0–750 ms jitter desyncs the first wave so the 5 in-flight
+		// solves don't hit VK's anti-bot in lockstep. Cheap once a
+		// slot is acquired (we're about to do a 5 s network round-trip
+		// anyway), and cheap on hot-path because cache hits skip it.
+		time.Sleep(time.Duration(rand.Intn(750)) * time.Millisecond)
 		u, p, a, err := f(link)
+		<-solveSlot
+
 		mu.Lock()
 		defer mu.Unlock()
 
