@@ -13,6 +13,7 @@ struct ContentView: View {
     @State private var vpnStatus: NEVPNStatus = .disconnected
     @StateObject private var transportHealth = TransportHealthState()
     @StateObject private var store = ProfileStore()
+    @StateObject private var captchaStats = CaptchaStatsState()
 
     @State private var showImportModal = false
     @State private var showingAlert = false
@@ -52,6 +53,11 @@ struct ContentView: View {
                     TransportHealthBanner(isStalled: transportHealth.isStalled)
                         .padding(.top, 8)
                         .animation(.easeInOut, value: transportHealth.isStalled)
+                }
+
+                if vpnStatus == .connecting || vpnStatus == .connected {
+                    CaptchaStatsBadge(stats: captchaStats)
+                        .padding(.top, 6)
                 }
 
                 Spacer()
@@ -128,8 +134,12 @@ struct ContentView: View {
             .onAppear {
                 checkInitialStatus()
                 transportHealth.start()
+                captchaStats.start()
             }
-            .onDisappear { transportHealth.stop() }
+            .onDisappear {
+                transportHealth.stop()
+                captchaStats.stop()
+            }
             .onReceive(NotificationCenter.default.publisher(for: .NEVPNStatusDidChange)) { notification in
                 if let connection = notification.object as? NEVPNConnection {
                     let newStatus = connection.status
@@ -297,6 +307,11 @@ struct ContentView: View {
                 return
             }
 
+            // Fresh slate per connect attempt. Keeps the log focused
+            // on the current session instead of accreting history
+            // across reconnects — the previous behaviour made it
+            // very hard to scan for "what happened THIS time".
+            SharedLogger.clearLogs()
             SharedLogger.info("User requested connect with profile \"\(profile.name)\"")
             vpnStatus = .connecting
             app.turnOnTunnel(
@@ -305,6 +320,7 @@ struct ContentView: View {
                 listenAddr: profile.listenAddr,
                 nValue: profile.nValue,
                 useUDP: profile.useUDP,
+                streamAggregation: profile.streamAggregation,
                 wgQuickConfig: profile.wgQuickConfig
             ) { isSuccess in
                 if !isSuccess {

@@ -32,9 +32,10 @@ extern char *LibXrayStopXray();
 extern char *LibXrayXrayVersion();
 extern char* LibXraySetSockCallback(libxray_sockcallback cb, void* ctx);
 
-extern void StartProxy(const char *link, const char *peerAddrStr, const char *localAddrStr, int n);
+extern void StartProxy(const char *link, const char *peerAddrStr, const char *localAddrStr, int n, int udp);
 extern void StopProxy(void);
 extern void RestartProxy(void);
+extern void ProxyForceReconnect(void);
 extern void ProxySetLogger(void *context, logger_fn_t logger_fn);
 extern int ProxyWaitReady(int timeoutMs);
 
@@ -43,5 +44,11 @@ extern void TurnBridgeSetManualCaptchaCallback(manual_captcha_cb_t cb);
 extern void TurnBridgeSubmitManualCaptchaToken(const char *request_id, const char *token);
 extern void TurnBridgeCancelManualCaptcha(const char *request_id, const char *reason);
 extern void TurnBridgeSetManualCaptchaMode(int enabled);
+extern void TurnBridgeSetStreamAggregation(int enabled);
+extern void TurnBridgeSetCaptchaTrapDir(const char *path);
+extern int TurnBridgeGetCaptchaDirectCount(void);
+extern int TurnBridgeGetCaptchaTunnelCount(void);
+extern int TurnBridgeIsCaptchaDirectSaturated(void);
+extern int TurnBridgeIsCaptchaTunnelSaturated(void);
 
 #endif

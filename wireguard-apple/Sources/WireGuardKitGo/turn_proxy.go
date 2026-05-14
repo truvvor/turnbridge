@@ -287,12 +287,26 @@ func dtlsFunc(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr) (net.
     return dtlsConn, nil
 }
 
-func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}, c1 chan<- error) {
+func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}, c1 chan<- error, streamID int) {
     var err error = nil
     defer func() { c1 <- err }()
     sessionStart := time.Now()
+
+    // Data-plane byte counters for this DTLS session. The two directions:
+    //   wgToDtls:   bytes read from listenConn (WG ciphertext at :9000)
+    //               and written into dtlsConn (towards the TURN relay).
+    //   dtlsToWg:   bytes read from dtlsConn (decrypted DTLS payload
+    //               coming back from the relay) and written into
+    //               listenConn (towards the WG client).
+    // A periodic logger below prints both totals and 10s deltas so we
+    // can tell whether user traffic is actually flowing through the
+    // tunnel or whether it's just WG control-plane keepalives.
+    var wgToDtls, dtlsToWg atomic.Uint64
+
     defer func() {
-        log.Printf("DTLS session lifetime=%s exit=%v", time.Since(sessionStart).Round(time.Millisecond), err)
+        log.Printf("DTLS session lifetime=%s wg→dtls=%dB dtls→wg=%dB exit=%v",
+            time.Since(sessionStart).Round(time.Millisecond),
+            wgToDtls.Load(), dtlsToWg.Load(), err)
     }()
     dtlsctx, dtlscancel := context.WithCancel(ctx)
     defer dtlscancel()
@@ -322,7 +336,42 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
         log.Printf("Closed DTLS connection\n")
     }()
     log.Printf("Established DTLS connection!\n")
-    select { case proxyReady <- struct{}{}: default: }
+
+    // Stream-Aggregation preamble: if enabled, write the 17-byte
+    // [sessionID, streamID] header BEFORE WireGuard packets start
+    // flowing through dtlsConn. The receiver-side aggregator
+    // (kiper292/vk-turn-proxy fork on the WG server's box) reads
+    // this once per stream and fuses every stream sharing the same
+    // session ID into a single endpoint for WG, stopping the WG
+    // server from endpoint-thrashing when N parallel TURN
+    // allocations deliver packets from N distinct VK relay ports.
+    // Without the flag set (default), nothing is written and the
+    // stream looks exactly like our pre-aggregation transport.
+    if streamAggIsEnabled() {
+        sid, ok := currentStreamAggSession()
+        if ok {
+            preamble := make([]byte, 17)
+            copy(preamble[:16], sid[:])
+            preamble[16] = byte(streamID)
+            if _, werr := dtlsConn.Write(preamble); werr != nil {
+                log.Printf("stream-agg: preamble write failed on stream %d: %s", streamID, werr)
+                err = fmt.Errorf("stream-agg preamble: %s", werr)
+                return
+            }
+            log.Printf("stream-agg: stream %d preamble sent (sessionID=%x)", streamID, sid[:4])
+        }
+    }
+
+    // NOTE: do NOT signal proxyReady here. Signalling it the moment
+    // the FIRST DTLS session establishes causes Swift to call
+    // adapter.start() and iOS to bring up utun with the WG config's
+    // AllowedIPs=0.0.0.0/0 routing. If the user has nValue>1, the
+    // remaining N-1 sessions still need to fetch fresh VK creds —
+    // and that means the manual-captcha WebView in the app tries to
+    // load id.vk.ru AFTER utun is up, so the captcha sheet ends up
+    // routed through the half-built tunnel and never loads. The
+    // proxyReady signal is now sent from StartProxy once all N
+    // sessions have established their DTLS+TURN allocations.
     go func() {
         for {
             select {
@@ -398,6 +447,13 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
     }()
 
     var addr atomic.Value
+
+    // Note: byte counters keep accumulating into wgToDtls / dtlsToWg
+    // and surface in the per-session lifetime log on exit. The
+    // periodic 10s dump was useful while we were proving that user
+    // traffic actually flows through the tunnel, but now it's just
+    // line noise.
+
     go func() {
         defer wg.Done()
         defer dtlscancel()
@@ -421,6 +477,7 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
                 log.Printf("Failed: %s", err1)
                 return
             }
+            wgToDtls.Add(uint64(n))
         }
     }()
 
@@ -451,6 +508,7 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
                 log.Printf("Failed: %s", err1)
                 return
             }
+            dtlsToWg.Add(uint64(n))
         }
     }()
 
@@ -479,8 +537,22 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	var err error = nil
 	defer func() { c <- err }()
 	sessionStart := time.Now()
+
+	// Data-plane byte counters on the TURN side. The two directions:
+	//   conn2ToRelay: bytes read from conn2 (decrypted DTLS output that
+	//                 represents the WG packet) and written into
+	//                 relayConn (towards the WG server via the TURN
+	//                 server's relay).
+	//   relayToConn2: bytes coming back from the relay and pushed into
+	//                 conn2 (which DTLS will re-encrypt for the client).
+	// Periodic logger below mirrors the DTLS-side counters so a missing
+	// data path can be pinpointed to either the DTLS or TURN layer.
+	var conn2ToRelay, relayToConn2 atomic.Uint64
+
 	defer func() {
-		log.Printf("TURN session lifetime=%s exit=%v", time.Since(sessionStart).Round(time.Millisecond), err)
+		log.Printf("TURN session lifetime=%s conn2→relay=%dB relay→conn2=%dB exit=%v",
+			time.Since(sessionStart).Round(time.Millisecond),
+			conn2ToRelay.Load(), relayToConn2.Load(), err)
 	}()
 	user, pass, url, err1 := turnParams.getCreds(turnParams.link)
 	if err1 != nil {
@@ -525,6 +597,11 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 				return
 			}
 		}()
+		// Same buffer concern as listenConn, but on the wire side: a
+		// page-load burst arrives at the device from the relay over a
+		// 30–100 ms RTT path, and any backlog the kernel can't queue
+		// gets dropped silently — TCP then retransmits and stalls.
+		tuneUDPBuffers("turnConn", conn)
 		turnConn = &connectedUDPConn{conn}
 	} else {
 		conn, err2 := d.DialContext(ctx1, "tcp", turnServerAddr) // nolint: noctx
@@ -628,6 +705,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 				log.Printf("Failed: %s", err1)
 				return
 			}
+			conn2ToRelay.Add(uint64(n))
 		}
 	}()
 
@@ -658,8 +736,13 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 				log.Printf("Failed: %s", err1)
 				return
 			}
+			relayToConn2.Add(uint64(n))
 		}
 	}()
+
+	// Byte counters are folded into the per-session lifetime log on
+	// exit; the periodic 10s dump that proved data was flowing
+	// during the throughput investigation is no longer interesting.
 
 	wg.Wait()
 	if err := relayConn.SetDeadline(time.Time{}); err != nil {
@@ -693,7 +776,7 @@ func reconnectBackoff(prev time.Duration, success bool) time.Duration {
 	return prev + jitter
 }
 
-func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConnChan <-chan net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}) {
+func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConnChan <-chan net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}, streamID int) {
 	var backoff time.Duration
 	for {
 		select {
@@ -701,7 +784,7 @@ func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConnCha
 			return
 		case listenConn := <-listenConnChan:
 			c := make(chan error)
-			go oneDtlsConnection(ctx, peer, listenConn, connchan, okchan, c)
+			go oneDtlsConnection(ctx, peer, listenConn, connchan, okchan, c, streamID)
 			err := <-c
 			if err != nil {
 				log.Printf("%s", err)
@@ -757,56 +840,80 @@ type turnCred struct {
 	user, pass, addr string
 }
 
+// Max concurrent captcha solves against VK. Fully-parallel solves at
+// N=30 trigger VK's anti-bot rate-limit (`ERROR_LIMIT` on
+// captcha.isNotRobot, `status: ERROR` on slider getContent) and the
+// per-IP TURN allocation cap (error 486). Five concurrent solves keeps
+// the captcha pipeline well under VK's threshold while still scaling
+// throughput roughly 5× over fully-serial (which was the d917a0e
+// motivation in the first place).
+const maxConcurrentCaptchaSolves = 5
+
 func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
 	var mu sync.Mutex
 	var pool []turnCred
 	var cTime time.Time
 	var idx int
 
+	// Bounded-concurrency gate for captcha solves. Buffered channel
+	// acts as a semaphore: at most cap(solveSlot) goroutines hold a
+	// slot at a time, the rest block on send until a slot is released.
+	solveSlot := make(chan struct{}, maxConcurrentCaptchaSolves)
+
 	return func(link string) (string, string, string, error) {
 		mu.Lock()
-		defer mu.Unlock()
 
 		if !cTime.IsZero() && time.Since(cTime) > 10*time.Minute {
 			pool = nil
 			cTime = time.Time{}
 		}
 
-		if len(pool) < poolSize {
-			u, p, a, err := f(link)
-			if err == nil {
-				pool = append(pool, turnCred{u, p, a})
-				cTime = time.Now()
-				log.Printf("Successfully registered User Identity %d/%d", len(pool), poolSize)
-
-				// Space out requests by 1000ms to avoid API limits
-				if len(pool) < poolSize {
-					time.Sleep(1000 * time.Millisecond)
-				}
-
-				c := pool[len(pool)-1]
-				idx++
-				return c.user, c.pass, c.addr, nil
-			}
-
-			log.Printf("Failed to get unique TURN identity: %v", err)
-			if len(pool) > 0 {
-				log.Printf("Falling back to reusing a previous identity...")
-				c := pool[idx%len(pool)]
-				idx++
-				cTime = time.Now()
-				return c.user, c.pass, c.addr, nil
-			}
-			return "", "", "", err
+		// Cache-hit fast path: pool already at capacity, hand out a
+		// rotating cached cred and bail. This path never touches the
+		// solve semaphore — only cold solves are throttled.
+		if len(pool) >= poolSize {
+			c := pool[idx%len(pool)]
+			idx++
+			cTime = time.Now()
+			mu.Unlock()
+			return c.user, c.pass, c.addr, nil
 		}
 
-		c := pool[idx%len(pool)]
-		idx++
-		// Refresh the cache deadline on every reuse so reconnect storms
-		// after a long-lived session don't suddenly evict the pool and
-		// force a fresh captcha.
-		cTime = time.Now()
-		return c.user, c.pass, c.addr, nil
+		// Cache-miss slow path: release the mutex, take a solve slot,
+		// then call f(link). The mutex is dropped first so we don't
+		// serialise on it while waiting for a slot, and we don't hold
+		// it across the slow solve either.
+		mu.Unlock()
+
+		solveSlot <- struct{}{}
+		// 0–750 ms jitter desyncs the first wave so the 5 in-flight
+		// solves don't hit VK's anti-bot in lockstep. Cheap once a
+		// slot is acquired (we're about to do a 5 s network round-trip
+		// anyway), and cheap on hot-path because cache hits skip it.
+		time.Sleep(time.Duration(rand.Intn(750)) * time.Millisecond)
+		u, p, a, err := f(link)
+		<-solveSlot
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		if err == nil {
+			pool = append(pool, turnCred{u, p, a})
+			cTime = time.Now()
+			log.Printf("Successfully registered User Identity %d/%d", len(pool), poolSize)
+			idx++
+			return u, p, a, nil
+		}
+
+		log.Printf("Failed to get unique TURN identity: %v", err)
+		if len(pool) > 0 {
+			log.Printf("Falling back to reusing a previous identity...")
+			c := pool[idx%len(pool)]
+			idx++
+			cTime = time.Now()
+			return c.user, c.pass, c.addr, nil
+		}
+		return "", "", "", err
 	}
 }
 
@@ -860,52 +967,196 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
 		log.Printf("Failed to listen: %s", err)
 		return
 	}
-	
+	// Bump the WG↔proxy UDP socket buffers. Default iOS UDP recv buffer
+	// is ~196 KB; a single page load can burst 50–100 1.2 KB packets at
+	// once, overflowing the kernel queue before our read goroutine
+	// drains it. The kernel may cap the request below 4 MB depending on
+	// kern.ipc.maxsockbuf — log what we actually got.
+	tuneUDPBuffers("listenConn", listenConn)
+
 	context.AfterFunc(ctx, func() {
 		if closeErr := listenConn.Close(); closeErr != nil {
 			log.Printf("Failed to close local connection: %s", closeErr)
 		}
 	})
 
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case listenConnChan <- listenConn:
+	// Per-session fan-out of the shared listenConn. Without this, all
+	// N oneDtlsConnection goroutines call ReadFrom on the same UDP
+	// socket, the kernel wakes only one of them, and the other N-1
+	// sessions sit idle — silently defeating nValue>1. The dispatcher
+	// reads once and round-robins each WG packet to one of N
+	// fanoutPacketConn channels; each session reads from its own.
+	// Writes still go straight back to the real listenConn so replies
+	// from any session reach the WG client.
+	fanouts := make([]*fanoutPacketConn, n)
+	for i := range fanouts {
+		fanouts[i] = newFanoutPacketConn(i, listenConn)
+	}
+	startFanoutDispatcher(ctx, listenConn, fanouts)
+	log.Printf("fanout: dispatcher up with %d virtual conn(s)", n)
+
+	// Each oneDtlsConnectionLoop wants a chan that endlessly redelivers
+	// its private listen-side conn. Spawn one such chan per fanout.
+	makeFanoutChan := func(f net.PacketConn) chan net.PacketConn {
+		ch := make(chan net.PacketConn)
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case ch <- f:
+				}
 			}
-		}
-	}()
+		}()
+		return ch
+	}
+
+	// listenConnChan kept for the type signature only — the original
+	// goroutine that fed the shared listenConn is replaced by the
+	// per-fanout chans below.
+	_ = listenConnChan
 
     wg1 := sync.WaitGroup{}
 	t := time.Tick(200 * time.Millisecond)
 
-	okchan := make(chan struct{})
-	connchan := make(chan net.PacketConn)
-
-	wg1.Go(func() {
-		oneDtlsConnectionLoop(ctx, peer, listenConnChan, connchan, okchan)
-	})
-	wg1.Go(func() {
-		oneTurnConnectionLoop(ctx, params, peer, connchan, t)
-	})
-
-    select {
-	case <-okchan:
-	case <-ctx.Done():
+	// Re-roll the Stream-Aggregation session ID once per StartProxy.
+	// Each of the N DTLS sessions below will then prepend the same
+	// session ID + its own stream index after handshake, letting the
+	// receiver-side aggregator fuse them. No-op when the feature is
+	// off (default).
+	if streamAggIsEnabled() {
+		sid := freshStreamAggSession()
+		log.Printf("stream-agg: enabled, sessionID=%x (N=%d)", sid[:4], n)
 	}
 
-	for i := 0; i < n-1; i++ {
+	// Phased bring-up driven by adaptive captcha-egress budget.
+	//
+	// VK rate-limits captcha.isNotRobot per source IP. We have two
+	// budgets available:
+	//
+	//   "direct" — the user's mobile IP. Used by the bootstrap
+	//              session that comes up before WG.
+	//   "tunnel" — the WG server's egress IP. Once WG handshake
+	//              completes, this extension's outbound HTTP routes
+	//              through utun automatically (includeAllNetworks=true).
+	//
+	// Sequence:
+	//
+	//   1. Spawn ONE bootstrap session, solve its captcha from direct.
+	//   2. Signal proxyReady so Swift starts the WG adapter through
+	//      that single TURN session.
+	//   3. Wait briefly for WG handshake; flip captchaTunnelEgress so
+	//      subsequent solves are attributed to "tunnel".
+	//   4. Spawn the remaining N-1 sessions one-by-one (small stagger
+	//      so they don't slam VK from the same IP simultaneously).
+	//      Each new session's captcha goes through utun → WG server
+	//      → api.vk.ru, hitting VK from a fresh per-IP budget.
+	//   5. If captchaTunnelSat trips (ERROR_LIMIT on the tunnel
+	//      egress too), stop spawning further sessions — we've
+	//      saturated both pools and adding more just produces dead
+	//      lanes that the watchdog tears down.
+	//
+	// Manual-captcha mode keeps the single-phase "all N before WG"
+	// barrier: each WebView is presented one-at-a-time anyway, and
+	// the UI flow assumes the captcha sheet can still reach id.vk.ru
+	// outside the tunnel (includeAllNetworks=false in that mode).
+	resetCaptchaStats()
+
+	sessionReady := make(chan int, n)
+	spawnSession := func(i int) {
+		fanoutChan := makeFanoutChan(fanouts[i])
 		cChan := make(chan net.PacketConn)
+		sessionOk := make(chan struct{})
+
 		wg1.Go(func() {
-			oneDtlsConnectionLoop(ctx, peer, listenConnChan, cChan, nil)
+			oneDtlsConnectionLoop(ctx, peer, fanoutChan, cChan, sessionOk, i)
 		})
 		wg1.Go(func() {
 			oneTurnConnectionLoop(ctx, params, peer, cChan, t)
 		})
+		go func() {
+			select {
+			case <-sessionOk:
+				// Make this lane visible to the fanout dispatcher.
+				// Until now the dispatcher was skipping it because
+				// nothing was draining its incoming channel.
+				fanouts[i].active.Store(true)
+				sessionReady <- i
+			case <-ctx.Done():
+			}
+		}()
 	}
 
-    log.Printf("Proxy started on %s", localAddrStr)
+	bootstrap := 1
+	if manualCaptchaForcedMode() || n == 1 {
+		bootstrap = n
+	}
+	log.Printf("StartProxy: bootstrap=%d, deferred=%d (manual=%v)",
+		bootstrap, n-bootstrap, manualCaptchaForcedMode())
+
+	for i := 0; i < bootstrap; i++ {
+		spawnSession(i)
+	}
+	for k := 0; k < bootstrap; k++ {
+		select {
+		case idx := <-sessionReady:
+			log.Printf("StartProxy: bootstrap session %d ready (%d/%d)", idx+1, k+1, bootstrap)
+		case <-ctx.Done():
+			log.Printf("StartProxy: cancelled during bootstrap, %d/%d up", k, bootstrap)
+			wg1.Wait()
+			return
+		}
+	}
+
+	// Bootstrap fleet is alive — let Swift bring up WG.
+	select {
+	case proxyReady <- struct{}{}:
+	default:
+	}
+
+	if bootstrap < n {
+		// Spawn the deferred fleet in the background so StartProxy
+		// returns and the WG adapter actually gets a chance to come
+		// up. wg1.Wait below still blocks on every spawned session.
+		wg1.Go(func() {
+			// Give WG handshake ~2 s to complete through the single
+			// bootstrap session. Once it's up, this extension's
+			// own outbound HTTP routes through utun and the
+			// remaining captchas hit VK from the WG server's egress.
+			select {
+			case <-time.After(2 * time.Second):
+			case <-ctx.Done():
+				return
+			}
+			captchaTunnelEgress.Store(true)
+			log.Printf("StartProxy: tunnel egress engaged; spawning deferred fleet (target=%d)", n)
+
+			// Per-session stagger of 800 ms. Without it, all 30
+			// captcha solves still arrive at VK within a couple
+			// of seconds, just from a different IP — VK's
+			// per-IP rate-limit window then fires for the
+			// tunnel egress too. 800 ms × 30 ≈ 24 s total
+			// warm-up, comfortably under VK's per-IP burst budget.
+			for i := bootstrap; i < n; i++ {
+				if ctx.Err() != nil {
+					return
+				}
+				if captchaTunnelSat.Load() {
+					log.Printf("StartProxy: tunnel egress also rate-limited; stopping at %d/%d sessions",
+						i, n)
+					return
+				}
+				spawnSession(i)
+				select {
+				case <-time.After(800 * time.Millisecond):
+				case <-ctx.Done():
+					return
+				}
+			}
+		})
+	}
+
+    log.Printf("Proxy started on %s with %d parallel TURN session(s) requested (phased)", localAddrStr, n)
     wg1.Wait()
 }
 
