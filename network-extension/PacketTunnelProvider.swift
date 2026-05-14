@@ -115,6 +115,19 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // would race the per-session goroutines.
         TurnBridgeSetStreamAggregation(streamAggregation ? 1 : 0)
 
+        // Captcha trap: every slider captcha buffers its raw VK
+        // response + decoded image in memory and only flushes to disk
+        // when the solve ultimately fails. The artefacts land inside
+        // the App Group container so they show up in the Files app
+        // and survive across extension restarts. Passing the path
+        // before StartProxy ensures the very first solve is covered.
+        if let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: CaptchaIPC.appGroupID) {
+            let trapDir = container.appendingPathComponent("captcha_trap", isDirectory: true)
+            try? FileManager.default.createDirectory(at: trapDir, withIntermediateDirectories: true)
+            trapDir.path.withCString { TurnBridgeSetCaptchaTrapDir($0) }
+            SharedLogger.info("Captcha trap dir: \(trapDir.path)", source: .tunnel)
+        }
+
         let manualCaptchaEnabled = UserDefaults(suiteName: CaptchaIPC.appGroupID)?
             .bool(forKey: "manualCaptcha") ?? false
         TurnBridgeSetManualCaptchaMode(manualCaptchaEnabled ? 1 : 0)

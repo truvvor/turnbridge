@@ -53,6 +53,15 @@ func solveSliderCaptcha(
 
     log.Printf("slider: fetching captcha content (settings=%q)", sliderSettings)
 
+    // Open a captcha trap. Every artefact we collect during the solve
+    // is buffered in memory and either Discarded (on success) or
+    // Committed (on any failure path). The deferred Discard is the
+    // safety net — explicit Commit calls in the failure branches run
+    // first, and Commit/Discard are idempotent.
+    trap := newCaptchaTrap("slider")
+    defer trap.Discard()
+    trap.Note("settings_raw=%q", sliderSettings)
+
     // Get scrambled image and swap instructions
     getContentData := baseParams
     if sliderSettings != "" {
@@ -61,13 +70,38 @@ func solveSliderCaptcha(
 
     resp, err := vkReq("captchaNotRobot.getContent", getContentData)
     if err != nil {
+        trap.Note("getContent transport error: %v", err)
+        trap.Commit("getContent_transport_err")
         return "", fmt.Errorf("slider getContent: %w", err)
+    }
+
+    // Save the raw getContent response and the image bytes as soon as
+    // we have them, BEFORE parsing — that way a new captcha variant
+    // that breaks parseSliderContent still leaves us a self-contained
+    // artefact to inspect.
+    if rawJSON, jerr := json.MarshalIndent(resp, "", "  "); jerr == nil {
+        trap.Save("getContent_response.json", rawJSON)
+    }
+    if respMap, ok := resp["response"].(map[string]interface{}); ok {
+        if imgStr, ok := respMap["image"].(string); ok && imgStr != "" {
+            if rawBytes, derr := base64.StdEncoding.DecodeString(imgStr); derr == nil {
+                ext := "bin"
+                if e, ok := respMap["extension"].(string); ok && e != "" {
+                    ext = strings.ToLower(e)
+                }
+                trap.Save("image."+ext, rawBytes)
+            }
+        }
     }
 
     content, err := parseSliderContent(resp)
     if err != nil {
+        trap.Note("parseSliderContent failed: %v", err)
+        trap.Commit("unparseable_response")
         return "", fmt.Errorf("slider parse: %w", err)
     }
+    trap.Note("parsed grid=%dx%d swaps=%d attempts=%d",
+        content.GridW, content.GridH, len(content.Steps)/2, content.Attempts)
 
     log.Printf("slider: image=%dx%d grid=%dx%d steps=%d attempts=%d",
         content.Image.Bounds().Dx(), content.Image.Bounds().Dy(),
@@ -76,6 +110,8 @@ func solveSliderCaptcha(
     // Rank candidate positions by pixel border continuity
     candidates, err := rankSliderCandidates(content.Image, content.GridW, content.GridH, content.Steps)
     if err != nil {
+        trap.Note("rank failed: %v", err)
+        trap.Commit("rank_failed")
         return "", fmt.Errorf("slider rank: %w", err)
     }
 
@@ -93,6 +129,8 @@ func solveSliderCaptcha(
 
         answer, err := encodeSliderAnswer(c.ActiveSteps)
         if err != nil {
+            trap.Note("encodeSliderAnswer failed: %v", err)
+            trap.Commit("encode_answer_err")
             return "", err
         }
 
@@ -111,24 +149,34 @@ func solveSliderCaptcha(
 
         checkResp, err := vkReq("captchaNotRobot.check", checkData)
         if err != nil {
+            trap.Note("attempt %d/%d transport err: %v", i+1, maxTries, err)
+            trap.Commit("check_transport_err")
             return "", fmt.Errorf("slider check: %w", err)
         }
 
         respObj, ok := checkResp["response"].(map[string]interface{})
         if !ok {
+            trap.Note("attempt %d/%d invalid response: %v", i+1, maxTries, checkResp)
+            trap.Commit("check_invalid_response")
             return "", fmt.Errorf("slider check: invalid response")
         }
 
         status, _ := respObj["status"].(string)
+        trap.Note("attempt %d/%d position=%d score=%d → status=%s",
+            i+1, maxTries, c.Index, c.Score, status)
         switch status {
         case "OK":
             successToken, _ := respObj["success_token"].(string)
             if successToken == "" {
+                trap.Note("OK but success_token missing in: %v", respObj)
+                trap.Commit("ok_without_token")
                 return "", fmt.Errorf("slider: success_token not found")
             }
             log.Printf("slider: solved! position=%d (attempt %d/%d)", c.Index, i+1, maxTries)
+            // Deferred Discard frees the buffer — nothing reaches disk.
             return successToken, nil
         case "ERROR_LIMIT":
+            trap.Commit("error_limit")
             return "", fmt.Errorf("slider: ERROR_LIMIT")
         default:
             log.Printf("slider: position=%d rejected (status=%s)", c.Index, status)
@@ -136,6 +184,7 @@ func solveSliderCaptcha(
         }
     }
 
+    trap.Commit("all_guesses_rejected")
     return "", fmt.Errorf("slider: all %d guesses rejected", maxTries)
 }
 

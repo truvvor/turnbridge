@@ -45,5 +45,6 @@ extern void TurnBridgeSubmitManualCaptchaToken(const char *request_id, const cha
 extern void TurnBridgeCancelManualCaptcha(const char *request_id, const char *reason);
 extern void TurnBridgeSetManualCaptchaMode(int enabled);
 extern void TurnBridgeSetStreamAggregation(int enabled);
+extern void TurnBridgeSetCaptchaTrapDir(const char *path);
 
 #endif
