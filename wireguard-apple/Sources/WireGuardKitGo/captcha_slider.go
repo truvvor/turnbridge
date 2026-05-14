@@ -21,6 +21,16 @@ const (
     defaultSliderAttempts = 4
 )
 
+// sliderRankSlot bounds the parallelism of the rendering+scoring step
+// in rankSliderCandidates. Each ranking allocates a fresh RGBA buffer
+// per candidate (49 × 600×600 × 4 = ~70 MB transient per solver). With
+// poolCreds' throttle=5 captcha solves in flight, the unbounded version
+// peaked around ~350 MB — well above the iOS NetworkExtension memory
+// cap (typically 50–100 MB). The cap-2 gate keeps peak < ~140 MB and
+// the latency hit is tiny (rank is ~50 ms on iPhone, so a 1-deep
+// queue resolves before the next captcha solve produces a slider).
+var sliderRankSlot = make(chan struct{}, 2)
+
 // vkReqFunc is the type for the VK API request helper from callCaptchaNotRobotAPI.
 type vkReqFunc func(method, postData string) (map[string]interface{}, error)
 
@@ -113,8 +123,15 @@ func solveSliderCaptcha(
         content.Image.Bounds().Dx(), content.Image.Bounds().Dy(),
         content.GridW, content.GridH, len(content.Steps)/2, content.Attempts)
 
-    // Rank candidate positions by pixel border continuity
+    // Rank candidate positions by pixel border continuity. Gate the
+    // memory-heavy render+score with sliderRankSlot so we don't OOM
+    // the iOS extension when several captcha solves arrive in
+    // parallel. Plain blocking send is fine — each ranking finishes
+    // in ~100 ms, so a stuck sender waits at most that long for a
+    // slot to free.
+    sliderRankSlot <- struct{}{}
     candidates, err := rankSliderCandidates(content.Image, content.GridW, content.GridH, content.Steps)
+    <-sliderRankSlot
     if err != nil {
         trap.Note("rank failed: %v", err)
         trap.Commit("rank_failed")
