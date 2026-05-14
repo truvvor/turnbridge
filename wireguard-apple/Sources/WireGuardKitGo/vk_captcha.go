@@ -156,9 +156,14 @@ func fetchPowInput(ctx context.Context, client *http.Client, profile Profile, re
     req.Header.Set("User-Agent", profile.UserAgent)
     req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
     req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-    req.Header.Set("sec-ch-ua", profile.SecChUa)
-    req.Header.Set("sec-ch-ua-mobile", profile.SecChUaMobile)
-    req.Header.Set("sec-ch-ua-platform", profile.SecChUaPlatform)
+    // Safari deliberately doesn't implement Client Hints — sending
+    // these headers from a Safari UA is itself a bot tell. Skip them
+    // when the profile didn't define any.
+    if profile.SecChUa != "" {
+        req.Header.Set("sec-ch-ua", profile.SecChUa)
+        req.Header.Set("sec-ch-ua-mobile", profile.SecChUaMobile)
+        req.Header.Set("sec-ch-ua-platform", profile.SecChUaPlatform)
+    }
     req.Header.Set("Sec-Fetch-Site", "none")
     req.Header.Set("Sec-Fetch-Mode", "navigate")
     req.Header.Set("Sec-Fetch-Dest", "document")
@@ -242,9 +247,11 @@ func callCaptchaNotRobot(ctx context.Context, client *http.Client, profile Profi
         req.Header.Set("Accept-Language", "en-US,en;q=0.9")
         req.Header.Set("Origin", "https://id.vk.ru")
         req.Header.Set("Referer", "https://id.vk.ru/")
-        req.Header.Set("sec-ch-ua", profile.SecChUa)
-        req.Header.Set("sec-ch-ua-mobile", profile.SecChUaMobile)
-        req.Header.Set("sec-ch-ua-platform", profile.SecChUaPlatform)
+        if profile.SecChUa != "" {
+            req.Header.Set("sec-ch-ua", profile.SecChUa)
+            req.Header.Set("sec-ch-ua-mobile", profile.SecChUaMobile)
+            req.Header.Set("sec-ch-ua-platform", profile.SecChUaPlatform)
+        }
         req.Header.Set("Sec-Fetch-Site", "same-site")
         req.Header.Set("Sec-Fetch-Mode", "cors")
         req.Header.Set("Sec-Fetch-Dest", "empty")

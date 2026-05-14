@@ -29,66 +29,34 @@ var lastNames = []string{
 }
 
 var profiles = []Profile{
-    // Windows Chrome
+    // iPhone Safari only. VK's anti-bot pipeline triggers the
+    // "Confirm you're not a robot" checkbox when it sees a mismatch
+    // between the connection (Russian cellular IP, iPhone-shaped TLS
+    // fingerprint from NSURLSession's underlying CFNetwork stack)
+    // and the User-Agent header. Real users clicking a VK call link
+    // from Safari on iPhone aren't asked for a captcha — and that's
+    // exactly the request we want to look like.
+    //
+    // Safari deliberately doesn't implement Client Hints; vk_captcha
+    // skips the sec-ch-ua headers entirely when SecChUa is empty,
+    // matching what mobile Safari actually sends on the wire.
     {
-        UserAgent:       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        SecChUa:         `"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"`,
-        SecChUaMobile:   "?0",
-        SecChUaPlatform: `"Windows"`,
+        UserAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1.1 Mobile/15E148 Safari/604.1",
     },
     {
-        UserAgent:       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-        SecChUa:         `"Chromium";v="145", "Not-A.Brand";v="99", "Google Chrome";v="145"`,
-        SecChUaMobile:   "?0",
-        SecChUaPlatform: `"Windows"`,
+        UserAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1",
     },
     {
-        UserAgent:       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
-        SecChUa:         `"Chromium";v="144", "Not-A.Brand";v="8", "Google Chrome";v="144"`,
-        SecChUaMobile:   "?0",
-        SecChUaPlatform: `"Windows"`,
-    },
-
-    // Windows Edge
-    {
-        UserAgent:       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0",
-        SecChUa:         `"Chromium";v="146", "Not-A.Brand";v="24", "Microsoft Edge";v="146"`,
-        SecChUaMobile:   "?0",
-        SecChUaPlatform: `"Windows"`,
+        UserAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
     },
     {
-        UserAgent:       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0",
-        SecChUa:         `"Chromium";v="145", "Not-A.Brand";v="99", "Microsoft Edge";v="145"`,
-        SecChUaMobile:   "?0",
-        SecChUaPlatform: `"Windows"`,
-    },
-
-    // macOS Chrome
-    {
-        UserAgent:       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        SecChUa:         `"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"`,
-        SecChUaMobile:   "?0",
-        SecChUaPlatform: `"macOS"`,
+        UserAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1",
     },
     {
-        UserAgent:       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-        SecChUa:         `"Chromium";v="145", "Not-A.Brand";v="99", "Google Chrome";v="145"`,
-        SecChUaMobile:   "?0",
-        SecChUaPlatform: `"macOS"`,
-    },
-
-    // Linux Chrome
-    {
-        UserAgent:       "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-        SecChUa:         `"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"`,
-        SecChUaMobile:   "?0",
-        SecChUaPlatform: `"Linux"`,
+        UserAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
     },
     {
-        UserAgent:       "Mozilla/5.0 (X11; Ubuntu; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
-        SecChUa:         `"Chromium";v="144", "Not-A.Brand";v="8", "Google Chrome";v="144"`,
-        SecChUaMobile:   "?0",
-        SecChUaPlatform: `"Linux"`,
+        UserAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1",
     },
 }
 
