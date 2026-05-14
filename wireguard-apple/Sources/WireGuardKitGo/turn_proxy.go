@@ -121,6 +121,31 @@ func init() {
 
 type getCredsFunc func(context.Context, string) (string, string, string, error)
 
+// sharedAuthClient is the package-level HTTP client used by getCreds
+// for the 8-RT VK auth + identity-registration pipeline. Sharing one
+// client across every getCreds invocation amortises TLS handshakes
+// (~300-500 ms each) over the connection pool — previously each
+// getCreds built a fresh http.Client whose defer CloseIdleConnections
+// destroyed the idle pool the moment the function returned, so every
+// one of 4×N=200 round trips paid full handshake cost. The captcha
+// solver uses its own client (newCaptchaClient) because it needs a
+// per-attempt cookie jar.
+var sharedAuthClient = &http.Client{
+	Timeout: 20 * time.Second,
+	Transport: &http.Transport{
+		// customDial layers system DNS → DoH (1.1.1.1) → hardcoded
+		// VK fallback IPs. Russian mobile carriers regularly
+		// NXDOMAIN login.vk.com / api.vk.com, so without this
+		// fallback the very first get_anonym_token POST dies on
+		// lookup before any captcha logic engages. See
+		// dns_resolver.go.
+		DialContext:         customDial,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 func getCreds(ctx context.Context, link string) (resUser string, resPass string, resTurn string, resErr error) {
     profile := getRandomProfile()
     name := generateName()
@@ -129,23 +154,6 @@ func getCreds(ctx context.Context, link string) (resUser string, resPass string,
     log.Printf("Connecting - Name: %s | UA: %s", name, profile.UserAgent)
 
 	doRequest := func(data string, url string) (resp map[string]interface{}, err error) {
-
-		client := &http.Client{
-			Timeout: 20 * time.Second,
-			Transport: &http.Transport{
-				// customDial layers system DNS → DoH (1.1.1.1) →
-				// hardcoded VK fallback IPs. Russian mobile carriers
-				// regularly NXDOMAIN login.vk.ru / api.vk.ru, so
-				// without this fallback the very first
-				// get_anonym_token POST dies on lookup before any
-				// captcha logic engages. See dns_resolver.go.
-				DialContext:         customDial,
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 100,
-				IdleConnTimeout:     90 * time.Second,
-			},
-		}
-		defer client.CloseIdleConnections()
 		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer([]byte(data)))
 		if err != nil {
 			return nil, err
@@ -154,7 +162,7 @@ func getCreds(ctx context.Context, link string) (resUser string, resPass string,
 		req.Header.Add("User-Agent", profile.UserAgent)
 		req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 
-		httpResp, err := client.Do(req)
+		httpResp, err := sharedAuthClient.Do(req)
 		if err != nil {
 			return nil, err
 		}
