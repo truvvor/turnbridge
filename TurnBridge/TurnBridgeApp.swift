@@ -70,19 +70,32 @@ struct TurnBridge: App {
             let excludeCellular = defaults.object(forKey: "excludeCellularServices") as? Bool ?? false
             let excludeLAN = defaults.object(forKey: "excludeLocalNetworks") as? Bool ?? true
 
-            // Manual captcha mode needs the captcha web view in the main app
-            // to actually reach the internet *while the tunnel is still
-            // coming up*. iOS enforces includeAllNetworks strictly during the
-            // Connecting phase too, so leaving it on means the WebView can
-            // never load id.vk.ru to ask the user. Trade kill-switch for
-            // captcha solvability when this mode is on.
+            // includeAllNetworks acts as a kill-switch — it installs
+            // the tunnel's default route BEFORE the tunnel is up, so
+            // outbound traffic in the Connecting phase has nowhere
+            // to go and the kernel returns "no route to host" for
+            // EVERY destination (including 1.1.1.1 / hardcoded VK
+            // IPs / DoH endpoints).
+            //
+            // That's fatal for both captcha modes:
+            //   manual — the in-app WebView can't load id.vk.com
+            //   auto   — the in-extension captcha solver can't reach
+            //            login.vk.com / api.vk.com / 1.1.1.1
+            //
+            // So we turn the kill-switch off in both modes. The user
+            // loses fail-closed behaviour during a mid-session
+            // tunnel break, but in exchange the tunnel can actually
+            // come up. Real kill-switch parity would require
+            // changing includeAllNetworks DYNAMICALLY after WG
+            // handshake — iOS doesn't support that, the flag is
+            // saveToPreferences-time only.
             let manualCaptcha = ManualCaptchaSetting.isEnabled
-            protocolConfiguration.includeAllNetworks = !manualCaptcha
+            protocolConfiguration.includeAllNetworks = false
             protocolConfiguration.excludeAPNs = excludeAPNs
             protocolConfiguration.excludeCellularServices = excludeCellular
             protocolConfiguration.excludeLocalNetworks = excludeLAN
 
-            SharedLogger.debug("Routing: includeAll=\(!manualCaptcha) (manualCaptcha=\(manualCaptcha)), LAN=\(excludeLAN), APNs=\(excludeAPNs), Cellular=\(excludeCellular)")
+            SharedLogger.debug("Routing: includeAll=false (manualCaptcha=\(manualCaptcha)), LAN=\(excludeLAN), APNs=\(excludeAPNs), Cellular=\(excludeCellular)")
 
             tunnelManager.protocolConfiguration = protocolConfiguration
             tunnelManager.isEnabled = true
