@@ -66,7 +66,20 @@ struct ContentView: View {
                         .scaleEffect(vpnStatus == .connecting ? 1.1 : 1.0)
                         .animation(vpnStatus == .connecting ? .easeInOut(duration: 1).repeatForever() : .default, value: vpnStatus)
 
-                    Button(action: toggleTunnel) {
+                    // Manual gating (instead of .disabled) so the
+                    // long-press gesture still fires while the tap is
+                    // a no-op. SwiftUI's .disabled disables hit-testing
+                    // for ALL gestures on the view, including
+                    // simultaneousGesture — that was making
+                    // forceDisconnect unreachable when the user
+                    // needed it most.
+                    Button(action: {
+                        let tapDisabled = vpnStatus == .connecting
+                            || vpnStatus == .disconnecting
+                            || store.selectedProfile == nil
+                        if tapDisabled { return }
+                        toggleTunnel()
+                    }) {
                         Text(buttonText)
                             .font(.title3)
                             .fontWeight(.semibold)
@@ -76,17 +89,12 @@ struct ContentView: View {
                             .foregroundColor(.white)
                             .cornerRadius(16)
                             .shadow(color: buttonColor.opacity(0.4), radius: 8, x: 0, y: 4)
+                            .opacity((vpnStatus == .connecting || vpnStatus == .disconnecting) ? 0.7 : 1.0)
                     }
-                    // Long press = force disconnect. Useful when the
-                    // tunnel is stuck in a captcha loop and the
-                    // regular Disconnect tap isn't enough to break
-                    // out cleanly. Bypasses the .disabled() gate so
-                    // it works even while .connecting / .disconnecting.
                     .simultaneousGesture(
                         LongPressGesture(minimumDuration: 1.0)
                             .onEnded { _ in forceDisconnect() }
                     )
-                    .disabled(vpnStatus == .connecting || vpnStatus == .disconnecting || store.selectedProfile == nil)
                     .padding(.horizontal, 40)
 
                     if vpnStatus == .connecting || vpnStatus == .disconnecting {
