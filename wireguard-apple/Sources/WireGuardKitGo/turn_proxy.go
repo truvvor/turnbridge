@@ -845,7 +845,18 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 
 type turnCred struct {
 	user, pass, addr string
+	acquiredAt       time.Time
 }
+
+// credMaxAge is how long a TURN cred stays usable in the pool. VK
+// rotates TURN allocations roughly every minute, after which Allocate
+// returns 437 (allocation mismatch). Recycling a 90 s-old cred during
+// a reconnect storm just kicks off a brand-new dead TURN session —
+// pion fails fast, the loop reconnects, getCreds returns the same
+// stale cred, and round we go. Capping at 45 s gives a comfortable
+// margin under VK's actual rotation window while still letting the
+// burst-recycle path (fresh creds added in the last ~5 s) work.
+const credMaxAge = 45 * time.Second
 
 // Max concurrent captcha solves against VK. Fully-parallel solves at
 // N=30 trigger VK's anti-bot rate-limit (`ERROR_LIMIT` on
@@ -873,6 +884,23 @@ func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
 		if !cTime.IsZero() && time.Since(cTime) > 10*time.Minute {
 			pool = nil
 			cTime = time.Time{}
+		}
+
+		// Prune creds older than credMaxAge. Without this both the
+		// cache-hit fast path and the saturation short-circuit would
+		// keep handing out dead identities to oneTurnConnection,
+		// which then 437s on Allocate, dies, reconnects, and burns
+		// another solve attempt. The 45 s budget lines up with VK's
+		// TURN rotation window so any cred in the pool was either
+		// just acquired or is in its useful lifetime.
+		if len(pool) > 0 {
+			fresh := pool[:0]
+			for _, c := range pool {
+				if time.Since(c.acquiredAt) <= credMaxAge {
+					fresh = append(fresh, c)
+				}
+			}
+			pool = fresh
 		}
 
 		// Cache-hit fast path: pool already at capacity, hand out a
@@ -949,7 +977,7 @@ func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
 		defer mu.Unlock()
 
 		if err == nil {
-			pool = append(pool, turnCred{u, p, a})
+			pool = append(pool, turnCred{u, p, a, time.Now()})
 			cTime = time.Now()
 			log.Printf("Successfully registered User Identity %d/%d", len(pool), poolSize)
 			idx++
