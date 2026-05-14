@@ -397,8 +397,19 @@ func callCaptchaNotRobot(ctx context.Context, client *http.Client, profile Profi
         if ok && successToken != "" {
             log.Printf("[Captcha] Step 4/4: endSession")
             _, _ = vkReq("captchaNotRobot.endSession", baseParams)
+            markCaptchaSuccess()
             return successToken, nil
         }
+    }
+
+    if status == "ERROR_LIMIT" {
+        // Mark the egress that owns this request as saturated. The
+        // bootstrap fleet runs from the client IP (saturates direct);
+        // the deferred fleet runs after WG handshake completes so its
+        // HTTP routes through utun and saturates the tunnel egress.
+        // StartProxy reads these flags to stop spawning new sessions
+        // when the second pool is also dry.
+        markCaptchaSaturated()
     }
 
     // Checkbox failed — try slider captcha
@@ -412,11 +423,15 @@ func callCaptchaNotRobot(ctx context.Context, client *http.Client, profile Profi
 
     sliderToken, sliderErr := solveSliderCaptcha(vkReq, baseParams, browserFp, hash, mergedSettings)
     if sliderErr != nil {
+        if strings.Contains(sliderErr.Error(), "ERROR_LIMIT") {
+            markCaptchaSaturated()
+        }
         return "", fmt.Errorf("slider captcha also failed: %w", sliderErr)
     }
 
     log.Printf("[Captcha] Slider solved! endSession...")
     _, _ = vkReq("captchaNotRobot.endSession", baseParams)
+    markCaptchaSuccess()
     return sliderToken, nil
 }
 

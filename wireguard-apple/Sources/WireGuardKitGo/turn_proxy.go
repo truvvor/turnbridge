@@ -1029,23 +1029,41 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
 		log.Printf("stream-agg: enabled, sessionID=%x (N=%d)", sid[:4], n)
 	}
 
-	// Spawn ALL N sessions in parallel. Sequential spawning made the
-	// auto-captcha mode artificially slow at high nValue
-	// (N=30 → 30 captchas back-to-back → ~3 minutes), even though
-	// the in-tunnel captcha solver runs entirely inside the
-	// extension's Go code with no UI dependency and can absolutely
-	// be parallelised. In manual-captcha mode the UI is the natural
-	// serialiser (it only presents one WebView sheet at a time), so
-	// spawning all N at once still produces a sequential user-facing
-	// flow there — no regression.
+	// Phased bring-up driven by adaptive captcha-egress budget.
 	//
-	// We still wait for ALL N to signal okchan before sending to
-	// proxyReady, otherwise utun comes up half-built and the manual
-	// captcha WebView for not-yet-ready sessions hangs (see commit
-	// ca8b19f for the original rationale of this barrier).
+	// VK rate-limits captcha.isNotRobot per source IP. We have two
+	// budgets available:
+	//
+	//   "direct" — the user's mobile IP. Used by the bootstrap
+	//              session that comes up before WG.
+	//   "tunnel" — the WG server's egress IP. Once WG handshake
+	//              completes, this extension's outbound HTTP routes
+	//              through utun automatically (includeAllNetworks=true).
+	//
+	// Sequence:
+	//
+	//   1. Spawn ONE bootstrap session, solve its captcha from direct.
+	//   2. Signal proxyReady so Swift starts the WG adapter through
+	//      that single TURN session.
+	//   3. Wait briefly for WG handshake; flip captchaTunnelEgress so
+	//      subsequent solves are attributed to "tunnel".
+	//   4. Spawn the remaining N-1 sessions one-by-one (small stagger
+	//      so they don't slam VK from the same IP simultaneously).
+	//      Each new session's captcha goes through utun → WG server
+	//      → api.vk.ru, hitting VK from a fresh per-IP budget.
+	//   5. If captchaTunnelSat trips (ERROR_LIMIT on the tunnel
+	//      egress too), stop spawning further sessions — we've
+	//      saturated both pools and adding more just produces dead
+	//      lanes that the watchdog tears down.
+	//
+	// Manual-captcha mode keeps the single-phase "all N before WG"
+	// barrier: each WebView is presented one-at-a-time anyway, and
+	// the UI flow assumes the captcha sheet can still reach id.vk.ru
+	// outside the tunnel (includeAllNetworks=false in that mode).
+	resetCaptchaStats()
+
 	sessionReady := make(chan int, n)
-	for i := 0; i < n; i++ {
-		i := i
+	spawnSession := func(i int) {
 		fanoutChan := makeFanoutChan(fanouts[i])
 		cChan := make(chan net.PacketConn)
 		sessionOk := make(chan struct{})
@@ -1056,38 +1074,89 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
 		wg1.Go(func() {
 			oneTurnConnectionLoop(ctx, params, peer, cChan, t)
 		})
-		// One forwarder per session that pushes its index onto the
-		// aggregate ready channel as soon as that session establishes
-		// its DTLS. Decouples the wait-for-all loop below from the
-		// per-session okchan semantics.
 		go func() {
 			select {
 			case <-sessionOk:
+				// Make this lane visible to the fanout dispatcher.
+				// Until now the dispatcher was skipping it because
+				// nothing was draining its incoming channel.
+				fanouts[i].active.Store(true)
 				sessionReady <- i
 			case <-ctx.Done():
 			}
 		}()
 	}
 
-	for k := 0; k < n; k++ {
+	bootstrap := 1
+	if manualCaptchaForcedMode() || n == 1 {
+		bootstrap = n
+	}
+	log.Printf("StartProxy: bootstrap=%d, deferred=%d (manual=%v)",
+		bootstrap, n-bootstrap, manualCaptchaForcedMode())
+
+	for i := 0; i < bootstrap; i++ {
+		spawnSession(i)
+	}
+	for k := 0; k < bootstrap; k++ {
 		select {
 		case idx := <-sessionReady:
-			log.Printf("StartProxy: session %d ready (%d/%d total)", idx+1, k+1, n)
+			log.Printf("StartProxy: bootstrap session %d ready (%d/%d)", idx+1, k+1, bootstrap)
 		case <-ctx.Done():
-			log.Printf("StartProxy: cancelled, only %d/%d sessions came up", k, n)
+			log.Printf("StartProxy: cancelled during bootstrap, %d/%d up", k, bootstrap)
 			wg1.Wait()
 			return
 		}
 	}
 
-	// All N TURN allocations are alive. NOW it's safe to let Swift
-	// bring up the WG adapter and route the user's traffic into utun.
+	// Bootstrap fleet is alive — let Swift bring up WG.
 	select {
 	case proxyReady <- struct{}{}:
 	default:
 	}
 
-    log.Printf("Proxy started on %s with %d parallel TURN session(s)", localAddrStr, n)
+	if bootstrap < n {
+		// Spawn the deferred fleet in the background so StartProxy
+		// returns and the WG adapter actually gets a chance to come
+		// up. wg1.Wait below still blocks on every spawned session.
+		wg1.Go(func() {
+			// Give WG handshake ~2 s to complete through the single
+			// bootstrap session. Once it's up, this extension's
+			// own outbound HTTP routes through utun and the
+			// remaining captchas hit VK from the WG server's egress.
+			select {
+			case <-time.After(2 * time.Second):
+			case <-ctx.Done():
+				return
+			}
+			captchaTunnelEgress.Store(true)
+			log.Printf("StartProxy: tunnel egress engaged; spawning deferred fleet (target=%d)", n)
+
+			// Per-session stagger of 800 ms. Without it, all 30
+			// captcha solves still arrive at VK within a couple
+			// of seconds, just from a different IP — VK's
+			// per-IP rate-limit window then fires for the
+			// tunnel egress too. 800 ms × 30 ≈ 24 s total
+			// warm-up, comfortably under VK's per-IP burst budget.
+			for i := bootstrap; i < n; i++ {
+				if ctx.Err() != nil {
+					return
+				}
+				if captchaTunnelSat.Load() {
+					log.Printf("StartProxy: tunnel egress also rate-limited; stopping at %d/%d sessions",
+						i, n)
+					return
+				}
+				spawnSession(i)
+				select {
+				case <-time.After(800 * time.Millisecond):
+				case <-ctx.Done():
+					return
+				}
+			}
+		})
+	}
+
+    log.Printf("Proxy started on %s with %d parallel TURN session(s) requested (phased)", localAddrStr, n)
     wg1.Wait()
 }
 

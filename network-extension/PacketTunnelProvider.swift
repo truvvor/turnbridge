@@ -43,6 +43,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private var lastPathStatus: Network.NWPath.Status?
     private var lastPathInterfaceLabel: String?
     private var lastTransportRestartAt = Date.distantPast
+    private var captchaStatsTimer: DispatchSourceTimer?
 
 
     /// Tear down the current TURN/DTLS cycle and let the proxy spin up
@@ -159,6 +160,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         DispatchQueue.global(qos: .userInteractive).async {
             StartProxy(vkLink, peerAddr, listenAddr, nValue, udpFlag)
         }
+
+        startCaptchaStatsPublisher()
 
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             let ready = ProxyWaitReady(dtlsReadyTimeoutMs)
@@ -305,6 +308,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         lastPathStatus = nil
         lastPathInterfaceLabel = nil
 
+        stopCaptchaStatsPublisher()
         StopProxy()
         SharedLogger.info("TURN proxy stopped", source: .tunnel)
         TransportHealthMonitor.reset()
@@ -331,6 +335,41 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
         let response = CaptchaBridge.handleAppMessage(messageData) ?? messageData
         completionHandler?(response)
+    }
+
+    /// Periodically copy the Go-side captcha counters into the App
+    /// Group's shared UserDefaults so the main app's UI can render
+    /// "Direct: X · Tunnel: Y" without an IPC round-trip every tick.
+    /// Reset to 0/0 happens on disconnect so the previous run's
+    /// numbers don't ghost into the next connection.
+    private func startCaptchaStatsPublisher() {
+        stopCaptchaStatsPublisher()
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now(), repeating: .seconds(1))
+        timer.setEventHandler {
+            let direct = Int(TurnBridgeGetCaptchaDirectCount())
+            let tunnel = Int(TurnBridgeGetCaptchaTunnelCount())
+            let directSat = TurnBridgeIsCaptchaDirectSaturated() != 0
+            let tunnelSat = TurnBridgeIsCaptchaTunnelSaturated() != 0
+            guard let defaults = UserDefaults(suiteName: CaptchaIPC.appGroupID) else { return }
+            defaults.set(direct, forKey: "captchaDirectCount")
+            defaults.set(tunnel, forKey: "captchaTunnelCount")
+            defaults.set(directSat, forKey: "captchaDirectSaturated")
+            defaults.set(tunnelSat, forKey: "captchaTunnelSaturated")
+        }
+        timer.resume()
+        captchaStatsTimer = timer
+    }
+
+    private func stopCaptchaStatsPublisher() {
+        captchaStatsTimer?.cancel()
+        captchaStatsTimer = nil
+        if let defaults = UserDefaults(suiteName: CaptchaIPC.appGroupID) {
+            defaults.set(0, forKey: "captchaDirectCount")
+            defaults.set(0, forKey: "captchaTunnelCount")
+            defaults.set(false, forKey: "captchaDirectSaturated")
+            defaults.set(false, forKey: "captchaTunnelSaturated")
+        }
     }
 
     override func sleep(completionHandler: @escaping () -> Void) {

@@ -71,6 +71,15 @@ type fanoutPacketConn struct {
 	deadlineTimer *time.Timer
 
 	dropped atomic.Uint64 // packets the dispatcher tried to enqueue but the channel was full
+
+	// active=false ⇒ dispatcher skips this lane. Used during phased
+	// bring-up: wave-2 fanouts exist before their DTLS sessions are
+	// up; without this gate the dispatcher round-robins WG packets
+	// into channels nobody is draining, the buffer fills, and packets
+	// get dropped instead of being delivered to the wave-1 lanes that
+	// are actually live. Flipped to true the instant the matching
+	// oneDtlsConnection signals sessionOk.
+	active atomic.Bool
 }
 
 func newFanoutPacketConn(id int, real net.PacketConn) *fanoutPacketConn {
@@ -228,11 +237,26 @@ func startFanoutDispatcher(ctx context.Context, listenConn net.PacketConn, fanou
 			data := make([]byte, n)
 			copy(data, buf[:n])
 
-			// Pick the next fanout. Use atomic counter so a future
-			// flow-hash dispatch could swap in here without changing
-			// the rest of the loop.
-			i := atomic.AddUint64(&rrIdx, 1) % uint64(len(fanouts))
-			f := fanouts[i]
+			// Pick the next ACTIVE fanout. During phased bring-up some
+			// fanouts exist but their DTLS sessions aren't up yet;
+			// posting to them would just fill the channel buffer and
+			// then drop. Linear probe from the round-robin cursor —
+			// O(N) worst case is fine for our N ≤ 100.
+			total := uint64(len(fanouts))
+			var f *fanoutPacketConn
+			for k := uint64(0); k < total; k++ {
+				i := (atomic.AddUint64(&rrIdx, 1) - 1) % total
+				if fanouts[i].active.Load() {
+					f = fanouts[i]
+					break
+				}
+			}
+			if f == nil {
+				// No active lanes — the bootstrap fleet hasn't come
+				// up yet, or all sessions died. Drop and account.
+				atomic.AddUint64(&dropped, 1)
+				continue
+			}
 
 			select {
 			case f.incoming <- fanoutPacket{data: data, addr: addr}:
