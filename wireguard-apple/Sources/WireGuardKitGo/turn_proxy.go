@@ -186,7 +186,7 @@ func getCreds(ctx context.Context, link string) (resUser string, resPass string,
     }()
 
 	data := "client_id=6287487&token_type=messages&client_secret=QbYic1K3lEV5kTGiqlq2&version=1&app_id=6287487"
-	url := "https://login.vk.ru/?act=get_anonym_token"
+	url := "https://login.vk.com/?act=get_anonym_token"
 
 	resp, err := doRequest(data, url)
 	if err != nil {
@@ -196,7 +196,7 @@ func getCreds(ctx context.Context, link string) (resUser string, resPass string,
 	token1 := resp["data"].(map[string]interface{})["access_token"].(string)
 
 	data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s", link, escapedName, token1)
-    reqURL := "https://api.vk.ru/method/calls.getAnonymousToken?v=5.274&client_id=6287487"
+    reqURL := "https://api.vk.com/method/calls.getAnonymousToken?v=5.274&client_id=6287487"
 
     var token2 string
     const maxCaptchaAttempts = 3

@@ -248,7 +248,7 @@ func solvePoW(powInput string, difficulty int) string {
 
 func callCaptchaNotRobot(ctx context.Context, client *http.Client, profile Profile, sessionToken, hash string, htmlSettings map[string]interface{}) (string, error) {
     vkReq := func(method string, postData string) (map[string]interface{}, error) {
-        requestURL := "https://api.vk.ru/method/" + method + "?v=5.131"
+        requestURL := "https://api.vk.com/method/" + method + "?v=5.131"
 
         req, err := http.NewRequestWithContext(ctx, "POST", requestURL, strings.NewReader(postData))
         if err != nil {
@@ -259,8 +259,8 @@ func callCaptchaNotRobot(ctx context.Context, client *http.Client, profile Profi
         req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
         req.Header.Set("Accept", "*/*")
         req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-        req.Header.Set("Origin", "https://id.vk.ru")
-        req.Header.Set("Referer", "https://id.vk.ru/")
+        req.Header.Set("Origin", "https://id.vk.com")
+        req.Header.Set("Referer", "https://id.vk.com/")
         if profile.SecChUa != "" {
             req.Header.Set("sec-ch-ua", profile.SecChUa)
             req.Header.Set("sec-ch-ua-mobile", profile.SecChUaMobile)

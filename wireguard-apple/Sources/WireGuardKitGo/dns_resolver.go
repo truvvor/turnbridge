@@ -2,7 +2,7 @@
 //
 // Resilient DNS for VK captcha/identity HTTP. The system resolver on
 // mobile carriers in censorship-heavy regions sometimes returns
-// NXDOMAIN, hijacked IPs, or hangs on api.vk.ru / id.vk.ru lookups,
+// NXDOMAIN, hijacked IPs, or hangs on api.vk.com / id.vk.com lookups,
 // even when the underlying network is otherwise fine. The captcha
 // solver then errors out with "no such host" or a timeout before any
 // of our retry logic can engage.
@@ -70,12 +70,17 @@ var dohCache sync.Map // host -> dohEntry
 // and DoH fail. VK's API endpoints have lived on these IPs for a long
 // time; refresh manually if VK migrates infrastructure.
 var fallbackIPs = map[string][]string{
+	"login.vk.com": {"87.240.132.78", "87.240.137.158"},
+	"api.vk.com":   {"87.240.132.78", "87.240.137.158"},
+	"id.vk.com":    {"87.240.132.78", "87.240.137.158"},
+	"vk.com":       {"87.240.132.78", "87.240.137.158"},
+	"m.vk.com":     {"87.240.132.78"},
+	// keep .ru hosts too in case some upstream code path still
+	// hits them (and they're reachable on the user's network).
 	"login.vk.ru": {"87.240.137.158", "87.240.190.78"},
 	"api.vk.ru":   {"87.240.137.158", "87.240.190.78"},
 	"id.vk.ru":    {"87.240.137.158", "87.240.190.78"},
 	"vk.ru":       {"87.240.137.158"},
-	"vk.com":      {"87.240.132.78", "87.240.137.158"},
-	"m.vk.com":    {"87.240.132.78"},
 }
 
 // customDial is the net.Dialer.DialContext-shaped function plug into
