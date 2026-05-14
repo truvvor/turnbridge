@@ -96,8 +96,15 @@ struct CapturedCaptchasView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .navigationBarTrailing) {
-                Button(action: refresh) {
-                    Image(systemName: "arrow.clockwise")
+                HStack(spacing: 6) {
+                    Button(role: .destructive, action: clearAll) {
+                        Image(systemName: "trash")
+                    }
+                    .disabled(entries.isEmpty && rawFileNames.isEmpty)
+
+                    Button(action: refresh) {
+                        Image(systemName: "arrow.clockwise")
+                    }
                 }
             }
         }
@@ -107,6 +114,21 @@ struct CapturedCaptchasView: View {
                 CapturedCaptchaDetail(entry: entry)
             }
         }
+    }
+
+    private func clearAll() {
+        guard let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: Self.appGroupID) else { return }
+        let trapDir = container.appendingPathComponent("captcha_trap", isDirectory: true)
+        guard let contents = try? FileManager.default.contentsOfDirectory(at: trapDir, includingPropertiesForKeys: nil, options: []) else {
+            return
+        }
+        for url in contents {
+            // Keep the probe file so the user can still see the path
+            // is live without reconnecting.
+            if url.lastPathComponent == "_probe.txt" { continue }
+            try? FileManager.default.removeItem(at: url)
+        }
+        refresh()
     }
 
     private func refresh() {

@@ -77,10 +77,11 @@ type captchaTrap struct {
 	label   string
 	started time.Time
 
-	mu      sync.Mutex
-	files   map[string][]byte
-	notes   []string
-	flushed bool
+	mu       sync.Mutex
+	files    map[string][]byte
+	notes    []string
+	flushed  bool
+	hasImage bool // set true the moment a non-empty image.* artefact lands
 }
 
 // newCaptchaTrap opens an in-memory artifact buffer. Safe to call even
@@ -106,7 +107,11 @@ func (t *captchaTrap) Save(name string, data []byte) {
 	}
 	cp := make([]byte, len(data))
 	copy(cp, data)
-	t.files[sanitizeArtifactName(name)] = cp
+	clean := sanitizeArtifactName(name)
+	t.files[clean] = cp
+	if len(cp) > 0 && strings.HasPrefix(clean, "image.") {
+		t.hasImage = true
+	}
 }
 
 // Note appends a human-readable line that lands in notes.log on commit.
@@ -125,7 +130,9 @@ func (t *captchaTrap) Note(format string, args ...any) {
 }
 
 // Commit flushes the buffer to disk under a fresh subdirectory. Safe to
-// call multiple times; only the first call writes.
+// call multiple times; only the first call writes. Commits without
+// an image artefact are skipped — text-only "VK said ERROR" entries
+// have no diagnostic value and just clutter the trap directory.
 func (t *captchaTrap) Commit(reason string) {
 	if t == nil {
 		return
@@ -140,6 +147,13 @@ func (t *captchaTrap) Commit(reason string) {
 		return
 	}
 	t.flushed = true
+
+	if !t.hasImage {
+		log.Printf("captcha-trap: skip commit, no image to capture (reason=%s)", reason)
+		t.files = nil
+		t.notes = nil
+		return
+	}
 
 	subdir := filepath.Join(root, fmt.Sprintf("%s_%s_%s",
 		t.started.Format("20060102_150405"),
