@@ -1259,9 +1259,15 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
 	}()
 
 	// Phase A: spawn direct sessions until N reached or direct egress
-	// hits ERROR_LIMIT. 400 ms stagger × throttle=5 in poolCreds keeps
-	// VK's anti-bot off our back while we drain its per-IP budget.
-	phaseAStagger := 400 * time.Millisecond
+	// hits ERROR_LIMIT. The 1.5-2.5 s pre-slot jitter inside poolCreds
+	// (see F3) now does the anti-bot pacing that the stagger used to
+	// do; the stagger only exists to give the saturation check inside
+	// this loop enough granularity to fire BEFORE the whole fleet has
+	// kicked off solveVkCaptcha. 100 ms × 50 = 5 s for all N to enter
+	// the slot queue, vs the old 20 s — saves ~15 s of bring-up time
+	// when direct doesn't saturate, while still letting Phase A→B
+	// transition fire within 100 ms of an ERROR_LIMIT landing.
+	phaseAStagger := 100 * time.Millisecond
 	phaseACount := 0
 	for phaseACount < n {
 		if directSaturated() {
@@ -1297,12 +1303,13 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
 	wg1.Go(func() {
 		log.Printf("StartProxy: spawning phase B (target=%d, already=%d)", n, phaseACount)
 
-		// Per-session stagger of 800 ms — slightly slower than
-		// Phase A because the WG server's egress is the only IP
-		// for everyone else's traffic too, so saturating it has
-		// wider blast radius. 800 ms × ~14 (typical remainder) ≈
-		// 11 s phase B warm-up.
-		phaseBStagger := 800 * time.Millisecond
+		// Per-session stagger 200 ms — twice Phase A because the WG
+		// server's egress is the only IP for everyone else's traffic
+		// too, so saturating it has wider blast radius. The 1.5-2.5 s
+		// pre-slot jitter (F3) handles anti-bot pacing; the stagger
+		// only governs how quickly the loop notices tunnel
+		// saturation. 200 ms × 40 ≈ 8 s phase B warm-up vs old 32 s.
+		phaseBStagger := 200 * time.Millisecond
 		for i := phaseACount; i < n; i++ {
 			if ctx.Err() != nil {
 				return
