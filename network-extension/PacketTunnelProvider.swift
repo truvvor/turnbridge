@@ -117,11 +117,28 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         TurnBridgeSetManualCaptchaMode(manualCaptchaEnabled ? 1 : 0)
         SharedLogger.info("Captcha mode: \(manualCaptchaEnabled ? "manual (browser sheet)" : "auto (in-tunnel solver)")", source: .tunnel)
 
-        // Manual captcha is human-driven, so give the user time to actually
-        // solve the challenge before declaring DTLS dead. Auto mode keeps
-        // the original 12s budget — if the solver can't bash through in
-        // that window something else is wrong and we want fast failure.
-        let dtlsReadyTimeoutMs: Int32 = manualCaptchaEnabled ? 300_000 : 12_000
+        // Scale the readiness budget by N: StartProxy on the Go side
+        // now waits for ALL N TURN allocations to come up before it
+        // signals proxyReady (otherwise the WG adapter starts after
+        // session 1 is up, iOS installs AllowedIPs=0.0.0.0/0 into
+        // utun, and the captcha load for sessions 2..N gets routed
+        // through the half-built tunnel and never completes — see
+        // turn_proxy.go's StartProxy comment).
+        //
+        // Per-session budget:
+        //   manual: the user is in the loop solving each captcha by
+        //   hand, so plan for ~30 s/session plus a generous floor.
+        //   auto:   the in-tunnel solver finishes in ~3–6 s on a
+        //   warm path but burns longer on a slider+retry sequence,
+        //   so budget ~15 s/session.
+        //
+        // The old 12 s / 300 s constants assumed N=1 and were the
+        // direct cause of "DTLS connection timeout (12s)" landing
+        // mid-Step-2/4 when nValue>1.
+        let perSessionMs: Int32 = manualCaptchaEnabled ? 30_000 : 15_000
+        let floorMs:      Int32 = manualCaptchaEnabled ? 60_000 : 20_000
+        let dtlsReadyTimeoutMs: Int32 = max(floorMs, perSessionMs * nValue)
+        SharedLogger.info("DTLS ready budget: \(dtlsReadyTimeoutMs / 1000)s for N=\(nValue) (\(manualCaptchaEnabled ? "manual" : "auto"))", source: .tunnel)
 
         DispatchQueue.global(qos: .userInteractive).async {
             StartProxy(vkLink, peerAddr, listenAddr, nValue, udpFlag)
