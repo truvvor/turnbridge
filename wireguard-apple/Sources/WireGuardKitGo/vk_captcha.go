@@ -117,7 +117,20 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError) (string, er
         return requestManualCaptcha(captchaErr.RedirectUri, 180*time.Second)
     }
 
-    time.Sleep(time.Duration(1500+mathrand.Intn(1000)) * time.Millisecond)
+    // Bump the in-flight gauge for this egress so the UI sees an
+    // increase the moment a solve starts. Released on every return
+    // path via defer.
+    isTunnel := markCaptchaAttemptStart()
+    defer markCaptchaAttemptDone(isTunnel)
+
+    // ctx-aware sleep so a Disconnect during the throttle-induced
+    // jitter wait bails immediately instead of running the full
+    // 1.5–2.5 s timer.
+    select {
+    case <-time.After(time.Duration(1500+mathrand.Intn(1000)) * time.Millisecond):
+    case <-ctx.Done():
+        return "", ctx.Err()
+    }
 
     log.Printf("[Captcha] Solving Not Robot Captcha...")
 
@@ -424,9 +437,9 @@ func callCaptchaNotRobot(ctx context.Context, client *http.Client, profile Profi
 
     sliderToken, sliderErr := solveSliderCaptcha(vkReq, baseParams, browserFp, hash, mergedSettings)
     if sliderErr != nil {
-        if strings.Contains(sliderErr.Error(), "ERROR_LIMIT") {
-            markCaptchaSaturated()
-        }
+        // saturation accounting now happens inside solveSliderCaptcha
+        // at the exact branch (ERROR_LIMIT or unparseable_response),
+        // so this caller just propagates the error.
         return "", fmt.Errorf("slider captcha also failed: %w", sliderErr)
     }
 

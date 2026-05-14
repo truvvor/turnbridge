@@ -48,7 +48,13 @@ extern void TurnBridgeSetStreamAggregation(int enabled);
 extern void TurnBridgeSetCaptchaTrapDir(const char *path);
 extern int TurnBridgeGetCaptchaDirectCount(void);
 extern int TurnBridgeGetCaptchaTunnelCount(void);
+extern int TurnBridgeGetCaptchaDirectAttempts(void);
+extern int TurnBridgeGetCaptchaTunnelAttempts(void);
+extern int TurnBridgeGetCaptchaDirectInFlight(void);
+extern int TurnBridgeGetCaptchaTunnelInFlight(void);
 extern int TurnBridgeIsCaptchaDirectSaturated(void);
 extern int TurnBridgeIsCaptchaTunnelSaturated(void);
+extern int TurnBridgeGetSessionsReady(void);
+extern int TurnBridgeGetSessionsTarget(void);
 
 #endif

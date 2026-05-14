@@ -15,6 +15,12 @@ import Combine
 final class CaptchaStatsState: ObservableObject {
     @Published private(set) var direct: Int = 0
     @Published private(set) var tunnel: Int = 0
+    @Published private(set) var directAttempts: Int = 0
+    @Published private(set) var tunnelAttempts: Int = 0
+    @Published private(set) var directInFlight: Int = 0
+    @Published private(set) var tunnelInFlight: Int = 0
+    @Published private(set) var sessionsReady: Int = 0
+    @Published private(set) var sessionsTarget: Int = 0
     @Published private(set) var directSaturated: Bool = false
     @Published private(set) var tunnelSaturated: Bool = false
 
@@ -33,6 +39,12 @@ final class CaptchaStatsState: ObservableObject {
         timer = nil
         direct = 0
         tunnel = 0
+        directAttempts = 0
+        tunnelAttempts = 0
+        directInFlight = 0
+        tunnelInFlight = 0
+        sessionsReady = 0
+        sessionsTarget = 0
         directSaturated = false
         tunnelSaturated = false
     }
@@ -43,6 +55,12 @@ final class CaptchaStatsState: ObservableObject {
         }
         direct = defaults.integer(forKey: "captchaDirectCount")
         tunnel = defaults.integer(forKey: "captchaTunnelCount")
+        directAttempts = defaults.integer(forKey: "captchaDirectAttempts")
+        tunnelAttempts = defaults.integer(forKey: "captchaTunnelAttempts")
+        directInFlight = defaults.integer(forKey: "captchaDirectInFlight")
+        tunnelInFlight = defaults.integer(forKey: "captchaTunnelInFlight")
+        sessionsReady = defaults.integer(forKey: "sessionsReady")
+        sessionsTarget = defaults.integer(forKey: "sessionsTarget")
         directSaturated = defaults.bool(forKey: "captchaDirectSaturated")
         tunnelSaturated = defaults.bool(forKey: "captchaTunnelSaturated")
     }
@@ -52,21 +70,37 @@ struct CaptchaStatsBadge: View {
     @ObservedObject var stats: CaptchaStatsState
 
     var body: some View {
-        // Always visible during connecting/connected: zeros give the
-        // user feedback that the counters exist and that they haven't
-        // yet incremented this connect cycle (often the case when
-        // pooled creds are reused without a fresh captcha solve).
-        HStack(spacing: 14) {
-            cell(label: "Direct",
-                 value: stats.direct,
-                 saturated: stats.directSaturated,
-                 accent: .blue)
-            Divider()
-                .frame(height: 22)
-            cell(label: "Tunnel",
-                 value: stats.tunnel,
-                 saturated: stats.tunnelSaturated,
-                 accent: .green)
+        VStack(spacing: 6) {
+            // Top row: Sessions ready/target — the single most useful
+            // number while connecting (are we making progress?).
+            HStack(spacing: 6) {
+                Image(systemName: "antenna.radiowaves.left.and.right")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                Text("\(stats.sessionsReady)/\(stats.sessionsTarget) sessions ready")
+                    .font(.system(size: 13, weight: .medium, design: .rounded))
+                    .foregroundColor(.primary)
+            }
+
+            Divider().padding(.horizontal, 4)
+
+            // Bottom row: per-egress counters with in-flight indicators.
+            HStack(spacing: 14) {
+                cell(label: "Direct",
+                     ok: stats.direct,
+                     attempts: stats.directAttempts,
+                     inFlight: stats.directInFlight,
+                     saturated: stats.directSaturated,
+                     accent: .blue)
+                Divider()
+                    .frame(height: 30)
+                cell(label: "Tunnel",
+                     ok: stats.tunnel,
+                     attempts: stats.tunnelAttempts,
+                     inFlight: stats.tunnelInFlight,
+                     saturated: stats.tunnelSaturated,
+                     accent: .green)
+            }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
@@ -78,16 +112,21 @@ struct CaptchaStatsBadge: View {
         )
     }
 
-    private func cell(label: String, value: Int, saturated: Bool, accent: Color) -> some View {
+    private func cell(label: String, ok: Int, attempts: Int, inFlight: Int, saturated: Bool, accent: Color) -> some View {
         VStack(spacing: 1) {
             HStack(spacing: 4) {
-                Text("\(value)")
+                Text("\(ok)")
                     .font(.system(size: 18, weight: .semibold, design: .rounded))
                     .foregroundColor(accent)
+                Text("/\(attempts)")
+                    .font(.system(size: 12, weight: .regular, design: .rounded))
+                    .foregroundColor(.secondary)
+                if inFlight > 0 {
+                    Text("·\(inFlight)⟳")
+                        .font(.system(size: 11, weight: .medium, design: .rounded))
+                        .foregroundColor(.orange)
+                }
                 if saturated {
-                    // Saturation = VK started returning ERROR_LIMIT for
-                    // this egress, so the pool is effectively closed
-                    // until VK's window resets.
                     Image(systemName: "exclamationmark.octagon.fill")
                         .font(.system(size: 11))
                         .foregroundColor(.orange)

@@ -77,8 +77,23 @@ struct ContentView: View {
                             .cornerRadius(16)
                             .shadow(color: buttonColor.opacity(0.4), radius: 8, x: 0, y: 4)
                     }
+                    // Long press = force disconnect. Useful when the
+                    // tunnel is stuck in a captcha loop and the
+                    // regular Disconnect tap isn't enough to break
+                    // out cleanly. Bypasses the .disabled() gate so
+                    // it works even while .connecting / .disconnecting.
+                    .simultaneousGesture(
+                        LongPressGesture(minimumDuration: 1.0)
+                            .onEnded { _ in forceDisconnect() }
+                    )
                     .disabled(vpnStatus == .connecting || vpnStatus == .disconnecting || store.selectedProfile == nil)
                     .padding(.horizontal, 40)
+
+                    if vpnStatus == .connecting || vpnStatus == .disconnecting {
+                        Text("Long-press to force disconnect")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
                 }
 
                 Spacer()
@@ -285,6 +300,16 @@ struct ContentView: View {
             return "Please provide a valid WireGuard configuration."
         }
         return nil
+    }
+
+    /// Always-on disconnect path. Regular `toggleTunnel()` is gated by
+    /// `vpnStatus == .connecting` to avoid double-taps; this one
+    /// bypasses that gate so a stuck "Please wait..." can be cleared
+    /// by long-press.
+    private func forceDisconnect() {
+        SharedLogger.warning("User forced disconnect (long-press)")
+        app.turnOffTunnel()
+        vpnStatus = .disconnecting
     }
 
     private func toggleTunnel() {

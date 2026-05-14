@@ -96,6 +96,12 @@ func solveSliderCaptcha(
 
     content, err := parseSliderContent(resp)
     if err != nil {
+        // status:ERROR / status:ERROR_LIMIT from slider getContent
+        // is VK rate-limiting us at the slider gate — count as a
+        // saturation hit so a high-N run doesn't keep spawning more
+        // sessions that will all hit the same wall. The fail streak
+        // resets on the next success.
+        markCaptchaSaturated()
         trap.Note("parseSliderContent failed: %v", err)
         trap.Commit("unparseable_response")
         return "", fmt.Errorf("slider parse: %w", err)
@@ -173,9 +179,17 @@ func solveSliderCaptcha(
                 return "", fmt.Errorf("slider: success_token not found")
             }
             log.Printf("slider: solved! position=%d (attempt %d/%d)", c.Index, i+1, maxTries)
-            // Deferred Discard frees the buffer — nothing reaches disk.
+            // Commit solved captchas too so the user can actually see
+            // what our solver is processing. The reason field marks
+            // them "solved_ok"; unsolved entries use other reasons.
+            // Without this commit a healthy run produces an empty trap
+            // dir, which looks indistinguishable from "the trap isn't
+            // wired correctly".
+            trap.Note("SOLVED at attempt %d/%d, position=%d", i+1, maxTries, c.Index)
+            trap.Commit("solved_ok")
             return successToken, nil
         case "ERROR_LIMIT":
+            markCaptchaSaturated()
             trap.Commit("error_limit")
             return "", fmt.Errorf("slider: ERROR_LIMIT")
         default:
