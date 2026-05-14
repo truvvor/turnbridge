@@ -21,6 +21,13 @@ struct GlobalSettingsView: View {
                 .onChange(of: manualCaptcha) { newValue in
                     ManualCaptchaSetting.isEnabled = newValue
                 }
+
+                NavigationLink(destination: CapturedCaptchasView()) {
+                    Label(
+                        title: { Text("Captured Captchas") },
+                        icon: { Image(systemName: "tray.full").foregroundColor(.secondary) }
+                    )
+                }
             }
 
             Section(header: Text("General")) {
