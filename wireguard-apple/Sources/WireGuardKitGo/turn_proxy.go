@@ -336,7 +336,16 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
         log.Printf("Closed DTLS connection\n")
     }()
     log.Printf("Established DTLS connection!\n")
-    select { case proxyReady <- struct{}{}: default: }
+    // NOTE: do NOT signal proxyReady here. Signalling it the moment
+    // the FIRST DTLS session establishes causes Swift to call
+    // adapter.start() and iOS to bring up utun with the WG config's
+    // AllowedIPs=0.0.0.0/0 routing. If the user has nValue>1, the
+    // remaining N-1 sessions still need to fetch fresh VK creds —
+    // and that means the manual-captcha WebView in the app tries to
+    // load id.vk.ru AFTER utun is up, so the captcha sheet ends up
+    // routed through the half-built tunnel and never loads. The
+    // proxyReady signal is now sent from StartProxy once all N
+    // sessions have established their DTLS+TURN allocations.
     go func() {
         for {
             select {
@@ -993,34 +1002,51 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
     wg1 := sync.WaitGroup{}
 	t := time.Tick(200 * time.Millisecond)
 
-	okchan := make(chan struct{})
-	connchan := make(chan net.PacketConn)
-
-	// Session 0 first; later sessions wait until it has solved captcha
-	// and we know the upstream is alive (okchan signal). Otherwise we'd
-	// fire N parallel captcha challenges at the user.
-	firstFanoutChan := makeFanoutChan(fanouts[0])
-	wg1.Go(func() {
-		oneDtlsConnectionLoop(ctx, peer, firstFanoutChan, connchan, okchan)
-	})
-	wg1.Go(func() {
-		oneTurnConnectionLoop(ctx, params, peer, connchan, t)
-	})
-
-    select {
-	case <-okchan:
-	case <-ctx.Done():
-	}
-
-	for i := 1; i < n; i++ {
+	// Spawn all N sessions one at a time. Each session needs its own
+	// VK captcha to fetch a fresh TURN identity, and the manual
+	// captcha sheet in the App has to be able to reach id.vk.ru while
+	// it's being solved. Once we signal proxyReady, Swift brings up
+	// the WG adapter and iOS installs the AllowedIPs=0.0.0.0/0 route
+	// into utun — at which point ALL device traffic flows through the
+	// tunnel we just built. If we signal proxyReady after the FIRST
+	// session establishes (the original behaviour), the next captcha
+	// load is routed via the half-built tunnel and never completes,
+	// hanging the connect flow forever. So:
+	//
+	//   1. spawn one session
+	//   2. wait for that session's DTLS to be up (okchan)
+	//   3. repeat until all N are up
+	//   4. only then signal proxyReady so the WG adapter starts
+	//
+	// Captchas are solved sequentially by the UI anyway (one sheet at
+	// a time), so this serialisation costs nothing extra in latency.
+	for i := 0; i < n; i++ {
 		fanoutChan := makeFanoutChan(fanouts[i])
 		cChan := make(chan net.PacketConn)
+		sessionOk := make(chan struct{})
+
 		wg1.Go(func() {
-			oneDtlsConnectionLoop(ctx, peer, fanoutChan, cChan, nil)
+			oneDtlsConnectionLoop(ctx, peer, fanoutChan, cChan, sessionOk)
 		})
 		wg1.Go(func() {
 			oneTurnConnectionLoop(ctx, params, peer, cChan, t)
 		})
+
+		select {
+		case <-sessionOk:
+			log.Printf("StartProxy: session %d/%d ready", i+1, n)
+		case <-ctx.Done():
+			log.Printf("StartProxy: cancelled before session %d/%d came up", i+1, n)
+			wg1.Wait()
+			return
+		}
+	}
+
+	// All N TURN allocations are alive. NOW it's safe to let Swift
+	// bring up the WG adapter and route the user's traffic into utun.
+	select {
+	case proxyReady <- struct{}{}:
+	default:
 	}
 
     log.Printf("Proxy started on %s with %d parallel TURN session(s)", localAddrStr, n)
