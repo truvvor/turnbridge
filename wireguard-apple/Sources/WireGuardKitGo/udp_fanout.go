@@ -185,9 +185,10 @@ func startFanoutDispatcher(ctx context.Context, listenConn net.PacketConn, fanou
 		var rrIdx uint64
 		var dropped uint64
 
-		// Periodic dispatcher health log, decoupled from the per-fanout
-		// session logs so a stalled consumer is visible even if its
-		// owning session never logs.
+		// Drops are silent under healthy conditions and only surface
+		// when a consumer is actually backing up. Periodic dispatcher
+		// health log fires every 10s but only emits a line if at
+		// least one packet was dropped since the last tick.
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
 		go func() {
@@ -197,12 +198,16 @@ func startFanoutDispatcher(ctx context.Context, listenConn net.PacketConn, fanou
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
+					curDrop := atomic.LoadUint64(&dropped)
+					if curDrop == prevDrop {
+						continue
+					}
 					var perFanoutDrop []uint64
 					for _, f := range fanouts {
 						perFanoutDrop = append(perFanoutDrop, f.dropped.Load())
 					}
-					curDrop := atomic.LoadUint64(&dropped)
-					log.Printf("fanout: total dropped=%d (Δ+%d) per-session=%v", curDrop, curDrop-prevDrop, perFanoutDrop)
+					log.Printf("fanout: dropped Δ+%d (total=%d) per-session=%v",
+						curDrop-prevDrop, curDrop, perFanoutDrop)
 					prevDrop = curDrop
 				}
 			}

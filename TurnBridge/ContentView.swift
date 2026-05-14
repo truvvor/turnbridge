@@ -297,6 +297,11 @@ struct ContentView: View {
                 return
             }
 
+            // Fresh slate per connect attempt. Keeps the log focused
+            // on the current session instead of accreting history
+            // across reconnects — the previous behaviour made it
+            // very hard to scan for "what happened THIS time".
+            SharedLogger.clearLogs()
             SharedLogger.info("User requested connect with profile \"\(profile.name)\"")
             vpnStatus = .connecting
             app.turnOnTunnel(

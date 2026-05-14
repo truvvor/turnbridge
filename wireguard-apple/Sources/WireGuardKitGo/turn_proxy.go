@@ -422,28 +422,11 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
 
     var addr atomic.Value
 
-    // Every 10s, dump the current totals and the deltas since the last
-    // tick. If user opens a website and these stay at +0 in both
-    // directions, no user traffic is reaching the DTLS layer (most
-    // likely the routing config is sending the request straight to
-    // WiFi/cellular, bypassing the tunnel entirely).
-    go func() {
-        ticker := time.NewTicker(10 * time.Second)
-        defer ticker.Stop()
-        var prevTx, prevRx uint64
-        for {
-            select {
-            case <-dtlsctx.Done():
-                return
-            case <-ticker.C:
-                tx := wgToDtls.Load()
-                rx := dtlsToWg.Load()
-                log.Printf("DTLS bytes wg→dtls=%d (Δ+%d) dtls→wg=%d (Δ+%d)",
-                    tx, tx-prevTx, rx, rx-prevRx)
-                prevTx, prevRx = tx, rx
-            }
-        }
-    }()
+    // Note: byte counters keep accumulating into wgToDtls / dtlsToWg
+    // and surface in the per-session lifetime log on exit. The
+    // periodic 10s dump was useful while we were proving that user
+    // traffic actually flows through the tunnel, but now it's just
+    // line noise.
 
     go func() {
         defer wg.Done()
@@ -731,25 +714,9 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 		}
 	}()
 
-	// Periodic counter dump every 10s so we can see whether the relay
-	// is actually carrying bytes or only the wakeup keepalives.
-	go func() {
-		ticker := time.NewTicker(10 * time.Second)
-		defer ticker.Stop()
-		var prevTx, prevRx uint64
-		for {
-			select {
-			case <-turnctx.Done():
-				return
-			case <-ticker.C:
-				tx := conn2ToRelay.Load()
-				rx := relayToConn2.Load()
-				log.Printf("TURN bytes conn2→relay=%d (Δ+%d) relay→conn2=%d (Δ+%d)",
-					tx, tx-prevTx, rx, rx-prevRx)
-				prevTx, prevRx = tx, rx
-			}
-		}
-	}()
+	// Byte counters are folded into the per-session lifetime log on
+	// exit; the periodic 10s dump that proved data was flowing
+	// during the throughput investigation is no longer interesting.
 
 	wg.Wait()
 	if err := relayConn.SetDeadline(time.Time{}); err != nil {
@@ -855,48 +822,52 @@ func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
 
 	return func(link string) (string, string, string, error) {
 		mu.Lock()
-		defer mu.Unlock()
 
 		if !cTime.IsZero() && time.Since(cTime) > 10*time.Minute {
 			pool = nil
 			cTime = time.Time{}
 		}
 
-		if len(pool) < poolSize {
-			u, p, a, err := f(link)
-			if err == nil {
-				pool = append(pool, turnCred{u, p, a})
-				cTime = time.Now()
-				log.Printf("Successfully registered User Identity %d/%d", len(pool), poolSize)
-
-				// Space out requests by 1000ms to avoid API limits
-				if len(pool) < poolSize {
-					time.Sleep(1000 * time.Millisecond)
-				}
-
-				c := pool[len(pool)-1]
-				idx++
-				return c.user, c.pass, c.addr, nil
-			}
-
-			log.Printf("Failed to get unique TURN identity: %v", err)
-			if len(pool) > 0 {
-				log.Printf("Falling back to reusing a previous identity...")
-				c := pool[idx%len(pool)]
-				idx++
-				cTime = time.Now()
-				return c.user, c.pass, c.addr, nil
-			}
-			return "", "", "", err
+		// Cache-hit fast path: pool already at capacity, hand out a
+		// rotating cached cred and bail.
+		if len(pool) >= poolSize {
+			c := pool[idx%len(pool)]
+			idx++
+			cTime = time.Now()
+			mu.Unlock()
+			return c.user, c.pass, c.addr, nil
 		}
 
-		c := pool[idx%len(pool)]
-		idx++
-		// Refresh the cache deadline on every reuse so reconnect storms
-		// after a long-lived session don't suddenly evict the pool and
-		// force a fresh captcha.
-		cTime = time.Now()
-		return c.user, c.pass, c.addr, nil
+		// Cache-miss slow path: release the mutex during the captcha
+		// solve so N parallel callers (one per TURN session) actually
+		// fetch concurrently instead of serialising on this lock.
+		// Previously this mutex was held across f(link), which made
+		// nValue=30 take ~3 minutes (30 × 5–6 s) to warm the pool.
+		// The pre-existing 1 s "API rate-limit" sleep is also gone —
+		// it was meaningless under serialised access and actively
+		// harmful when callers run in parallel.
+		mu.Unlock()
+		u, p, a, err := f(link)
+		mu.Lock()
+		defer mu.Unlock()
+
+		if err == nil {
+			pool = append(pool, turnCred{u, p, a})
+			cTime = time.Now()
+			log.Printf("Successfully registered User Identity %d/%d", len(pool), poolSize)
+			idx++
+			return u, p, a, nil
+		}
+
+		log.Printf("Failed to get unique TURN identity: %v", err)
+		if len(pool) > 0 {
+			log.Printf("Falling back to reusing a previous identity...")
+			c := pool[idx%len(pool)]
+			idx++
+			cTime = time.Now()
+			return c.user, c.pass, c.addr, nil
+		}
+		return "", "", "", err
 	}
 }
 
@@ -1002,25 +973,23 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
     wg1 := sync.WaitGroup{}
 	t := time.Tick(200 * time.Millisecond)
 
-	// Spawn all N sessions one at a time. Each session needs its own
-	// VK captcha to fetch a fresh TURN identity, and the manual
-	// captcha sheet in the App has to be able to reach id.vk.ru while
-	// it's being solved. Once we signal proxyReady, Swift brings up
-	// the WG adapter and iOS installs the AllowedIPs=0.0.0.0/0 route
-	// into utun — at which point ALL device traffic flows through the
-	// tunnel we just built. If we signal proxyReady after the FIRST
-	// session establishes (the original behaviour), the next captcha
-	// load is routed via the half-built tunnel and never completes,
-	// hanging the connect flow forever. So:
+	// Spawn ALL N sessions in parallel. Sequential spawning made the
+	// auto-captcha mode artificially slow at high nValue
+	// (N=30 → 30 captchas back-to-back → ~3 minutes), even though
+	// the in-tunnel captcha solver runs entirely inside the
+	// extension's Go code with no UI dependency and can absolutely
+	// be parallelised. In manual-captcha mode the UI is the natural
+	// serialiser (it only presents one WebView sheet at a time), so
+	// spawning all N at once still produces a sequential user-facing
+	// flow there — no regression.
 	//
-	//   1. spawn one session
-	//   2. wait for that session's DTLS to be up (okchan)
-	//   3. repeat until all N are up
-	//   4. only then signal proxyReady so the WG adapter starts
-	//
-	// Captchas are solved sequentially by the UI anyway (one sheet at
-	// a time), so this serialisation costs nothing extra in latency.
+	// We still wait for ALL N to signal okchan before sending to
+	// proxyReady, otherwise utun comes up half-built and the manual
+	// captcha WebView for not-yet-ready sessions hangs (see commit
+	// ca8b19f for the original rationale of this barrier).
+	sessionReady := make(chan int, n)
 	for i := 0; i < n; i++ {
+		i := i
 		fanoutChan := makeFanoutChan(fanouts[i])
 		cChan := make(chan net.PacketConn)
 		sessionOk := make(chan struct{})
@@ -1031,12 +1000,25 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
 		wg1.Go(func() {
 			oneTurnConnectionLoop(ctx, params, peer, cChan, t)
 		})
+		// One forwarder per session that pushes its index onto the
+		// aggregate ready channel as soon as that session establishes
+		// its DTLS. Decouples the wait-for-all loop below from the
+		// per-session okchan semantics.
+		go func() {
+			select {
+			case <-sessionOk:
+				sessionReady <- i
+			case <-ctx.Done():
+			}
+		}()
+	}
 
+	for k := 0; k < n; k++ {
 		select {
-		case <-sessionOk:
-			log.Printf("StartProxy: session %d/%d ready", i+1, n)
+		case idx := <-sessionReady:
+			log.Printf("StartProxy: session %d ready (%d/%d total)", idx+1, k+1, n)
 		case <-ctx.Done():
-			log.Printf("StartProxy: cancelled before session %d/%d came up", i+1, n)
+			log.Printf("StartProxy: cancelled, only %d/%d sessions came up", k, n)
 			wg1.Wait()
 			return
 		}
