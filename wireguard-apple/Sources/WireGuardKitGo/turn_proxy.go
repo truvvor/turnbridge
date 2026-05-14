@@ -1142,6 +1142,47 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
 		return
 	}
 
+	// Start the sessionReady drain + proxyReady-signaller BEFORE the
+	// Phase A spawn loop. iOS' startTunnel completion handler has to
+	// fire within ~15-20 s or the OS gives up and tears the tunnel
+	// down. Phase A's 400 ms stagger × N=50 = 20 s of spawning, so if
+	// we wait for "phase A done" before consuming the first
+	// sessionReady, iOS pulls the plug before WG ever starts. With
+	// this goroutine reading concurrently, the very first DTLS-ready
+	// session (≈5 s in) triggers proxyReady immediately and Swift's
+	// adapter.start fires without waiting on the rest of the fleet.
+	go func() {
+		firstSignalled := false
+		for {
+			select {
+			case idx := <-sessionReady:
+				log.Printf("StartProxy: session %d ready", idx+1)
+				if !firstSignalled {
+					firstSignalled = true
+					log.Printf("StartProxy: first session ready, signaling proxyReady")
+					select {
+					case proxyReady <- struct{}{}:
+					default:
+					}
+					// Flip tunnel egress 2 s after the first DTLS
+					// session is up — WG handshake completes in that
+					// window and from then on the extension's HTTP
+					// auto-routes through utun.
+					go func() {
+						select {
+						case <-time.After(2 * time.Second):
+							captchaTunnelEgress.Store(true)
+							log.Printf("StartProxy: tunnel egress engaged")
+						case <-ctx.Done():
+						}
+					}()
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
 	// Phase A: spawn direct sessions until N reached or direct egress
 	// hits ERROR_LIMIT. 400 ms stagger × throttle=5 in poolCreds keeps
 	// VK's anti-bot off our back while we drain its per-IP budget.
@@ -1165,66 +1206,21 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
 	log.Printf("StartProxy: phase A done, spawned=%d/%d direct, saturated=%v",
 		phaseACount, n, directSaturated())
 
-	// Bridge: wait for any spawned session to reach DTLS ready, then
-	// fire proxyReady so Swift can start the WG adapter.
-	select {
-	case idx := <-sessionReady:
-		log.Printf("StartProxy: first session ready (%d), signaling proxyReady", idx+1)
-	case <-ctx.Done():
-		wg1.Wait()
-		return
-	}
-	select {
-	case proxyReady <- struct{}{}:
-	default:
-	}
-
-	// Drain remaining ready signals indefinitely. Both Phase A
-	// stragglers and Phase B sessions land here; we just log each
-	// and don't gate on counts.
-	go func() {
-		for {
-			select {
-			case idx := <-sessionReady:
-				log.Printf("StartProxy: session %d ready", idx+1)
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
 	if phaseACount >= n {
-		// Phase A spawned all N — no Phase B needed. captchaTunnelEgress
-		// still flips so the UI knows when WG is up, even if no
-		// solves happen post-flip.
-		go func() {
-			select {
-			case <-time.After(2 * time.Second):
-				captchaTunnelEgress.Store(true)
-			case <-ctx.Done():
-			}
-		}()
+		// Phase A spawned all N — no Phase B needed. proxyReady was
+		// already fired by the drain goroutine above; nothing else
+		// to do here.
 		log.Printf("Proxy started on %s with %d parallel TURN session(s) (all direct)", localAddrStr, n)
 		wg1.Wait()
 		return
 	}
 
 	// Phase B: still need sessions, direct saturated. Spawn the rest
-	// through the tunnel egress. wg1.Go so StartProxy can return and
-	// Swift's WG adapter actually gets started; wg1.Wait at the
-	// bottom blocks on every spawned goroutine.
+	// through the tunnel egress. captchaTunnelEgress has either
+	// already flipped (if first session was ready before saturation)
+	// or will flip via the drain goroutine after the next ready.
 	wg1.Go(func() {
-		// Give WG handshake ~2 s through the just-ready bootstrap
-		// session. After that, this extension's HTTP routes through
-		// utun → WG server → api.vk.ru.
-		select {
-		case <-time.After(2 * time.Second):
-		case <-ctx.Done():
-			return
-		}
-		captchaTunnelEgress.Store(true)
-		log.Printf("StartProxy: tunnel egress engaged; spawning phase B (target=%d, already=%d)",
-			n, phaseACount)
+		log.Printf("StartProxy: spawning phase B (target=%d, already=%d)", n, phaseACount)
 
 		// Per-session stagger of 800 ms — slightly slower than
 		// Phase A because the WG server's egress is the only IP
