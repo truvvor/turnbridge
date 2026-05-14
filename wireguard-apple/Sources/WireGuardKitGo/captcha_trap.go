@@ -53,7 +53,19 @@ func TurnBridgeSetCaptchaTrapDir(cPath *C.char) {
 		captchaTrapDir.Store("")
 		return
 	}
-	log.Printf("captcha-trap: artifacts → %s", path)
+	// Write a probe file so the path is verifiable end-to-end without
+	// waiting for a captcha to actually fail. If the user opens
+	// "Captured Captchas" and sees nothing AND no probe, the issue is
+	// path/permission. If they see the probe but no failure folders,
+	// the slider solver simply hasn't tripped this session.
+	probePath := filepath.Join(path, "_probe.txt")
+	probeContent := fmt.Sprintf("trap dir: %s\nwritten:  %s\npid:      %d\n",
+		path, time.Now().Format(time.RFC3339), os.Getpid())
+	if err := os.WriteFile(probePath, []byte(probeContent), 0o644); err != nil {
+		log.Printf("captcha-trap: probe write failed: %v", err)
+	} else {
+		log.Printf("captcha-trap: artifacts → %s (probe written)", path)
+	}
 }
 
 func captchaTrapRoot() string {

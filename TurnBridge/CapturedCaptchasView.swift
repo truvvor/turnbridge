@@ -14,6 +14,10 @@ import SwiftUI
 struct CapturedCaptchasView: View {
     @State private var entries: [Entry] = []
     @State private var selectedEntry: Entry?
+    @State private var trapPath: String = "(not initialized)"
+    @State private var probeExists: Bool = false
+    @State private var rootError: String?
+    @State private var rawFileNames: [String] = []
 
     private static let appGroupID = "group.com.truvvor.turnbridge"
 
@@ -28,15 +32,44 @@ struct CapturedCaptchasView: View {
     }
 
     var body: some View {
-        Group {
-            if entries.isEmpty {
-                ContentUnavailableView(
-                    "No captured captchas yet",
-                    systemImage: "tray",
-                    description: Text("Failed slider solves drop their image and raw VK response here. If you've connected without seeing ERROR_LIMIT/slider failures, the trap stays empty.")
-                )
-            } else {
-                List {
+        List {
+            Section(header: Text("Trap location")) {
+                Text(trapPath)
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+
+                HStack {
+                    Image(systemName: probeExists ? "checkmark.circle.fill" : "xmark.circle.fill")
+                        .foregroundColor(probeExists ? .green : .orange)
+                    Text(probeExists
+                         ? "Probe file present — extension is writing to this path."
+                         : "No probe file. Tunnel must be started at least once for the path to be created. If you've connected and still see this, the extension isn't wired correctly.")
+                        .font(.caption)
+                }
+
+                if let rootError = rootError {
+                    Text(rootError)
+                        .font(.caption)
+                        .foregroundColor(.red)
+                }
+
+                Text("Raw filesystem entries: \(rawFileNames.count)")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                if !rawFileNames.isEmpty {
+                    Text(rawFileNames.joined(separator: "\n"))
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .textSelection(.enabled)
+                }
+            }
+
+            Section(header: Text("Unsolved captchas (\(entries.count))")) {
+                if entries.isEmpty {
+                    Text("None yet. Each failed slider solve drops a folder here with the image and raw VK response. Successful solves leave nothing behind.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                } else {
                     ForEach(entries) { entry in
                         Button(action: { selectedEntry = entry }) {
                             VStack(alignment: .leading, spacing: 4) {
@@ -77,19 +110,38 @@ struct CapturedCaptchasView: View {
     }
 
     private func refresh() {
+        rawFileNames = []
+        rootError = nil
+        probeExists = false
+
         guard let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: Self.appGroupID) else {
+            trapPath = "(App Group container unavailable)"
+            rootError = "FileManager returned nil for \(Self.appGroupID). Check the App Group entitlement."
             entries = []
             return
         }
         let trapDir = container.appendingPathComponent("captcha_trap", isDirectory: true)
-        guard let contents = try? FileManager.default.contentsOfDirectory(
-            at: trapDir,
-            includingPropertiesForKeys: [.creationDateKey],
-            options: [.skipsHiddenFiles]
-        ) else {
+        trapPath = trapDir.path
+
+        if !FileManager.default.fileExists(atPath: trapDir.path) {
+            rootError = "Directory does not exist yet. Start a tunnel and reconnect."
             entries = []
             return
         }
+
+        probeExists = FileManager.default.fileExists(atPath: trapDir.appendingPathComponent("_probe.txt").path)
+
+        guard let contents = try? FileManager.default.contentsOfDirectory(
+            at: trapDir,
+            includingPropertiesForKeys: [.creationDateKey, .isDirectoryKey],
+            options: []
+        ) else {
+            rootError = "contentsOfDirectory failed."
+            entries = []
+            return
+        }
+
+        rawFileNames = contents.map { $0.lastPathComponent }.sorted()
 
         entries = contents
             .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
