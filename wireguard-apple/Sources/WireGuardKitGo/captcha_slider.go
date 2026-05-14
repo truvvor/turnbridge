@@ -21,15 +21,16 @@ const (
     defaultSliderAttempts = 4
 )
 
-// sliderRankSlot bounds the parallelism of the rendering+scoring step
-// in rankSliderCandidates. Each ranking allocates a fresh RGBA buffer
-// per candidate (49 × 600×600 × 4 = ~70 MB transient per solver). With
-// poolCreds' throttle=5 captcha solves in flight, the unbounded version
-// peaked around ~350 MB — well above the iOS NetworkExtension memory
-// cap (typically 50–100 MB). The cap-2 gate keeps peak < ~140 MB and
-// the latency hit is tiny (rank is ~50 ms on iPhone, so a 1-deep
-// queue resolves before the next captcha solve produces a slider).
-var sliderRankSlot = make(chan struct{}, 2)
+// sliderRankSlot bounds the parallelism of the scoring step in
+// rankSliderCandidates. Before F5 each ranking materialised the full
+// rearranged image per candidate (49 × 600×600 × 4 = ~70 MB transient
+// per solver), so cap-2 was a hard memory ceiling. F5 scores directly
+// on the source image without materialising swaps — peak transient
+// drops to a few KB — so the slot now exists only to bound CPU when
+// many slider captchas land at once. Matches maxConcurrentCaptchaSolves
+// so the captcha pipeline isn't artificially throttled below its own
+// concurrency cap.
+var sliderRankSlot = make(chan struct{}, maxConcurrentCaptchaSolves)
 
 // vkReqFunc is the type for the VK API request helper from callCaptchaNotRobotAPI.
 type vkReqFunc func(method, postData string) (map[string]interface{}, error)
@@ -483,12 +484,14 @@ func rankSliderCandidates(img image.Image, gridW, gridH int, swaps []int) ([]sli
             return nil, err
         }
 
-        rendered, err := renderSliderCandidate(img, gridW, gridH, mapping)
-        if err != nil {
-            return nil, err
-        }
-
-        score := scoreRenderedSliderImage(rendered, gridW, gridH)
+        // F5: score directly on the source image without rendering a
+        // full RGBA buffer per candidate. The seam-energy metric only
+        // needs pixel values at adjacent-tile boundaries, which we
+        // can look up via the mapping (destination position d's
+        // pixels come from source tile mapping[d]). Drops slider rank
+        // peak memory from ~140 MB to a few KB, lets the slot cap be
+        // raised back to maxConcurrentCaptchaSolves.
+        score := scoreSliderMapping(img, gridW, gridH, mapping)
         candidates = append(candidates, sliderCandidate{
             Index:       idx,
             ActiveSteps: activeSteps,
@@ -504,6 +507,63 @@ func rankSliderCandidates(img image.Image, gridW, gridH int, swaps []int) ([]sli
     })
 
     return candidates, nil
+}
+
+// scoreSliderMapping computes a seam-energy score for a candidate
+// tile mapping without materialising the rearranged image. For every
+// pair of adjacent destination positions it looks up the source
+// tiles via the mapping and sums pixel differences across the shared
+// border directly on `img`. The correct (=originally-arranged)
+// mapping produces the lowest total energy; rankSliderCandidates
+// sorts ascending and picks the top one.
+//
+// Equivalent to first rendering the rearranged image and then
+// scoring across its inter-tile borders, except this skips a
+// 600×600×4-byte allocation per candidate and slashes ranking peak
+// memory by ~70 MB.
+func scoreSliderMapping(img image.Image, gridW, gridH int, mapping []int) int64 {
+    bounds := img.Bounds()
+    var score int64
+
+    // Horizontal seams: dest left tile's right edge vs dest right
+    // tile's left edge. Source tile rects for each give the pixels.
+    for row := 0; row < gridH; row++ {
+        for col := 0; col < gridW-1; col++ {
+            srcLeft := sliderTileRect(bounds, gridW, gridH, mapping[row*gridW+col])
+            srcRight := sliderTileRect(bounds, gridW, gridH, mapping[row*gridW+col+1])
+            height := srcLeft.Dy()
+            if h := srcRight.Dy(); h < height {
+                height = h
+            }
+            for y := 0; y < height; y++ {
+                score += pixelDiff(
+                    img.At(srcLeft.Max.X-1, srcLeft.Min.Y+y),
+                    img.At(srcRight.Min.X, srcRight.Min.Y+y),
+                )
+            }
+        }
+    }
+
+    // Vertical seams: dest top tile's bottom edge vs dest bottom
+    // tile's top edge.
+    for row := 0; row < gridH-1; row++ {
+        for col := 0; col < gridW; col++ {
+            srcTop := sliderTileRect(bounds, gridW, gridH, mapping[row*gridW+col])
+            srcBottom := sliderTileRect(bounds, gridW, gridH, mapping[(row+1)*gridW+col])
+            width := srcTop.Dx()
+            if w := srcBottom.Dx(); w < width {
+                width = w
+            }
+            for x := 0; x < width; x++ {
+                score += pixelDiff(
+                    img.At(srcTop.Min.X+x, srcTop.Max.Y-1),
+                    img.At(srcBottom.Min.X+x, srcBottom.Min.Y),
+                )
+            }
+        }
+    }
+
+    return score
 }
 
 func buildSliderActiveSteps(swaps []int, candidateIndex int) []int {
@@ -540,65 +600,6 @@ func buildSliderTileMapping(gridW, gridH int, activeSteps []int) ([]int, error) 
     return mapping, nil
 }
 
-func renderSliderCandidate(img image.Image, gridW, gridH int, mapping []int) (*image.RGBA, error) {
-    tileCount := gridW * gridH
-    if len(mapping) != tileCount {
-        return nil, fmt.Errorf("mapping length %d != %d", len(mapping), tileCount)
-    }
-
-    bounds := img.Bounds()
-    rendered := image.NewRGBA(bounds)
-    for dstIdx, srcIdx := range mapping {
-        srcRect := sliderTileRect(bounds, gridW, gridH, srcIdx)
-        dstRect := sliderTileRect(bounds, gridW, gridH, dstIdx)
-        copyTile(rendered, dstRect, img, srcRect)
-    }
-    return rendered, nil
-}
-
-func scoreRenderedSliderImage(img image.Image, gridW, gridH int) int64 {
-    bounds := img.Bounds()
-    var score int64
-
-    // Horizontal borders (left tile right edge vs right tile left edge)
-    for row := 0; row < gridH; row++ {
-        for col := 0; col < gridW-1; col++ {
-            leftRect := sliderTileRect(bounds, gridW, gridH, row*gridW+col)
-            rightRect := sliderTileRect(bounds, gridW, gridH, row*gridW+col+1)
-            height := leftRect.Dy()
-            if h := rightRect.Dy(); h < height {
-                height = h
-            }
-            for y := 0; y < height; y++ {
-                score += pixelDiff(
-                    img.At(leftRect.Max.X-1, leftRect.Min.Y+y),
-                    img.At(rightRect.Min.X, rightRect.Min.Y+y),
-                )
-            }
-        }
-    }
-
-    // Vertical borders (top tile bottom edge vs bottom tile top edge)
-    for row := 0; row < gridH-1; row++ {
-        for col := 0; col < gridW; col++ {
-            topRect := sliderTileRect(bounds, gridW, gridH, row*gridW+col)
-            bottomRect := sliderTileRect(bounds, gridW, gridH, (row+1)*gridW+col)
-            width := topRect.Dx()
-            if w := bottomRect.Dx(); w < width {
-                width = w
-            }
-            for x := 0; x < width; x++ {
-                score += pixelDiff(
-                    img.At(topRect.Min.X+x, topRect.Max.Y-1),
-                    img.At(bottomRect.Min.X+x, bottomRect.Min.Y),
-                )
-            }
-        }
-    }
-
-    return score
-}
-
 func sliderTileRect(bounds image.Rectangle, gridW, gridH, index int) image.Rectangle {
     row := index / gridW
     col := index % gridW
@@ -607,18 +608,6 @@ func sliderTileRect(bounds image.Rectangle, gridW, gridH, index int) image.Recta
     y0 := bounds.Min.Y + row*bounds.Dy()/gridH
     y1 := bounds.Min.Y + (row+1)*bounds.Dy()/gridH
     return image.Rect(x0, y0, x1, y1)
-}
-
-func copyTile(dst *image.RGBA, dstRect image.Rectangle, src image.Image, srcRect image.Rectangle) {
-    dw, dh := dstRect.Dx(), dstRect.Dy()
-    sw, sh := srcRect.Dx(), srcRect.Dy()
-    for y := 0; y < dh; y++ {
-        sy := srcRect.Min.Y + y*sh/dh
-        for x := 0; x < dw; x++ {
-            sx := srcRect.Min.X + x*sw/dw
-            dst.Set(dstRect.Min.X+x, dstRect.Min.Y+y, src.At(sx, sy))
-        }
-    }
 }
 
 func pixelDiff(a, b color.Color) int64 {
