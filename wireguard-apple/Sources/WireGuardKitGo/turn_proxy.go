@@ -133,6 +133,13 @@ func getCreds(link string) (resUser string, resPass string, resTurn string, resE
 		client := &http.Client{
 			Timeout: 20 * time.Second,
 			Transport: &http.Transport{
+				// customDial layers system DNS → DoH (1.1.1.1) →
+				// hardcoded VK fallback IPs. Russian mobile carriers
+				// regularly NXDOMAIN login.vk.ru / api.vk.ru, so
+				// without this fallback the very first
+				// get_anonym_token POST dies on lookup before any
+				// captcha logic engages. See dns_resolver.go.
+				DialContext:         customDial,
 				MaxIdleConns:        100,
 				MaxIdleConnsPerHost: 100,
 				IdleConnTimeout:     90 * time.Second,

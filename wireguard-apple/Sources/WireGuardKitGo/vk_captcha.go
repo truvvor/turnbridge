@@ -12,7 +12,6 @@ import (
     "io"
     "log"
     mathrand "math/rand"
-    "net"
     "net/http"
     "net/http/cookiejar"
     "net/url"
@@ -50,10 +49,12 @@ func newCaptchaClient() *http.Client {
         Timeout: 20 * time.Second,
         Jar:     jar,
         Transport: &http.Transport{
-            DialContext: (&net.Dialer{
-                Timeout:   30 * time.Second,
-                KeepAlive: 30 * time.Second,
-            }).DialContext,
+            // customDial layers system DNS → DoH (1.1.1.1) → hardcoded
+            // VK IPs. Russian mobile carriers regularly return NXDOMAIN
+            // or hijacked records for api.vk.ru / id.vk.ru, which
+            // bricks the captcha solver before any other retry can
+            // engage. See dns_resolver.go.
+            DialContext: customDial,
             TLSClientConfig: &tls.Config{
                 InsecureSkipVerify: false,
             },
