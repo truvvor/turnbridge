@@ -886,6 +886,40 @@ func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
 			return c.user, c.pass, c.addr, nil
 		}
 
+		// Saturation short-circuit. Reconnect loops (oneDtls/oneTurn
+		// ConnectionLoop) call getCreds on every retry, and while the
+		// pool is below poolSize each call would otherwise spin up
+		// another solveVkCaptcha → ERROR_LIMIT → recycle cycle. With
+		// N=50 sessions all hitting VK's rate-limit simultaneously
+		// this snowballs into 100+ doomed captcha attempts per minute
+		// and a fresh TURN allocation per attempt — each of which VK
+		// closes within ~50 s. Detect the burning state and short-
+		// circuit straight to a recycled cred. The cooldown in
+		// directSaturated/tunnelSaturated will auto-clear the streak
+		// after captchaCooldown so this is not permanent — once VK's
+		// rate-limit window expires, real solves resume.
+		if len(pool) > 0 {
+			egressIsTunnel := captchaTunnelEgress.Load()
+			// "currentSat" is the egress this attempt would use by
+			// default. "otherSat" is the egress solveVkCaptcha can
+			// escape to via the force-direct path (cellularDial).
+			// That escape only exists for tunnel → direct, not the
+			// other way around, so when we're already on direct the
+			// short-circuit just looks at directSaturated.
+			currentSat := directSaturated()
+			otherSat := tunnelSaturated()
+			if egressIsTunnel {
+				currentSat, otherSat = tunnelSaturated(), directSaturated()
+			}
+			if currentSat && (otherSat || !egressIsTunnel) {
+				c := pool[idx%len(pool)]
+				idx++
+				cTime = time.Now()
+				mu.Unlock()
+				return c.user, c.pass, c.addr, nil
+			}
+		}
+
 		// Cache-miss slow path: release the mutex, take a solve slot,
 		// then call f(ctx, link). The mutex is dropped first so we don't
 		// serialise on it while waiting for a slot, and we don't hold

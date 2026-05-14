@@ -57,6 +57,7 @@ func solveSliderCaptcha(
     browserFp string,
     hash string,
     settingsResp map[string]interface{},
+    isTunnel bool,
 ) (string, error) {
     // Extract slider settings from the settings response
     sliderSettings := extractSliderSettings(settingsResp)
@@ -111,7 +112,7 @@ func solveSliderCaptcha(
         // saturation hit so a high-N run doesn't keep spawning more
         // sessions that will all hit the same wall. The fail streak
         // resets on the next success.
-        markCaptchaSaturated()
+        markCaptchaSaturated(isTunnel)
         trap.Note("parseSliderContent failed: %v", err)
         trap.Commit("unparseable_response")
         return "", fmt.Errorf("slider parse: %w", err)
@@ -206,7 +207,7 @@ func solveSliderCaptcha(
             trap.Commit("solved_ok")
             return successToken, nil
         case "ERROR_LIMIT":
-            markCaptchaSaturated()
+            markCaptchaSaturated(isTunnel)
             trap.Commit("error_limit")
             return "", fmt.Errorf("slider: ERROR_LIMIT")
         default:

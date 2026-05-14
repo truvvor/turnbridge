@@ -43,8 +43,19 @@ func randomHex(n int) string {
     return hex.EncodeToString(bytes)
 }
 
-func newCaptchaClient() *http.Client {
+func newCaptchaClient(forceDirect bool) *http.Client {
     jar, _ := cookiejar.New(nil)
+    dialer := customDial
+    if forceDirect {
+        // After WG comes up the extension's default route is utun, so
+        // every captcha HTTP normally goes through the tunnel egress.
+        // When the tunnel egress has hit VK's per-IP rate-limit we
+        // want to retry from the original physical egress (cellular /
+        // WiFi). cellularDial pins the socket to a non-utun interface
+        // index via IP_BOUND_IF so the kernel routes through the
+        // physical NIC instead of utun.
+        dialer = cellularDial
+    }
     return &http.Client{
         Timeout: 20 * time.Second,
         Jar:     jar,
@@ -54,7 +65,7 @@ func newCaptchaClient() *http.Client {
             // or hijacked records for api.vk.ru / id.vk.ru, which
             // bricks the captcha solver before any other retry can
             // engage. See dns_resolver.go.
-            DialContext: customDial,
+            DialContext: dialer,
             TLSClientConfig: &tls.Config{
                 InsecureSkipVerify: false,
             },
@@ -117,10 +128,22 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError) (string, er
         return requestManualCaptcha(captchaErr.RedirectUri, 180*time.Second)
     }
 
+    // Egress decision. The default is whatever captchaTunnelEgress
+    // dictates (direct pre-handshake, tunnel post-handshake). When
+    // tunnel is saturated AND direct still has budget, we override
+    // and pin a physical interface (cellular / WiFi) for this attempt
+    // so the request bypasses utun — that's the only way to retry
+    // the direct egress after WG comes up. cellularDial falls back
+    // to the system route if no usable physical interface is found.
+    forceDirect := captchaTunnelEgress.Load() && tunnelSaturated() && !directSaturated()
+    if forceDirect {
+        log.Printf("[Captcha] tunnel egress saturated — forcing physical-interface egress")
+    }
+
     // Bump the in-flight gauge for this egress so the UI sees an
     // increase the moment a solve starts. Released on every return
     // path via defer.
-    isTunnel := markCaptchaAttemptStart()
+    isTunnel := markCaptchaAttemptStart(forceDirect)
     defer markCaptchaAttemptDone(isTunnel)
 
     // ctx-aware sleep so a Disconnect during the throttle-induced
@@ -140,7 +163,7 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError) (string, er
     }
 
     profile := getRandomProfile()
-    client := newCaptchaClient()
+    client := newCaptchaClient(forceDirect)
 
     powInput, difficulty, htmlSettings, err := fetchPowInput(ctx, client, profile, captchaErr.RedirectUri)
     if err != nil {
@@ -152,7 +175,7 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError) (string, er
     hash := solvePoW(powInput, difficulty)
     log.Printf("[Captcha] PoW solved: hash=%s", hash)
 
-    successToken, err := callCaptchaNotRobot(ctx, client, profile, sessionToken, hash, htmlSettings)
+    successToken, err := callCaptchaNotRobot(ctx, client, profile, sessionToken, hash, htmlSettings, isTunnel)
     if err != nil {
         return "", fmt.Errorf("captchaNotRobot API failed: %w", err)
     }
@@ -246,7 +269,7 @@ func solvePoW(powInput string, difficulty int) string {
     return ""
 }
 
-func callCaptchaNotRobot(ctx context.Context, client *http.Client, profile Profile, sessionToken, hash string, htmlSettings map[string]interface{}) (string, error) {
+func callCaptchaNotRobot(ctx context.Context, client *http.Client, profile Profile, sessionToken, hash string, htmlSettings map[string]interface{}, isTunnel bool) (string, error) {
     vkReq := func(method string, postData string) (map[string]interface{}, error) {
         requestURL := "https://api.vk.com/method/" + method + "?v=5.131"
 
@@ -411,7 +434,7 @@ func callCaptchaNotRobot(ctx context.Context, client *http.Client, profile Profi
         if ok && successToken != "" {
             log.Printf("[Captcha] Step 4/4: endSession")
             _, _ = vkReq("captchaNotRobot.endSession", baseParams)
-            markCaptchaSuccess()
+            markCaptchaSuccess(isTunnel)
             return successToken, nil
         }
     }
@@ -423,7 +446,7 @@ func callCaptchaNotRobot(ctx context.Context, client *http.Client, profile Profi
         // HTTP routes through utun and saturates the tunnel egress.
         // StartProxy reads these flags to stop spawning new sessions
         // when the second pool is also dry.
-        markCaptchaSaturated()
+        markCaptchaSaturated(isTunnel)
     }
 
     // Checkbox failed — try slider captcha
@@ -435,7 +458,7 @@ func callCaptchaNotRobot(ctx context.Context, client *http.Client, profile Profi
         mergedSettings = htmlSettings
     }
 
-    sliderToken, sliderErr := solveSliderCaptcha(vkReq, baseParams, browserFp, hash, mergedSettings)
+    sliderToken, sliderErr := solveSliderCaptcha(vkReq, baseParams, browserFp, hash, mergedSettings, isTunnel)
     if sliderErr != nil {
         // saturation accounting now happens inside solveSliderCaptcha
         // at the exact branch (ERROR_LIMIT or unparseable_response),
@@ -445,7 +468,7 @@ func callCaptchaNotRobot(ctx context.Context, client *http.Client, profile Profi
 
     log.Printf("[Captcha] Slider solved! endSession...")
     _, _ = vkReq("captchaNotRobot.endSession", baseParams)
-    markCaptchaSuccess()
+    markCaptchaSuccess(isTunnel)
     return sliderToken, nil
 }
 

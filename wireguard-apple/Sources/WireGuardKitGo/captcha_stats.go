@@ -27,6 +27,7 @@ import "C"
 
 import (
 	"sync/atomic"
+	"time"
 )
 
 var (
@@ -38,6 +39,8 @@ var (
 	captchaTunnelInFlight   atomic.Int64 // ditto for tunnel
 	captchaDirectFailStreak atomic.Int64 // consecutive ERROR_LIMITs on direct egress without a success
 	captchaTunnelFailStreak atomic.Int64 // ditto for tunnel
+	captchaDirectSatAt      atomic.Int64 // unix-nano timestamp of last ERROR_LIMIT on direct
+	captchaTunnelSatAt      atomic.Int64 // unix-nano timestamp of last ERROR_LIMIT on tunnel
 	captchaTunnelEgress     atomic.Bool  // true once we believe HTTP from this extension routes through utun
 	captchaSessionsReady    atomic.Int64 // DTLS sessions that have reached sessionOk
 	captchaSessionsTarget   atomic.Int64 // requested N
@@ -48,6 +51,14 @@ var (
 // noise; three in a row is a genuine rate-limit pattern.
 const satThreshold = 3
 
+// captchaCooldown is how long the saturated flag stays sticky after the
+// last ERROR_LIMIT. VK's per-IP captcha rate-limit windows are short
+// (~60 s in practice), so once a minute has elapsed without a fresh
+// failure we let the spawn paths try again. Without this the system
+// gives up forever after one rate-limit burst, even if the network
+// would have recovered.
+const captchaCooldown = 60 * time.Second
+
 func resetCaptchaStats() {
 	captchaDirectOK.Store(0)
 	captchaTunnelOK.Store(0)
@@ -57,13 +68,21 @@ func resetCaptchaStats() {
 	captchaTunnelInFlight.Store(0)
 	captchaDirectFailStreak.Store(0)
 	captchaTunnelFailStreak.Store(0)
+	captchaDirectSatAt.Store(0)
+	captchaTunnelSatAt.Store(0)
 	captchaTunnelEgress.Store(false)
 	captchaSessionsReady.Store(0)
 	captchaSessionsTarget.Store(0)
 }
 
-func markCaptchaAttemptStart() (isTunnel bool) {
-	if captchaTunnelEgress.Load() {
+// markCaptchaAttemptStart bumps the in-flight gauge for the egress
+// this attempt will use. forceDirect=true means the caller is pinning
+// a physical interface to bypass utun (see cellularDial), so the
+// attempt should be counted against the direct bucket even though
+// captchaTunnelEgress is true.
+func markCaptchaAttemptStart(forceDirect bool) (isTunnel bool) {
+	isTunnel = captchaTunnelEgress.Load() && !forceDirect
+	if isTunnel {
 		captchaTunnelAttempts.Add(1)
 		captchaTunnelInFlight.Add(1)
 		return true
@@ -81,26 +100,62 @@ func markCaptchaAttemptDone(isTunnel bool) {
 	}
 }
 
-func markCaptchaSuccess() {
-	if captchaTunnelEgress.Load() {
+// markCaptchaSuccess clears the streak for the egress that just got a
+// success_token. The isTunnel flag is the one returned from
+// markCaptchaAttemptStart so a force-direct retry credits the right
+// pool even when captchaTunnelEgress is globally true.
+func markCaptchaSuccess(isTunnel bool) {
+	if isTunnel {
 		captchaTunnelOK.Add(1)
 		captchaTunnelFailStreak.Store(0)
+		captchaTunnelSatAt.Store(0)
 	} else {
 		captchaDirectOK.Add(1)
 		captchaDirectFailStreak.Store(0)
+		captchaDirectSatAt.Store(0)
 	}
 }
 
-func markCaptchaSaturated() {
-	if captchaTunnelEgress.Load() {
+// markCaptchaSaturated records an ERROR_LIMIT against the egress this
+// attempt actually used. Stamps the timestamp so the cooldown in
+// directSaturated/tunnelSaturated can auto-clear after captchaCooldown.
+func markCaptchaSaturated(isTunnel bool) {
+	now := time.Now().UnixNano()
+	if isTunnel {
 		captchaTunnelFailStreak.Add(1)
+		captchaTunnelSatAt.Store(now)
 	} else {
 		captchaDirectFailStreak.Add(1)
+		captchaDirectSatAt.Store(now)
 	}
 }
 
-func directSaturated() bool { return captchaDirectFailStreak.Load() >= satThreshold }
-func tunnelSaturated() bool { return captchaTunnelFailStreak.Load() >= satThreshold }
+// saturatedWithCooldown is the shared check + auto-decay for both
+// egresses. If the streak is at threshold but captchaCooldown has
+// elapsed since the last ERROR_LIMIT, clear the streak and report
+// not-saturated so the spawn paths can probe again.
+func saturatedWithCooldown(streak *atomic.Int64, satAt *atomic.Int64) bool {
+	if streak.Load() < satThreshold {
+		return false
+	}
+	last := satAt.Load()
+	if last == 0 {
+		return true
+	}
+	if time.Now().UnixNano()-last > captchaCooldown.Nanoseconds() {
+		streak.Store(0)
+		satAt.Store(0)
+		return false
+	}
+	return true
+}
+
+func directSaturated() bool {
+	return saturatedWithCooldown(&captchaDirectFailStreak, &captchaDirectSatAt)
+}
+func tunnelSaturated() bool {
+	return saturatedWithCooldown(&captchaTunnelFailStreak, &captchaTunnelSatAt)
+}
 
 //export TurnBridgeGetCaptchaDirectCount
 func TurnBridgeGetCaptchaDirectCount() C.int {
