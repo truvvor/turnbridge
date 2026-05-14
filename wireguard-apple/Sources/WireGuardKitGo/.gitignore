@@ -1,3 +1,8 @@
 .cache/
 .tmp/
 out/
+
+# `go build .` from this directory produces a binary named after the
+# Go module (github.com/amnezia-vpn/amneziawg-apple). Ignore it so
+# verifying compilation locally doesn't leave a 50 MB artifact behind.
+amneziawg-apple
