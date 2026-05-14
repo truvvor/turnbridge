@@ -956,26 +956,31 @@ func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
 			}
 		}
 
-		// Cache-miss slow path: release the mutex, take a solve slot,
-		// then call f(ctx, link). The mutex is dropped first so we don't
-		// serialise on it while waiting for a slot, and we don't hold
-		// it across the slow solve either. Slot acquisition respects
-		// ctx so a Disconnect during the queue tail bails fast.
+		// Cache-miss slow path: release the mutex, jitter, take a
+		// solve slot, then call f(ctx, link). The mutex is dropped
+		// first so we don't serialise on it while waiting for a slot.
+		// The jitter runs BEFORE slot acquisition so it overlaps the
+		// queue wait instead of holding a slot — previously a 5-slot
+		// pipeline burned 0.75-3 s per slot on jitter alone, halving
+		// effective throughput. Now the slot only covers the actual
+		// PoW + HTTP work. ctx-aware at every step so a Disconnect
+		// during the wait bails fast.
 		mu.Unlock()
+
+		// 1.5-2.5 s pre-slot wait: combined anti-bot pacing (used to
+		// live inside solveVkCaptcha as a fixed 1.5-2.5 s sleep while
+		// the slot was held) and entry desync (used to be a 0-750 ms
+		// post-slot jitter). Both purposes preserved, the slot is
+		// freed earlier.
+		select {
+		case <-time.After(time.Duration(1500+rand.Intn(1000)) * time.Millisecond):
+		case <-ctx.Done():
+			return "", "", "", ctx.Err()
+		}
 
 		select {
 		case solveSlot <- struct{}{}:
 		case <-ctx.Done():
-			return "", "", "", ctx.Err()
-		}
-		// 0–750 ms jitter desyncs the first wave so the 5 in-flight
-		// solves don't hit VK's anti-bot in lockstep. Cheap once a
-		// slot is acquired (we're about to do a 5 s network round-trip
-		// anyway), and cheap on hot-path because cache hits skip it.
-		select {
-		case <-time.After(time.Duration(rand.Intn(750)) * time.Millisecond):
-		case <-ctx.Done():
-			<-solveSlot
 			return "", "", "", ctx.Err()
 		}
 		u, p, a, err := f(ctx, link)

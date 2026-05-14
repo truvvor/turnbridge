@@ -146,14 +146,12 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError) (string, er
     isTunnel := markCaptchaAttemptStart(forceDirect)
     defer markCaptchaAttemptDone(isTunnel)
 
-    // ctx-aware sleep so a Disconnect during the throttle-induced
-    // jitter wait bails immediately instead of running the full
-    // 1.5–2.5 s timer.
-    select {
-    case <-time.After(time.Duration(1500+mathrand.Intn(1000)) * time.Millisecond):
-    case <-ctx.Done():
-        return "", ctx.Err()
-    }
+    // Anti-bot pacing used to live here as a 1.5-2.5 s pre-solve
+    // sleep, but it was held INSIDE poolCreds' solveSlot semaphore
+    // which throttles 5 in-flight solves. The slot now covers only
+    // the real PoW + HTTP work; pacing has been moved to poolCreds'
+    // pre-slot wait so the same wall-clock delay overlaps the slot
+    // queue instead of serialising inside it.
 
     log.Printf("[Captcha] Solving Not Robot Captcha...")
 
