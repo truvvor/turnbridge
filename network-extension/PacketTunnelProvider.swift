@@ -101,12 +101,19 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // Default true for backward-compat with profiles saved before this field existed.
         let useUDP = (providerConfiguration["useUDP"] as? Bool) ?? true
         let udpFlag: Int32 = useUDP ? 1 : 0
+        let streamAggregation = (providerConfiguration["streamAggregation"] as? Bool) ?? false
 
-        SharedLogger.info("Peer: \(peerAddr), Listen: \(listenAddr), N: \(nValue), UDP: \(useUDP)", source: .tunnel)
+        SharedLogger.info("Peer: \(peerAddr), Listen: \(listenAddr), N: \(nValue), UDP: \(useUDP), streamAgg: \(streamAggregation)", source: .tunnel)
         SharedLogger.info("Starting TURN proxy...", source: .tunnel)
 
         ProxySetLogger(nil, goProxyCLoggerCallback)
         CaptchaBridge.install()
+
+        // Toggle the Stream-Aggregation handshake on the Go side
+        // BEFORE StartProxy. The Go global is read once when each
+        // DTLS session completes its handshake, so setting it later
+        // would race the per-session goroutines.
+        TurnBridgeSetStreamAggregation(streamAggregation ? 1 : 0)
 
         let manualCaptchaEnabled = UserDefaults(suiteName: CaptchaIPC.appGroupID)?
             .bool(forKey: "manualCaptcha") ?? false

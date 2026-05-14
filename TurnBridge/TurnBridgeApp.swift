@@ -33,8 +33,8 @@ struct TurnBridge: App {
         var id: String { request.requestId }
     }
     
-    func turnOnTunnel(vkLink: String, peerAddr: String, listenAddr: String, nValue: Int, useUDP: Bool, wgQuickConfig: String, completionHandler: @escaping (Bool) -> Void) {
-        SharedLogger.info("Connecting... peer=\(peerAddr), listen=\(listenAddr), n=\(nValue), udp=\(useUDP)")
+    func turnOnTunnel(vkLink: String, peerAddr: String, listenAddr: String, nValue: Int, useUDP: Bool, streamAggregation: Bool, wgQuickConfig: String, completionHandler: @escaping (Bool) -> Void) {
+        SharedLogger.info("Connecting... peer=\(peerAddr), listen=\(listenAddr), n=\(nValue), udp=\(useUDP), streamAgg=\(streamAggregation)")
 
         NETunnelProviderManager.loadAllFromPreferences { tunnelManagersInSettings, error in
             if let error = error {
@@ -61,7 +61,8 @@ struct TurnBridge: App {
                 "peerAddr": peerAddr,
                 "listenAddr": listenAddr,
                 "nValue": nValue,
-                "useUDP": useUDP
+                "useUDP": useUDP,
+                "streamAggregation": streamAggregation
             ]
 
             let defaults = UserDefaults.standard

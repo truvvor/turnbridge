@@ -287,7 +287,7 @@ func dtlsFunc(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr) (net.
     return dtlsConn, nil
 }
 
-func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}, c1 chan<- error) {
+func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}, c1 chan<- error, streamID int) {
     var err error = nil
     defer func() { c1 <- err }()
     sessionStart := time.Now()
@@ -336,6 +336,32 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
         log.Printf("Closed DTLS connection\n")
     }()
     log.Printf("Established DTLS connection!\n")
+
+    // Stream-Aggregation preamble: if enabled, write the 17-byte
+    // [sessionID, streamID] header BEFORE WireGuard packets start
+    // flowing through dtlsConn. The receiver-side aggregator
+    // (kiper292/vk-turn-proxy fork on the WG server's box) reads
+    // this once per stream and fuses every stream sharing the same
+    // session ID into a single endpoint for WG, stopping the WG
+    // server from endpoint-thrashing when N parallel TURN
+    // allocations deliver packets from N distinct VK relay ports.
+    // Without the flag set (default), nothing is written and the
+    // stream looks exactly like our pre-aggregation transport.
+    if streamAggIsEnabled() {
+        sid, ok := currentStreamAggSession()
+        if ok {
+            preamble := make([]byte, 17)
+            copy(preamble[:16], sid[:])
+            preamble[16] = byte(streamID)
+            if _, werr := dtlsConn.Write(preamble); werr != nil {
+                log.Printf("stream-agg: preamble write failed on stream %d: %s", streamID, werr)
+                err = fmt.Errorf("stream-agg preamble: %s", werr)
+                return
+            }
+            log.Printf("stream-agg: stream %d preamble sent (sessionID=%x)", streamID, sid[:4])
+        }
+    }
+
     // NOTE: do NOT signal proxyReady here. Signalling it the moment
     // the FIRST DTLS session establishes causes Swift to call
     // adapter.start() and iOS to bring up utun with the WG config's
@@ -750,7 +776,7 @@ func reconnectBackoff(prev time.Duration, success bool) time.Duration {
 	return prev + jitter
 }
 
-func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConnChan <-chan net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}) {
+func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConnChan <-chan net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}, streamID int) {
 	var backoff time.Duration
 	for {
 		select {
@@ -758,7 +784,7 @@ func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConnCha
 			return
 		case listenConn := <-listenConnChan:
 			c := make(chan error)
-			go oneDtlsConnection(ctx, peer, listenConn, connchan, okchan, c)
+			go oneDtlsConnection(ctx, peer, listenConn, connchan, okchan, c, streamID)
 			err := <-c
 			if err != nil {
 				log.Printf("%s", err)
@@ -973,6 +999,16 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
     wg1 := sync.WaitGroup{}
 	t := time.Tick(200 * time.Millisecond)
 
+	// Re-roll the Stream-Aggregation session ID once per StartProxy.
+	// Each of the N DTLS sessions below will then prepend the same
+	// session ID + its own stream index after handshake, letting the
+	// receiver-side aggregator fuse them. No-op when the feature is
+	// off (default).
+	if streamAggIsEnabled() {
+		sid := freshStreamAggSession()
+		log.Printf("stream-agg: enabled, sessionID=%x (N=%d)", sid[:4], n)
+	}
+
 	// Spawn ALL N sessions in parallel. Sequential spawning made the
 	// auto-captcha mode artificially slow at high nValue
 	// (N=30 → 30 captchas back-to-back → ~3 minutes), even though
@@ -995,7 +1031,7 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
 		sessionOk := make(chan struct{})
 
 		wg1.Go(func() {
-			oneDtlsConnectionLoop(ctx, peer, fanoutChan, cChan, sessionOk)
+			oneDtlsConnectionLoop(ctx, peer, fanoutChan, cChan, sessionOk, i)
 		})
 		wg1.Go(func() {
 			oneTurnConnectionLoop(ctx, params, peer, cChan, t)

@@ -310,6 +310,7 @@ struct ContentView: View {
                 listenAddr: profile.listenAddr,
                 nValue: profile.nValue,
                 useUDP: profile.useUDP,
+                streamAggregation: profile.streamAggregation,
                 wgQuickConfig: profile.wgQuickConfig
             ) { isSuccess in
                 if !isSuccess {

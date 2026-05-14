@@ -54,6 +54,23 @@ struct SettingsView: View {
                             in: 1...100)
                         .labelsHidden()
                 }
+
+                // Stream Aggregation: ports the 17-byte
+                // [sessionID, streamID] handshake from
+                // kiper292/wireguard-turn-android. Lets a compatible
+                // server-side aggregator (kiper292/vk-turn-proxy fork
+                // deployed alongside the WG server) fuse the N
+                // parallel TURN allocations into a single stable
+                // endpoint for WireGuard.
+                //
+                // REQUIRES the matching server. If toggled on without
+                // a compatible aggregator, the 17-byte preamble lands
+                // in the WG packet stream and breaks the very first
+                // handshake. Default off.
+                Toggle("Stream Aggregation", isOn: binding(\.streamAggregation))
+                Text("Requires kiper292/vk-turn-proxy on the WG server. Leave off if you don't run a compatible aggregator.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
             }
 
             Section(header: Text("WireGuard Config")) {
