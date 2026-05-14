@@ -52,30 +52,30 @@ struct CaptchaStatsBadge: View {
     @ObservedObject var stats: CaptchaStatsState
 
     var body: some View {
-        if stats.direct == 0 && stats.tunnel == 0 {
-            EmptyView()
-        } else {
-            HStack(spacing: 14) {
-                cell(label: "Direct",
-                     value: stats.direct,
-                     saturated: stats.directSaturated,
-                     accent: .blue)
-                Divider()
-                    .frame(height: 22)
-                cell(label: "Tunnel",
-                     value: stats.tunnel,
-                     saturated: stats.tunnelSaturated,
-                     accent: .green)
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-            .background(.regularMaterial)
-            .clipShape(RoundedRectangle(cornerRadius: 12))
-            .overlay(
-                RoundedRectangle(cornerRadius: 12)
-                    .strokeBorder(Color.secondary.opacity(0.25), lineWidth: 1)
-            )
+        // Always visible during connecting/connected: zeros give the
+        // user feedback that the counters exist and that they haven't
+        // yet incremented this connect cycle (often the case when
+        // pooled creds are reused without a fresh captcha solve).
+        HStack(spacing: 14) {
+            cell(label: "Direct",
+                 value: stats.direct,
+                 saturated: stats.directSaturated,
+                 accent: .blue)
+            Divider()
+                .frame(height: 22)
+            cell(label: "Tunnel",
+                 value: stats.tunnel,
+                 saturated: stats.tunnelSaturated,
+                 accent: .green)
         }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(.regularMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(Color.secondary.opacity(0.25), lineWidth: 1)
+        )
     }
 
     private func cell(label: String, value: Int, saturated: Bool, accent: Color) -> some View {

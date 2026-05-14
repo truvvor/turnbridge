@@ -1034,27 +1034,38 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
 	// VK rate-limits captcha.isNotRobot per source IP. We have two
 	// budgets available:
 	//
-	//   "direct" — the user's mobile IP. Used by the bootstrap
-	//              session that comes up before WG.
+	//   "direct" — the user's mobile IP. Used until ERROR_LIMIT lands
+	//              on a captcha solve.
 	//   "tunnel" — the WG server's egress IP. Once WG handshake
 	//              completes, this extension's outbound HTTP routes
 	//              through utun automatically (includeAllNetworks=true).
 	//
 	// Sequence:
 	//
-	//   1. Spawn ONE bootstrap session, solve its captcha from direct.
-	//   2. Signal proxyReady so Swift starts the WG adapter through
-	//      that single TURN session.
-	//   3. Wait briefly for WG handshake; flip captchaTunnelEgress so
-	//      subsequent solves are attributed to "tunnel".
-	//   4. Spawn the remaining N-1 sessions one-by-one (small stagger
-	//      so they don't slam VK from the same IP simultaneously).
-	//      Each new session's captcha goes through utun → WG server
-	//      → api.vk.ru, hitting VK from a fresh per-IP budget.
-	//   5. If captchaTunnelSat trips (ERROR_LIMIT on the tunnel
-	//      egress too), stop spawning further sessions — we've
-	//      saturated both pools and adding more just produces dead
-	//      lanes that the watchdog tears down.
+	//   Phase A (direct):
+	//     Spawn sessions one at a time with a small stagger, keeping
+	//     them all on the user's mobile IP. Stop as soon as either
+	//       (a) we've spawned N, or
+	//       (b) a captcha solve returns ERROR_LIMIT (captchaDirectSat
+	//           trips).
+	//     This drains the direct egress's rate-limit budget — exactly
+	//     what the user asked for ("столько тоннелей сколько можно
+	//     поднять со своего родного айпи").
+	//
+	//   Bridge:
+	//     Wait for any one of the spawned sessions to reach DTLS
+	//     ready, fire proxyReady so Swift starts the WG adapter,
+	//     then wait ~2 s for WG handshake to complete through that
+	//     session. Flip captchaTunnelEgress so subsequent solves
+	//     are attributed to the tunnel pool.
+	//
+	//   Phase B (tunnel) — only if Phase A stopped early on direct
+	//     saturation AND we still have sessions to spawn:
+	//     Continue spawning sessions, also one at a time. Their
+	//     captcha HTTP now goes through utun → WG server → api.vk.ru,
+	//     so VK sees the WG server's egress IP — a fresh per-IP
+	//     rate-limit budget. Stop when N reached or
+	//     captchaTunnelSat trips.
 	//
 	// Manual-captcha mode keeps the single-phase "all N before WG"
 	// barrier: each WebView is presented one-at-a-time anyway, and
@@ -1087,74 +1098,138 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
 		}()
 	}
 
-	bootstrap := 1
-	if manualCaptchaForcedMode() || n == 1 {
-		bootstrap = n
-	}
-	log.Printf("StartProxy: bootstrap=%d, deferred=%d (manual=%v)",
-		bootstrap, n-bootstrap, manualCaptchaForcedMode())
-
-	for i := 0; i < bootstrap; i++ {
-		spawnSession(i)
-	}
-	for k := 0; k < bootstrap; k++ {
+	if manualCaptchaForcedMode() {
+		// Manual mode: spawn all N upfront and wait for every one
+		// before bringing up WG (legacy behaviour the WebView UI
+		// flow depends on).
+		for i := 0; i < n; i++ {
+			spawnSession(i)
+		}
+		for k := 0; k < n; k++ {
+			select {
+			case idx := <-sessionReady:
+				log.Printf("StartProxy: session %d ready (%d/%d, manual)", idx+1, k+1, n)
+			case <-ctx.Done():
+				wg1.Wait()
+				return
+			}
+		}
 		select {
-		case idx := <-sessionReady:
-			log.Printf("StartProxy: bootstrap session %d ready (%d/%d)", idx+1, k+1, bootstrap)
+		case proxyReady <- struct{}{}:
+		default:
+		}
+		log.Printf("Proxy started on %s with %d parallel TURN session(s) (manual mode)", localAddrStr, n)
+		wg1.Wait()
+		return
+	}
+
+	// Phase A: spawn direct sessions until N reached or direct egress
+	// hits ERROR_LIMIT. 400 ms stagger × throttle=5 in poolCreds keeps
+	// VK's anti-bot off our back while we drain its per-IP budget.
+	phaseAStagger := 400 * time.Millisecond
+	phaseACount := 0
+	for phaseACount < n {
+		if captchaDirectSat.Load() {
+			log.Printf("StartProxy: direct egress saturated after %d sessions, transitioning to tunnel egress",
+				phaseACount)
+			break
+		}
+		spawnSession(phaseACount)
+		phaseACount++
+		select {
+		case <-time.After(phaseAStagger):
 		case <-ctx.Done():
-			log.Printf("StartProxy: cancelled during bootstrap, %d/%d up", k, bootstrap)
 			wg1.Wait()
 			return
 		}
 	}
+	log.Printf("StartProxy: phase A done, spawned=%d/%d direct, saturated=%v",
+		phaseACount, n, captchaDirectSat.Load())
 
-	// Bootstrap fleet is alive — let Swift bring up WG.
+	// Bridge: wait for any spawned session to reach DTLS ready, then
+	// fire proxyReady so Swift can start the WG adapter.
+	select {
+	case idx := <-sessionReady:
+		log.Printf("StartProxy: first session ready (%d), signaling proxyReady", idx+1)
+	case <-ctx.Done():
+		wg1.Wait()
+		return
+	}
 	select {
 	case proxyReady <- struct{}{}:
 	default:
 	}
 
-	if bootstrap < n {
-		// Spawn the deferred fleet in the background so StartProxy
-		// returns and the WG adapter actually gets a chance to come
-		// up. wg1.Wait below still blocks on every spawned session.
-		wg1.Go(func() {
-			// Give WG handshake ~2 s to complete through the single
-			// bootstrap session. Once it's up, this extension's
-			// own outbound HTTP routes through utun and the
-			// remaining captchas hit VK from the WG server's egress.
+	// Drain remaining ready signals indefinitely. Both Phase A
+	// stragglers and Phase B sessions land here; we just log each
+	// and don't gate on counts.
+	go func() {
+		for {
 			select {
-			case <-time.After(2 * time.Second):
+			case idx := <-sessionReady:
+				log.Printf("StartProxy: session %d ready", idx+1)
 			case <-ctx.Done():
 				return
 			}
-			captchaTunnelEgress.Store(true)
-			log.Printf("StartProxy: tunnel egress engaged; spawning deferred fleet (target=%d)", n)
+		}
+	}()
 
-			// Per-session stagger of 800 ms. Without it, all 30
-			// captcha solves still arrive at VK within a couple
-			// of seconds, just from a different IP — VK's
-			// per-IP rate-limit window then fires for the
-			// tunnel egress too. 800 ms × 30 ≈ 24 s total
-			// warm-up, comfortably under VK's per-IP burst budget.
-			for i := bootstrap; i < n; i++ {
-				if ctx.Err() != nil {
-					return
-				}
-				if captchaTunnelSat.Load() {
-					log.Printf("StartProxy: tunnel egress also rate-limited; stopping at %d/%d sessions",
-						i, n)
-					return
-				}
-				spawnSession(i)
-				select {
-				case <-time.After(800 * time.Millisecond):
-				case <-ctx.Done():
-					return
-				}
+	if phaseACount >= n {
+		// Phase A spawned all N — no Phase B needed. captchaTunnelEgress
+		// still flips so the UI knows when WG is up, even if no
+		// solves happen post-flip.
+		go func() {
+			select {
+			case <-time.After(2 * time.Second):
+				captchaTunnelEgress.Store(true)
+			case <-ctx.Done():
 			}
-		})
+		}()
+		log.Printf("Proxy started on %s with %d parallel TURN session(s) (all direct)", localAddrStr, n)
+		wg1.Wait()
+		return
 	}
+
+	// Phase B: still need sessions, direct saturated. Spawn the rest
+	// through the tunnel egress. wg1.Go so StartProxy can return and
+	// Swift's WG adapter actually gets started; wg1.Wait at the
+	// bottom blocks on every spawned goroutine.
+	wg1.Go(func() {
+		// Give WG handshake ~2 s through the just-ready bootstrap
+		// session. After that, this extension's HTTP routes through
+		// utun → WG server → api.vk.ru.
+		select {
+		case <-time.After(2 * time.Second):
+		case <-ctx.Done():
+			return
+		}
+		captchaTunnelEgress.Store(true)
+		log.Printf("StartProxy: tunnel egress engaged; spawning phase B (target=%d, already=%d)",
+			n, phaseACount)
+
+		// Per-session stagger of 800 ms — slightly slower than
+		// Phase A because the WG server's egress is the only IP
+		// for everyone else's traffic too, so saturating it has
+		// wider blast radius. 800 ms × ~14 (typical remainder) ≈
+		// 11 s phase B warm-up.
+		phaseBStagger := 800 * time.Millisecond
+		for i := phaseACount; i < n; i++ {
+			if ctx.Err() != nil {
+				return
+			}
+			if captchaTunnelSat.Load() {
+				log.Printf("StartProxy: tunnel egress also rate-limited; stopping at %d/%d sessions",
+					i, n)
+				return
+			}
+			spawnSession(i)
+			select {
+			case <-time.After(phaseBStagger):
+			case <-ctx.Done():
+				return
+			}
+		}
+	})
 
     log.Printf("Proxy started on %s with %d parallel TURN session(s) requested (phased)", localAddrStr, n)
     wg1.Wait()

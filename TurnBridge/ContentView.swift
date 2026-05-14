@@ -11,7 +11,6 @@ struct ContentView: View {
     var app: TurnBridge
 
     @State private var vpnStatus: NEVPNStatus = .disconnected
-    @StateObject private var transportHealth = TransportHealthState()
     @StateObject private var store = ProfileStore()
     @StateObject private var captchaStats = CaptchaStatsState()
 
@@ -49,15 +48,10 @@ struct ContentView: View {
                         .disabled(vpnStatus != .disconnected)
                 }
 
-                if vpnStatus == .connected {
-                    TransportHealthBanner(isStalled: transportHealth.isStalled)
-                        .padding(.top, 8)
-                        .animation(.easeInOut, value: transportHealth.isStalled)
-                }
-
                 if vpnStatus == .connecting || vpnStatus == .connected {
                     CaptchaStatsBadge(stats: captchaStats)
-                        .padding(.top, 6)
+                        .padding(.top, 10)
+                        .padding(.horizontal, 20)
                 }
 
                 Spacer()
@@ -133,11 +127,9 @@ struct ContentView: View {
             }
             .onAppear {
                 checkInitialStatus()
-                transportHealth.start()
                 captchaStats.start()
             }
             .onDisappear {
-                transportHealth.stop()
                 captchaStats.stop()
             }
             .onReceive(NotificationCenter.default.publisher(for: .NEVPNStatusDidChange)) { notification in
