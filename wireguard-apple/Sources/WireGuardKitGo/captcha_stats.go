@@ -30,36 +30,77 @@ import (
 )
 
 var (
-	captchaDirectOK     atomic.Int64
-	captchaTunnelOK     atomic.Int64
-	captchaDirectSat    atomic.Bool // ERROR_LIMIT seen on direct egress
-	captchaTunnelSat    atomic.Bool // ERROR_LIMIT seen on tunnel egress
-	captchaTunnelEgress atomic.Bool // true once we believe HTTP from this extension routes through utun
+	captchaDirectOK         atomic.Int64
+	captchaTunnelOK         atomic.Int64
+	captchaDirectAttempts   atomic.Int64 // total captcha solve attempts started on direct egress
+	captchaTunnelAttempts   atomic.Int64 // ditto for tunnel egress
+	captchaDirectInFlight   atomic.Int64 // currently mid-solve on direct
+	captchaTunnelInFlight   atomic.Int64 // ditto for tunnel
+	captchaDirectFailStreak atomic.Int64 // consecutive ERROR_LIMITs on direct egress without a success
+	captchaTunnelFailStreak atomic.Int64 // ditto for tunnel
+	captchaTunnelEgress     atomic.Bool  // true once we believe HTTP from this extension routes through utun
+	captchaSessionsReady    atomic.Int64 // DTLS sessions that have reached sessionOk
+	captchaSessionsTarget   atomic.Int64 // requested N
 )
+
+// satThreshold is the number of consecutive ERROR_LIMITs that count as
+// "egress saturated, stop spawning more sessions there". One failure is
+// noise; three in a row is a genuine rate-limit pattern.
+const satThreshold = 3
 
 func resetCaptchaStats() {
 	captchaDirectOK.Store(0)
 	captchaTunnelOK.Store(0)
-	captchaDirectSat.Store(false)
-	captchaTunnelSat.Store(false)
+	captchaDirectAttempts.Store(0)
+	captchaTunnelAttempts.Store(0)
+	captchaDirectInFlight.Store(0)
+	captchaTunnelInFlight.Store(0)
+	captchaDirectFailStreak.Store(0)
+	captchaTunnelFailStreak.Store(0)
 	captchaTunnelEgress.Store(false)
+	captchaSessionsReady.Store(0)
+	captchaSessionsTarget.Store(0)
+}
+
+func markCaptchaAttemptStart() (isTunnel bool) {
+	if captchaTunnelEgress.Load() {
+		captchaTunnelAttempts.Add(1)
+		captchaTunnelInFlight.Add(1)
+		return true
+	}
+	captchaDirectAttempts.Add(1)
+	captchaDirectInFlight.Add(1)
+	return false
+}
+
+func markCaptchaAttemptDone(isTunnel bool) {
+	if isTunnel {
+		captchaTunnelInFlight.Add(-1)
+	} else {
+		captchaDirectInFlight.Add(-1)
+	}
 }
 
 func markCaptchaSuccess() {
 	if captchaTunnelEgress.Load() {
 		captchaTunnelOK.Add(1)
+		captchaTunnelFailStreak.Store(0)
 	} else {
 		captchaDirectOK.Add(1)
+		captchaDirectFailStreak.Store(0)
 	}
 }
 
 func markCaptchaSaturated() {
 	if captchaTunnelEgress.Load() {
-		captchaTunnelSat.Store(true)
+		captchaTunnelFailStreak.Add(1)
 	} else {
-		captchaDirectSat.Store(true)
+		captchaDirectFailStreak.Add(1)
 	}
 }
+
+func directSaturated() bool { return captchaDirectFailStreak.Load() >= satThreshold }
+func tunnelSaturated() bool { return captchaTunnelFailStreak.Load() >= satThreshold }
 
 //export TurnBridgeGetCaptchaDirectCount
 func TurnBridgeGetCaptchaDirectCount() C.int {
@@ -71,9 +112,29 @@ func TurnBridgeGetCaptchaTunnelCount() C.int {
 	return C.int(captchaTunnelOK.Load())
 }
 
+//export TurnBridgeGetCaptchaDirectAttempts
+func TurnBridgeGetCaptchaDirectAttempts() C.int {
+	return C.int(captchaDirectAttempts.Load())
+}
+
+//export TurnBridgeGetCaptchaTunnelAttempts
+func TurnBridgeGetCaptchaTunnelAttempts() C.int {
+	return C.int(captchaTunnelAttempts.Load())
+}
+
+//export TurnBridgeGetCaptchaDirectInFlight
+func TurnBridgeGetCaptchaDirectInFlight() C.int {
+	return C.int(captchaDirectInFlight.Load())
+}
+
+//export TurnBridgeGetCaptchaTunnelInFlight
+func TurnBridgeGetCaptchaTunnelInFlight() C.int {
+	return C.int(captchaTunnelInFlight.Load())
+}
+
 //export TurnBridgeIsCaptchaDirectSaturated
 func TurnBridgeIsCaptchaDirectSaturated() C.int {
-	if captchaDirectSat.Load() {
+	if directSaturated() {
 		return 1
 	}
 	return 0
@@ -81,8 +142,18 @@ func TurnBridgeIsCaptchaDirectSaturated() C.int {
 
 //export TurnBridgeIsCaptchaTunnelSaturated
 func TurnBridgeIsCaptchaTunnelSaturated() C.int {
-	if captchaTunnelSat.Load() {
+	if tunnelSaturated() {
 		return 1
 	}
 	return 0
+}
+
+//export TurnBridgeGetSessionsReady
+func TurnBridgeGetSessionsReady() C.int {
+	return C.int(captchaSessionsReady.Load())
+}
+
+//export TurnBridgeGetSessionsTarget
+func TurnBridgeGetSessionsTarget() C.int {
+	return C.int(captchaSessionsTarget.Load())
 }

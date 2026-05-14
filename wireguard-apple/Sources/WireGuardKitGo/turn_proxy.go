@@ -119,9 +119,9 @@ func init() {
     log.SetOutput(ProxyLogger(0))
 }
 
-type getCredsFunc func(string) (string, string, string, error)
+type getCredsFunc func(context.Context, string) (string, string, string, error)
 
-func getCreds(link string) (resUser string, resPass string, resTurn string, resErr error) {
+func getCreds(ctx context.Context, link string) (resUser string, resPass string, resTurn string, resErr error) {
     profile := getRandomProfile()
     name := generateName()
 	escapedName := neturl.QueryEscape(name)
@@ -146,7 +146,7 @@ func getCreds(link string) (resUser string, resPass string, resTurn string, resE
 			},
 		}
 		defer client.CloseIdleConnections()
-		req, err := http.NewRequest("POST", url, bytes.NewBuffer([]byte(data)))
+		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer([]byte(data)))
 		if err != nil {
 			return nil, err
 		}
@@ -217,7 +217,7 @@ func getCreds(link string) (resUser string, resPass string, resTurn string, resE
                 if captchaErr.IsCaptchaError() {
                     log.Printf("[Captcha] Attempt %d/%d: solving...", attempt+1, maxCaptchaAttempts)
 
-                    successToken, solveErr := solveVkCaptcha(context.Background(), captchaErr)
+                    successToken, solveErr := solveVkCaptcha(ctx, captchaErr)
                     if solveErr != nil {
                         return "", "", "", fmt.Errorf("captcha solve error: %v", solveErr)
                     }
@@ -561,7 +561,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 			time.Since(sessionStart).Round(time.Millisecond),
 			conn2ToRelay.Load(), relayToConn2.Load(), err)
 	}()
-	user, pass, url, err1 := turnParams.getCreds(turnParams.link)
+	user, pass, url, err1 := turnParams.getCreds(ctx, turnParams.link)
 	if err1 != nil {
 		err = fmt.Errorf("failed to get TURN credentials: %s", err1)
 		return
@@ -867,7 +867,7 @@ func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
 	// slot at a time, the rest block on send until a slot is released.
 	solveSlot := make(chan struct{}, maxConcurrentCaptchaSolves)
 
-	return func(link string) (string, string, string, error) {
+	return func(ctx context.Context, link string) (string, string, string, error) {
 		mu.Lock()
 
 		if !cTime.IsZero() && time.Since(cTime) > 10*time.Minute {
@@ -887,18 +887,28 @@ func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
 		}
 
 		// Cache-miss slow path: release the mutex, take a solve slot,
-		// then call f(link). The mutex is dropped first so we don't
+		// then call f(ctx, link). The mutex is dropped first so we don't
 		// serialise on it while waiting for a slot, and we don't hold
-		// it across the slow solve either.
+		// it across the slow solve either. Slot acquisition respects
+		// ctx so a Disconnect during the queue tail bails fast.
 		mu.Unlock()
 
-		solveSlot <- struct{}{}
+		select {
+		case solveSlot <- struct{}{}:
+		case <-ctx.Done():
+			return "", "", "", ctx.Err()
+		}
 		// 0–750 ms jitter desyncs the first wave so the 5 in-flight
 		// solves don't hit VK's anti-bot in lockstep. Cheap once a
 		// slot is acquired (we're about to do a 5 s network round-trip
 		// anyway), and cheap on hot-path because cache hits skip it.
-		time.Sleep(time.Duration(rand.Intn(750)) * time.Millisecond)
-		u, p, a, err := f(link)
+		select {
+		case <-time.After(time.Duration(rand.Intn(750)) * time.Millisecond):
+		case <-ctx.Done():
+			<-solveSlot
+			return "", "", "", ctx.Err()
+		}
+		u, p, a, err := f(ctx, link)
 		<-solveSlot
 
 		mu.Lock()
@@ -1079,6 +1089,7 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
 	// the UI flow assumes the captcha sheet can still reach id.vk.ru
 	// outside the tunnel (includeAllNetworks=false in that mode).
 	resetCaptchaStats()
+	captchaSessionsTarget.Store(int64(n))
 
 	sessionReady := make(chan int, n)
 	spawnSession := func(i int) {
@@ -1099,6 +1110,7 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
 				// Until now the dispatcher was skipping it because
 				// nothing was draining its incoming channel.
 				fanouts[i].active.Store(true)
+				captchaSessionsReady.Add(1)
 				sessionReady <- i
 			case <-ctx.Done():
 			}
@@ -1136,7 +1148,7 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
 	phaseAStagger := 400 * time.Millisecond
 	phaseACount := 0
 	for phaseACount < n {
-		if captchaDirectSat.Load() {
+		if directSaturated() {
 			log.Printf("StartProxy: direct egress saturated after %d sessions, transitioning to tunnel egress",
 				phaseACount)
 			break
@@ -1151,7 +1163,7 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
 		}
 	}
 	log.Printf("StartProxy: phase A done, spawned=%d/%d direct, saturated=%v",
-		phaseACount, n, captchaDirectSat.Load())
+		phaseACount, n, directSaturated())
 
 	// Bridge: wait for any spawned session to reach DTLS ready, then
 	// fire proxyReady so Swift can start the WG adapter.
@@ -1224,7 +1236,7 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
 			if ctx.Err() != nil {
 				return
 			}
-			if captchaTunnelSat.Load() {
+			if tunnelSaturated() {
 				log.Printf("StartProxy: tunnel egress also rate-limited; stopping at %d/%d sessions",
 					i, n)
 				return

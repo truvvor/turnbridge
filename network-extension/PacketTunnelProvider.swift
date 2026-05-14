@@ -349,11 +349,23 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         timer.setEventHandler {
             let direct = Int(TurnBridgeGetCaptchaDirectCount())
             let tunnel = Int(TurnBridgeGetCaptchaTunnelCount())
+            let directAttempts = Int(TurnBridgeGetCaptchaDirectAttempts())
+            let tunnelAttempts = Int(TurnBridgeGetCaptchaTunnelAttempts())
+            let directInFlight = Int(TurnBridgeGetCaptchaDirectInFlight())
+            let tunnelInFlight = Int(TurnBridgeGetCaptchaTunnelInFlight())
+            let sessionsReady = Int(TurnBridgeGetSessionsReady())
+            let sessionsTarget = Int(TurnBridgeGetSessionsTarget())
             let directSat = TurnBridgeIsCaptchaDirectSaturated() != 0
             let tunnelSat = TurnBridgeIsCaptchaTunnelSaturated() != 0
             guard let defaults = UserDefaults(suiteName: CaptchaIPC.appGroupID) else { return }
             defaults.set(direct, forKey: "captchaDirectCount")
             defaults.set(tunnel, forKey: "captchaTunnelCount")
+            defaults.set(directAttempts, forKey: "captchaDirectAttempts")
+            defaults.set(tunnelAttempts, forKey: "captchaTunnelAttempts")
+            defaults.set(directInFlight, forKey: "captchaDirectInFlight")
+            defaults.set(tunnelInFlight, forKey: "captchaTunnelInFlight")
+            defaults.set(sessionsReady, forKey: "sessionsReady")
+            defaults.set(sessionsTarget, forKey: "sessionsTarget")
             defaults.set(directSat, forKey: "captchaDirectSaturated")
             defaults.set(tunnelSat, forKey: "captchaTunnelSaturated")
         }
@@ -367,6 +379,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         if let defaults = UserDefaults(suiteName: CaptchaIPC.appGroupID) {
             defaults.set(0, forKey: "captchaDirectCount")
             defaults.set(0, forKey: "captchaTunnelCount")
+            defaults.set(0, forKey: "captchaDirectAttempts")
+            defaults.set(0, forKey: "captchaTunnelAttempts")
+            defaults.set(0, forKey: "captchaDirectInFlight")
+            defaults.set(0, forKey: "captchaTunnelInFlight")
+            defaults.set(0, forKey: "sessionsReady")
+            defaults.set(0, forKey: "sessionsTarget")
             defaults.set(false, forKey: "captchaDirectSaturated")
             defaults.set(false, forKey: "captchaTunnelSaturated")
         }
