@@ -6,6 +6,8 @@ struct GlobalSettingsView: View {
     @AppStorage("excludeLocalNetworks") private var excludeLocalNetworks = true
 
     @State private var manualCaptcha: Bool = ManualCaptchaSetting.isEnabled
+    @State private var remoteCaptchaURL: String = RemoteCaptchaSetting.url
+    @State private var remoteCaptchaAPIKey: String = RemoteCaptchaSetting.apiKey
 
     var body: some View {
         Form {
@@ -28,6 +30,29 @@ struct GlobalSettingsView: View {
                         icon: { Image(systemName: "tray.full").foregroundColor(.secondary) }
                     )
                 }
+            }
+
+            Section(header: Text("Remote captcha service")) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Offload captcha solving to a server after the first 5 sessions are up. Each configured backend contributes one extra per-IP rate-limit budget.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                TextField("Server URL (https://…)", text: $remoteCaptchaURL)
+                    .keyboardType(.URL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .onSubmit { RemoteCaptchaSetting.url = remoteCaptchaURL }
+                    .onChange(of: remoteCaptchaURL) { newValue in
+                        RemoteCaptchaSetting.url = newValue
+                    }
+                SecureField("API key", text: $remoteCaptchaAPIKey)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled(true)
+                    .onSubmit { RemoteCaptchaSetting.apiKey = remoteCaptchaAPIKey }
+                    .onChange(of: remoteCaptchaAPIKey) { newValue in
+                        RemoteCaptchaSetting.apiKey = newValue
+                    }
             }
 
             Section(header: Text("General")) {

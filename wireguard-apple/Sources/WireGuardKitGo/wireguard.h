@@ -38,6 +38,7 @@ extern void RestartProxy(void);
 extern void ProxyForceReconnect(void);
 extern void ProxySetLogger(void *context, logger_fn_t logger_fn);
 extern int ProxyWaitReady(int timeoutMs);
+extern void ProxySetRemoteCaptchaService(const char *url, const char *apiKey);
 
 typedef void (*manual_captcha_cb_t)(const char *request_id, const char *redirect_uri);
 extern void TurnBridgeSetManualCaptchaCallback(manual_captcha_cb_t cb);

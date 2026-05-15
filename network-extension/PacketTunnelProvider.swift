@@ -134,6 +134,26 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         TurnBridgeSetManualCaptchaMode(manualCaptchaEnabled ? 1 : 0)
         SharedLogger.info("Captcha mode: \(manualCaptchaEnabled ? "manual (browser sheet)" : "auto (in-tunnel solver)")", source: .tunnel)
 
+        // Remote captcha service: if the user configured a backend
+        // URL + API key in Settings, the Go side will offload
+        // getCreds to it after the first few local solves succeed —
+        // letting us pull a second per-IP rate-limit budget from a
+        // machine that isn't on the user's mobile IP. Empty values
+        // disable the feature (server's getCreds falls back to local
+        // every time).
+        let remoteURL = UserDefaults(suiteName: CaptchaIPC.appGroupID)?
+            .string(forKey: "remoteCaptchaServiceURL") ?? ""
+        let remoteKey = UserDefaults(suiteName: CaptchaIPC.appGroupID)?
+            .string(forKey: "remoteCaptchaServiceAPIKey") ?? ""
+        remoteURL.withCString { urlPtr in
+            remoteKey.withCString { keyPtr in
+                ProxySetRemoteCaptchaService(urlPtr, keyPtr)
+            }
+        }
+        if !remoteURL.isEmpty && !remoteKey.isEmpty {
+            SharedLogger.info("Remote captcha service configured (\(remoteURL))", source: .tunnel)
+        }
+
         // Scale the readiness budget by N: StartProxy on the Go side
         // now waits for ALL N TURN allocations to come up before it
         // signals proxyReady (otherwise the WG adapter starts after

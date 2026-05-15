@@ -1050,7 +1050,7 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
 		port:     port,
 		link:     link,
 		udp:      udp,
-		getCreds: poolCreds(getCreds, n),
+		getCreds: poolCreds(getCredsRouted, n),
 	}
 
     listenConnChan := make(chan net.PacketConn)
