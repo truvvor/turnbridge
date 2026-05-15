@@ -573,11 +573,31 @@ func (c *connectedUDPConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 }
 
 type turnParams struct {
-	host     string
-	port     string
-	link     string
+	host string
+	port string
+	// links is a non-empty list of VK call-join links. The first
+	// call to nextLink returns links[0], then [1], rolling over
+	// after the last entry. With N>1 we hypothesise VK keys its
+	// per-IP captcha rate-limit on (source-IP, link) so spreading
+	// solves across multiple call IDs multiplies the effective
+	// budget proportionally. Also gives a chance of landing on
+	// different turn_server.urls[0] relays, each with its own
+	// voice-grade shaper. linkCursor advances atomically so
+	// concurrent oneTurnConnections don't all hit the same link
+	// simultaneously.
+	links      []string
+	linkCursor atomic.Uint64
+
 	udp      bool
 	getCreds getCredsFunc
+}
+
+func (p *turnParams) nextLink() string {
+	if len(p.links) == 0 {
+		return ""
+	}
+	idx := p.linkCursor.Add(1) - 1
+	return p.links[int(idx)%len(p.links)]
 }
 
 func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UDPAddr, conn2 net.PacketConn, c chan<- error) {
@@ -601,7 +621,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 			time.Since(sessionStart).Round(time.Millisecond),
 			conn2ToRelay.Load(), relayToConn2.Load(), err)
 	}()
-	user, pass, url, err1 := turnParams.getCreds(ctx, turnParams.link)
+	user, pass, url, err1 := turnParams.getCreds(ctx, turnParams.nextLink())
 	if err1 != nil {
 		err = fmt.Errorf("failed to get TURN credentials: %s", err1)
 		return
@@ -1049,9 +1069,32 @@ func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
 func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, cUDP C.int) {
     select { case <-proxyReady: default: }
 
-    link := C.GoString(cLink)
+    rawLink := C.GoString(cLink)
     peerAddrStr := C.GoString(cPeerAddr)
     localAddrStr := C.GoString(cLocalAddr)
+
+    // Parse the link parameter as a list — accept comma OR newline
+    // OR semicolon as separators so the Swift side can stuff
+    // multiple URLs into the existing single-string profile field
+    // without an API break. Empty entries are dropped. Hypothesis
+    // we're testing: VK's per-IP captcha rate-limit might be keyed
+    // on (source-IP, vk_join_link) rather than just source-IP, in
+    // which case M distinct links multiply our effective budget by
+    // roughly M.
+    var links []string
+    for _, sep := range []string{"\n", ",", ";"} {
+        rawLink = strings.ReplaceAll(rawLink, sep, "\n")
+    }
+    for _, l := range strings.Split(rawLink, "\n") {
+        if l = strings.TrimSpace(l); l != "" {
+            links = append(links, l)
+        }
+    }
+    if len(links) == 0 {
+        log.Printf("StartProxy: no usable link in %q, aborting", C.GoString(cLink))
+        return
+    }
+    log.Printf("StartProxy: %d link(s) configured for round-robin: %v", len(links), links)
     
     // host/port: empty by default so we use what VK API returned in
     // turn_server.urls[0]. Override only if you know the TURN endpoint
@@ -1094,17 +1137,24 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
         return
     }
 
-    parts := strings.Split(link, "join/")
-    link = parts[len(parts)-1]
-
-    if idx := strings.IndexAny(link, "/?#"); idx != -1 {
-        link = link[:idx]
+    // Normalise each link to the bare "joinID" used in the VK API
+    // body: strip the "vk.com/call/join/" prefix and any trailing
+    // path/query/fragment. Applied per-link so a mixed paste of
+    // full URLs and bare IDs both work.
+    for i, l := range links {
+        if parts := strings.Split(l, "join/"); len(parts) > 1 {
+            l = parts[len(parts)-1]
+        }
+        if idx := strings.IndexAny(l, "/?#"); idx != -1 {
+            l = l[:idx]
+        }
+        links[i] = l
     }
 
 	params := &turnParams{
 		host:     host,
 		port:     port,
-		link:     link,
+		links:    links,
 		udp:      udp,
 		getCreds: poolCreds(getCredsRouted, n),
 	}

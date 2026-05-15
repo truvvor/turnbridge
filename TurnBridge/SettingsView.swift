@@ -21,10 +21,12 @@ struct SettingsView: View {
                     .disableAutocorrection(true)
             }
 
-            Section(header: Text("Proxy Settings")) {
-                TextField("TURN Server URL", text: binding(\.vkLink))
+            Section(header: Text("Proxy Settings"),
+                    footer: Text("One VK call-join URL per line. Multiple links round-robin across sessions — gives more captcha-rate-limit budget if VK keys it on (source-IP, link).")) {
+                TextEditor(text: binding(\.vkLink))
                     .autocapitalization(.none)
                     .disableAutocorrection(true)
+                    .frame(minHeight: 60)
 
                 TextField("Peer Address (IP:Port)", text: binding(\.peerAddr))
                     .autocapitalization(.none)
