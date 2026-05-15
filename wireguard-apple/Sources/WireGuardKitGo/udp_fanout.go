@@ -237,18 +237,38 @@ func startFanoutDispatcher(ctx context.Context, listenConn net.PacketConn, fanou
 			data := make([]byte, n)
 			copy(data, buf[:n])
 
-			// Pick the next ACTIVE fanout. During phased bring-up some
-			// fanouts exist but their DTLS sessions aren't up yet;
-			// posting to them would just fill the channel buffer and
-			// then drop. Linear probe from the round-robin cursor —
-			// O(N) worst case is fine for our N ≤ 100.
+			// Pick an ACTIVE fanout. We use SHORTEST-QUEUE-FIRST with a
+			// round-robin tiebreak. Pure round-robin distributes WG
+			// packets evenly across N sessions, but the throughput of a
+			// VK TURN allocation is voice-grade (~250 kbps - 2 Mbps) and
+			// some allocations are noticeably slower than others — a
+			// recycled cred about to expire, a relay on a hot path, a
+			// session whose DTLS handshake just retried. Pure RR keeps
+			// shoving packets into those slow lanes until their 256-deep
+			// buffer fills, then drops; meanwhile fast lanes idle.
+			// Shortest-queue-first naturally puts most packets on the
+			// fastest lanes (their queues are short because they drain
+			// quickly) and starves the slow ones. WG's own
+			// retransmit/ack machinery handles any out-of-order arrival.
+			//
+			// O(N) per packet is fine: N ≤ 100, ~1k pkts/sec on a
+			// 10 Mbps tunnel → 100k cheap ops/sec.
 			total := uint64(len(fanouts))
+			start := (atomic.AddUint64(&rrIdx, 1) - 1) % total
 			var f *fanoutPacketConn
+			minLen := fanoutQueueDepth + 1 // anything in-range beats this
 			for k := uint64(0); k < total; k++ {
-				i := (atomic.AddUint64(&rrIdx, 1) - 1) % total
-				if fanouts[i].active.Load() {
+				i := (start + k) % total
+				if !fanouts[i].active.Load() {
+					continue
+				}
+				l := len(fanouts[i].incoming)
+				if l < minLen {
+					minLen = l
 					f = fanouts[i]
-					break
+					if l == 0 {
+						break // an empty queue is unbeatable
+					}
 				}
 			}
 			if f == nil {
