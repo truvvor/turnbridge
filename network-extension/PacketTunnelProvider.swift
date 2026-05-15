@@ -421,17 +421,32 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     override func wake() {
-        // After a sleep iOS thaws our Go runtime, but the TURN allocation
-        // and DTLS session held by the embedded vk-turn-proxy client are
-        // almost certainly stale — VK TURN drops idle channels, NAT
-        // mappings on the cellular side have expired, and pion/dtls
-        // sequence numbers can be outside the replay window. Force a
-        // clean reconnect before WireGuard starts pumping packets through
-        // zombie sockets.
+        // After a sleep iOS thaws our Go runtime. The TURN allocation
+        // and DTLS session held by the embedded vk-turn-proxy client
+        // MAY be stale (VK TURN drops idle channels after ~50 s, NAT
+        // mappings on the cellular side expire, pion/dtls sequence
+        // numbers can drift out of the replay window), but only after
+        // a long enough suspension. Short sleeps — screen-off blink,
+        // brief task switch, lock-unlock cycle — leave every socket
+        // intact and we just lose a few hundred ms of keepalive RTT.
+        //
+        // ProxyForceReconnect cancels ALL live TURN+DTLS sessions
+        // (test logs showed 96–100 cancellations per wake on N=50,
+        // and the recovery storm immediately trips VK's per-IP
+        // ERROR_LIMIT). For short gaps we'd rather keep the work the
+        // captcha pipeline already invested in. wakeReconnectThreshold
+        // is set below VK's allocation rotation window so anything
+        // shorter is presumed survivable.
         let gap = Self.lastSleepAt.map { Date().timeIntervalSince($0) } ?? 0
-        sharedLogger.log("System wake — gap=\(String(format: "%.1f", gap))s, forcing TURN/DTLS reconnect")
-        SharedLogger.info("System wake — gap=\(String(format: "%.1f", gap))s, forcing TURN/DTLS reconnect", source: .tunnel)
-        ProxyForceReconnect()
+        let wakeReconnectThreshold: TimeInterval = 30
+        if gap < wakeReconnectThreshold {
+            sharedLogger.log("System wake — short gap=\(String(format: "%.1f", gap))s, keeping live sessions")
+            SharedLogger.info("System wake — short gap=\(String(format: "%.1f", gap))s, keeping live sessions", source: .tunnel)
+        } else {
+            sharedLogger.log("System wake — gap=\(String(format: "%.1f", gap))s ≥ \(Int(wakeReconnectThreshold))s, forcing TURN/DTLS reconnect")
+            SharedLogger.info("System wake — gap=\(String(format: "%.1f", gap))s ≥ \(Int(wakeReconnectThreshold))s, forcing TURN/DTLS reconnect", source: .tunnel)
+            ProxyForceReconnect()
+        }
         Self.lastSleepAt = nil
     }
 

@@ -39,11 +39,15 @@ import (
 // remoteHandoverThreshold — number of LOCAL successful captcha
 // solves before subsequent solves are offloaded to the remote
 // service. The first few sessions bootstrap the WG tunnel using
-// the mobile IP's fresh per-IP captcha budget; once WG is up and
-// we'd otherwise burn the tunnel egress (or worse, get stuck on
-// recycled creds), we hand off to the server. 5 is the user-
-// requested value ("поднимать 5-7 сессий и уходить дальше").
-const remoteHandoverThreshold = 5
+// the mobile IP's fresh per-IP captcha budget; once WG is up we
+// hand off to the server cluster so the phone IP doesn't burn its
+// remaining ERROR_LIMIT budget on sessions 6+. 3 is lower than the
+// original 5 because the gap between "first session ready" and the
+// counter actually hitting the threshold is filled by other
+// in-flight getCreds calls that have already committed to local —
+// dropping the threshold by 2 buys ~4 more remote-routed solves at
+// no extra latency cost.
+const remoteHandoverThreshold = 3
 
 type remoteCaptchaConfig struct {
 	url    atomic.Value // string
