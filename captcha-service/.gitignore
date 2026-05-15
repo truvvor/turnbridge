@@ -1,0 +1,3 @@
+# `go build .` produces a binary named after the directory.
+captcha-service
+trap/

@@ -102,6 +102,76 @@ healthcheck on `/healthz`.
 
 `maxConcurrentCaptchaSolves = 5` matches the iOS client's pacing.
 VK trips `ERROR_LIMIT` more aggressively when more than ~5-6 solves
-land on the same source IP in the same 60 s window. If you front
-this with a pool of egress IPs, scale the concurrency proportionally
-(future work; the current build assumes one IP per binary).
+land on the same source IP in the same 60 s window. Scale capacity
+by adding more peers on different IPs (see Cluster mode below),
+not by raising this limit on one instance.
+
+## Cluster mode (V2)
+
+Every binary is symmetric. The peer the client hits acts as
+**master** for that request: it round-robins through the configured
+peer list (including itself), forwards to `/internal/cred` when
+round-robin lands on a different peer, and falls through to the
+next peer on `429`. Single-node mode (no `PEERS`) is the default
+and matches V1 behaviour.
+
+### Deployment
+
+Run one captcha-service per IP. Each binary needs to know all
+peers in the fleet. Example for 3 nodes on different VPS:
+
+```sh
+# Node A (77.90.8.199)
+docker run -d -p 8080:8080 \
+  -e API_KEY=$SHARED_KEY \
+  -e SELF_URL=http://77.90.8.199:8080 \
+  -e PEERS='http://77.90.8.199:8080|'$SHARED_KEY',http://77.90.8.200:8080|'$SHARED_KEY',http://77.90.8.201:8080|'$SHARED_KEY \
+  --name cs turnbridge/captcha-service
+
+# Node B (77.90.8.200) — same PEERS list, different SELF_URL
+docker run -d -p 8080:8080 \
+  -e API_KEY=$SHARED_KEY \
+  -e SELF_URL=http://77.90.8.200:8080 \
+  -e PEERS='http://77.90.8.199:8080|'$SHARED_KEY',http://77.90.8.200:8080|'$SHARED_KEY',http://77.90.8.201:8080|'$SHARED_KEY \
+  --name cs turnbridge/captcha-service
+
+# Node C (77.90.8.201) — analogous
+```
+
+`PEERS` format: comma-separated `URL|API_KEY` entries. `SELF_URL`
+must exactly match one of the `PEERS` URLs so the binary recognises
+itself and bypasses HTTP when round-robin picks it. Different
+peers can use different API keys (each entry carries its own); the
+common pattern is one shared key across the whole fleet.
+
+### Saturation propagation
+
+Each peer tracks its own VK rate-limit cooldown locally
+(`directSaturated()` flips on `ERROR_LIMIT` and auto-clears after
+60 s). When a master forwards to a peer and the peer returns `429`
+or sets `X-Captcha-Self-Saturated: 1` on its response, the master
+records "peer X cool down until now + 60 s" and skips X in
+subsequent rounds. No gossip / heartbeats — saturation is learned
+passively from response headers.
+
+`GET /stats` includes the master's view of each peer's availability.
+
+### Client config
+
+The client always talks to ONE master URL. To survive a single-node
+outage, either:
+
+- Front the cluster with a load balancer / DNS round-robin (single
+  client URL → many backend nodes).
+- Or accept that "master" is whichever node the client points at
+  and live-edit the URL when needed.
+
+### HTTP path summary
+
+- `POST /cred` — public, client-facing. Master logic; forwards.
+- `POST /internal/cred` — peer-only. Same auth as `/cred` but
+  never forwards. Sets `X-Captcha-Self-Saturated: 1` when this
+  peer is in its 60 s cooldown.
+- `GET /stats` — counters + peer-view snapshot.
+- `GET /healthz` — for Docker HEALTHCHECK.
+
