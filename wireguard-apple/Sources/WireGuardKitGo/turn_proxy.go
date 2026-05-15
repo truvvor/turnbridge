@@ -76,7 +76,33 @@ func ProxyForceReconnect() {
 	for _, c := range cancels {
 		c()
 	}
+	// Network-path changes (which is what triggers a force-reconnect
+	// 90% of the time) are exactly when half-dead persistConns
+	// accumulate in the HTTP idle pool — IdleConnTimeout=90s won't
+	// catch them because the socket isn't naturally idle, it's
+	// silently broken. Drop them all so the next captcha solve
+	// dials fresh sockets instead of reusing zombies.
+	flushHTTPIdleConns()
 	log.Printf("ProxyForceReconnect: cancelled %d live session(s)", len(cancels))
+}
+
+// sleepCtx blocks for d, returning early (with ctx.Err()) if ctx
+// fires first. Unlike `select { case <-ctx.Done(): case <-time.After(d): }`,
+// this releases the underlying Timer immediately when ctx wins —
+// so it doesn't leak a Timer object + runtime goroutine on every
+// abandoned wait. In a DTLS reconnect storm this accumulates fast.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 
@@ -329,6 +355,12 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
     defer unregister()
     var conn1, conn2 net.PacketConn
     conn1, conn2 = connutil.AsyncPacketPipe()
+    // AsyncPacketPipe is an unbounded in-memory queue with no
+    // natural close trigger — packets that arrive after the DTLS
+    // session dies (and oneTurnConnection's read loop is wedged or
+    // exited) would otherwise accumulate forever. Closing conn1
+    // tears down both ends per packet_pipe.go.
+    defer conn1.Close()
     go func() {
         for {
             select {
@@ -684,7 +716,17 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 
 	wg := sync.WaitGroup{}
 	wg.Add(2)
-	turnctx, turncancel := context.WithCancel(context.Background())
+	// Derive turnctx from the parent ctx (StartProxy's, via
+	// oneTurnConnectionLoop). Previously this was rooted at
+	// context.Background(), so StopProxy / Disconnect only cancelled
+	// proxy-ctx — the two read-loop goroutines below kept blocking
+	// on conn2.ReadFrom forever (conn2 is an AsyncPacketPipe with no
+	// natural close trigger). ProxyForceReconnect happened to work
+	// because it iterates the session registry and calls turncancel
+	// directly, but StopProxy doesn't. Result: every session
+	// abandoned via StopProxy left one wedged goroutine behind, plus
+	// its conn2 pipe in memory.
+	turnctx, turncancel := context.WithCancel(ctx)
 	unregister := registerSession(turncancel)
 	defer unregister()
 	context.AfterFunc(turnctx, func() {
@@ -806,10 +848,8 @@ func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConnCha
 				backoff = reconnectBackoff(backoff, false)
 				if backoff > 0 {
 					log.Printf("DTLS reconnect in %s", backoff.Round(time.Millisecond))
-					select {
-					case <-ctx.Done():
+					if err := sleepCtx(ctx, backoff); err != nil {
 						return
-					case <-time.After(backoff):
 					}
 				}
 			} else {
@@ -836,10 +876,8 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 					backoff = reconnectBackoff(backoff, false)
 					if backoff > 0 {
 						log.Printf("TURN reconnect in %s", backoff.Round(time.Millisecond))
-						select {
-						case <-ctx.Done():
+						if err := sleepCtx(ctx, backoff); err != nil {
 							return
-						case <-time.After(backoff):
 						}
 					}
 				} else {
@@ -972,10 +1010,8 @@ func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
 		// the slot was held) and entry desync (used to be a 0-750 ms
 		// post-slot jitter). Both purposes preserved, the slot is
 		// freed earlier.
-		select {
-		case <-time.After(time.Duration(1500+rand.Intn(1000)) * time.Millisecond):
-		case <-ctx.Done():
-			return "", "", "", ctx.Err()
+		if err := sleepCtx(ctx, time.Duration(1500+rand.Intn(1000))*time.Millisecond); err != nil {
+			return "", "", "", err
 		}
 
 		select {
@@ -1129,7 +1165,13 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
 	_ = listenConnChan
 
     wg1 := sync.WaitGroup{}
-	t := time.Tick(200 * time.Millisecond)
+	// time.Tick (no Stop hook) leaks one ticker goroutine + heap
+	// object per StartProxy invocation — across iOS suspend/wake
+	// cycles and Disconnect/Reconnect this accumulates fast. Use
+	// NewTicker + Stop bound to ctx cleanup.
+	tDispatcher := time.NewTicker(200 * time.Millisecond)
+	defer tDispatcher.Stop()
+	t := tDispatcher.C
 
 	// Re-roll the Stream-Aggregation session ID once per StartProxy.
 	// Each of the N DTLS sessions below will then prepend the same
@@ -1359,4 +1401,21 @@ func StopProxy() {
         proxyCancel = nil
         log.Println("Proxy gracefully stopped")
     }
+    // Drop accumulated idle HTTP conns. sharedAuthClient,
+    // remoteCredsClient and dohClient are package-level so their
+    // pools survive StartProxy/StopProxy cycles — without an
+    // explicit flush, every Disconnect carries forward a
+    // potentially-stale persistConn (each with a readLoop +
+    // writeLoop goroutine pair) to the next Connect.
+    flushHTTPIdleConns()
+}
+
+// flushHTTPIdleConns closes idle conns on every package-level
+// http.Client in the bridge. Called from StopProxy and
+// ProxyForceReconnect — both cases where outbound HTTP path may
+// have changed under us.
+func flushHTTPIdleConns() {
+    sharedAuthClient.CloseIdleConnections()
+    remoteCredsClient.CloseIdleConnections()
+    dohClient.CloseIdleConnections()
 }
