@@ -2,6 +2,7 @@
 //  Created by nullcstring.
 //
 
+import Darwin
 import NetworkExtension
 import Network
 import WireGuardKit
@@ -182,6 +183,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         startCaptchaStatsPublisher()
+        Self.startMemoryLogger()
 
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             let ready = ProxyWaitReady(dtlsReadyTimeoutMs)
@@ -454,4 +456,54 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // Static because PacketTunnelProvider instances are owned by the system
     // and we want to survive whatever lifecycle iOS chooses.
     private static var lastSleepAt: Date?
+
+    // Memory logger — runs every 5 s while the extension is alive.
+    // Reports (a) the iOS-given remaining memory budget for this
+    // extension via os_proc_available_memory() — this is the number
+    // that, once it hits zero, makes iOS terminate us. (b) resident
+    // set size via mach_task_basic_info, so we can see WHAT our
+    // memory actually is in OS terms (not just Go heap, which the
+    // Go-side memstats logger reports separately). The pair tells
+    // us how much headroom we have for raising N, where N=50
+    // currently sits on the memory budget, and whether spikes
+    // come from Go (captcha pipeline) or non-Go (libdtls, mach
+    // ports, etc).
+    private static var memoryTimer: DispatchSourceTimer?
+
+    static func startMemoryLogger() {
+        // Re-arm on every StartProxy so it survives Stop/Start cycles
+        // without leaking the previous timer.
+        memoryTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        timer.schedule(deadline: .now(), repeating: .seconds(5))
+        timer.setEventHandler {
+            let avail = os_proc_available_memory()
+            let rss = currentResidentMemoryBytes()
+            // Numbers in MB for human-readable logs.
+            let availMB = Double(avail) / 1024.0 / 1024.0
+            let rssMB = Double(rss) / 1024.0 / 1024.0
+            let msg = String(
+                format: "memory: rss=%.1fMB available=%.1fMB",
+                rssMB, availMB
+            )
+            sharedLogger.log("\(msg, privacy: .public)")
+            SharedLogger.info(msg, source: .tunnel)
+        }
+        timer.resume()
+        memoryTimer = timer
+    }
+
+    private static func currentResidentMemoryBytes() -> UInt64 {
+        var info = mach_task_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) { ptr -> kern_return_t in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+            }
+        }
+        if kr != KERN_SUCCESS {
+            return 0
+        }
+        return info.resident_size
+    }
 }

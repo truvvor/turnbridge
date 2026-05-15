@@ -1032,6 +1032,11 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
     proxyCancel = cancel
     defer cancel()
 
+    // Periodic Go runtime memstats. Pair with the Swift-side
+    // os_proc_available_memory logger to understand when the
+    // extension is approaching iOS's kill threshold.
+    startMemstatsLogger(ctx)
+
     peer, err := net.ResolveUDPAddr("udp", peerAddrStr)
     if err != nil {
         log.Printf("Resolve UDP error: %v", err)
