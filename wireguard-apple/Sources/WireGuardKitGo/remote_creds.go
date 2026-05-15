@@ -29,6 +29,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -78,6 +79,46 @@ func ProxySetRemoteCaptchaService(cURL *C.char, cAPIKey *C.char) {
 	log.Printf("remote-captcha: configured (url=%s, handover-after=%d local solves)", url, remoteHandoverThreshold)
 }
 
+// remoteCooldownDefault — how long the client treats the remote
+// service as unavailable when the master returns 429 without a
+// usable Retry-After header. Matches the server's own ERROR_LIMIT
+// cooldown so the two ends recover in lockstep.
+const remoteCooldownDefault = 60 * time.Second
+
+// remoteCooldownUntilNano is a UnixNano timestamp; calls to
+// getCredsRemote skip the round trip entirely while now() < this
+// value. Lets `getCredsRouted` fall through to local immediately
+// during a saturation window instead of paying 90 s of HTTP timeout
+// per session waiting for the server to refuse again.
+var remoteCooldownUntilNano atomic.Int64
+
+func remoteInCooldown() bool {
+	until := remoteCooldownUntilNano.Load()
+	if until == 0 {
+		return false
+	}
+	return time.Now().UnixNano() < until
+}
+
+func setRemoteCooldown(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	until := time.Now().Add(d).UnixNano()
+	for {
+		cur := remoteCooldownUntilNano.Load()
+		// Only extend; never shorten. Two concurrent 429s with
+		// different Retry-After values shouldn't clobber the
+		// longer one.
+		if until <= cur {
+			return
+		}
+		if remoteCooldownUntilNano.CompareAndSwap(cur, until) {
+			return
+		}
+	}
+}
+
 // remoteCredsClient is dedicated to /cred calls. Its DialContext is
 // customDial so it benefits from DoH + fallback IPs when api.vk.com
 // is censored, but the actual target host is the user's own server.
@@ -125,6 +166,28 @@ func getCredsRemote(ctx context.Context, link string) (string, string, string, e
 	if jsonErr := json.Unmarshal(rawBody, &resp); jsonErr != nil {
 		return "", "", "", fmt.Errorf("decode server response (status=%d): %w", httpResp.StatusCode, jsonErr)
 	}
+	if httpResp.StatusCode == http.StatusTooManyRequests {
+		// Master is reporting that every peer it knows about is
+		// saturated. Trip our local cooldown so we don't pile on
+		// during the recovery window — the next ~60 s of getCreds
+		// calls will skip the HTTP round trip and go straight to
+		// the local solver (which on a single-IP deployment is
+		// often also saturated, but at least skipping spares us
+		// the 90 s remote timeout per session).
+		cooldown := remoteCooldownDefault
+		if ra := httpResp.Header.Get("Retry-After"); ra != "" {
+			if secs, err := strconv.Atoi(strings.TrimSpace(ra)); err == nil && secs > 0 {
+				cooldown = time.Duration(secs) * time.Second
+			}
+		}
+		setRemoteCooldown(cooldown)
+		log.Printf("remote-captcha: master saturated, cooling down for %v", cooldown)
+		msg := resp.Error
+		if msg == "" {
+			msg = "all peers saturated"
+		}
+		return "", "", "", fmt.Errorf("server: %s", msg)
+	}
 	if httpResp.StatusCode != http.StatusOK {
 		msg := resp.Error
 		if msg == "" {
@@ -144,9 +207,16 @@ func getCredsRemote(ctx context.Context, link string) (string, string, string, e
 // on the user's own mobile IP; after that, calls prefer the remote
 // service. Remote failures cleanly fall through to local — same
 // recycle-pool behaviour as before, no client-side regression.
+//
+// When the master is in 429-cooldown (see setRemoteCooldown), skip
+// the HTTP attempt entirely. The cooldown is established by a real
+// 429 response; once the window passes the next call will try remote
+// again. This keeps the recovery-window log clean and stops us from
+// burning 90 s timeouts on each session-spawn while the cluster
+// recovers.
 func getCredsRouted(ctx context.Context, link string) (string, string, string, error) {
 	useRemote := remoteCaptchaEnabled() && captchaSessionsReady.Load() >= int64(remoteHandoverThreshold)
-	if useRemote {
+	if useRemote && !remoteInCooldown() {
 		u, p, a, err := getCredsRemote(ctx, link)
 		if err == nil {
 			log.Printf("remote-captcha: cred from server (sessions_ready=%d)", captchaSessionsReady.Load())
