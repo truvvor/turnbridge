@@ -1023,6 +1023,21 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
     host := ""
     port := ""
     n := int(cN)
+    // Hard cap on N to keep the extension inside its iOS memory budget.
+    // Empirical: at N=50 we see rss 97 MB / available 3.7 MB after ~100 s,
+    // i.e. the ~100 MB extension budget is fully consumed. N=40 leaves
+    // ~20 MB of headroom for steady-state growth (goroutine accumulation
+    // from DTLS retry storms, sharedAuthClient idle conns, etc) and keeps
+    // peak resident below 90 MB. If memory leaks get fixed and the steady-
+    // state climb flattens, this can be raised.
+    const maxN = 40
+    if n > maxN {
+        log.Printf("StartProxy: N=%d capped to %d (iOS memory budget)", n, maxN)
+        n = maxN
+    }
+    if n < 1 {
+        n = 1
+    }
     // udp transport to TURN. true=plain UDP (faster, fragile under loss),
     // false=TCP STUNConn (survives short cellular blips at the cost of HoL).
     udp := cUDP != 0
