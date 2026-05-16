@@ -278,6 +278,16 @@ func (a *minimalTURNAlloc) allocate(ctx context.Context) error {
 		if err := m.NewTransactionID(); err != nil {
 			return nil, err
 		}
+		// WriteHeader stamps the STUN magic cookie 0x2112A442 into
+		// m.Raw[4:8]. Without this, MessageIntegrity.AddTo (called
+		// later by addAuth) computes the HMAC over m.Raw with
+		// cookie=0 — but the wire bytes go out with the real cookie
+		// (Encode writes it), so the server's recomputed HMAC over
+		// the received bytes doesn't match → 401. SetType wrote
+		// [0:2] and NewTransactionID wrote [8:20], but nothing else
+		// touches [4:8] until Encode, which runs too late. This was
+		// the 1.3.9 ship-blocker.
+		m.WriteHeader()
 		m.Add(attrRequestedTransport, []byte{transportUDP, 0, 0, 0})
 		m.Add(attrRequestedAddressFamily, []byte{family, 0, 0, 0})
 		if withAuth {
@@ -367,6 +377,7 @@ func (a *minimalTURNAlloc) channelBind(ctx context.Context) error {
 		if err := m.NewTransactionID(); err != nil {
 			return nil, err
 		}
+		m.WriteHeader() // stamp magic cookie — see allocate()
 		var chBuf [4]byte
 		binary.BigEndian.PutUint16(chBuf[0:2], fixedChannelNumber)
 		m.Add(attrChannelNumber, chBuf[:])
@@ -413,6 +424,7 @@ func (a *minimalTURNAlloc) refresh(ctx context.Context, lifetimeSec uint32) erro
 		if err := m.NewTransactionID(); err != nil {
 			return nil, err
 		}
+		m.WriteHeader() // stamp magic cookie — see allocate()
 		var lifeBuf [4]byte
 		binary.BigEndian.PutUint32(lifeBuf[:], lifetimeSec)
 		m.Add(attrLifetime, lifeBuf[:])

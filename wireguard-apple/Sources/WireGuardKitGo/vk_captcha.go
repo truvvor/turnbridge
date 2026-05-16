@@ -69,6 +69,16 @@ func newCaptchaClient(forceDirect bool) *http.Client {
             TLSClientConfig: &tls.Config{
                 InsecureSkipVerify: false,
             },
+            // Tight per-client connection pool. Each solve only ever
+            // talks to api.vk.ru + id.vk.ru, and a fresh client is
+            // built per attempt — no point keeping deep idle pools.
+            // With 5s idle timeout (vs default 90s) the persistConn
+            // goroutines exit promptly after the solve completes,
+            // instead of sitting for 90s holding stack space and a
+            // socket per request.
+            MaxIdleConns:        4,
+            MaxIdleConnsPerHost: 2,
+            IdleConnTimeout:     5 * time.Second,
         },
     }
 }

@@ -685,11 +685,14 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 		turnConn = turn.NewSTUNConn(conn)
 	}
 	// useMinimalTURN swaps pion/turn for the in-tree minimal client
-	// (turn_min.go). DISABLED in 1.3.10 — 1.3.9 shipped with a bug
-	// that made every TURN allocation 401 even after long-term auth
-	// challenge, so all sessions fell back to retry storms and OOM'd.
-	// Keeping the code in tree for now so we can fix forward.
-	const useMinimalTURN = false
+	// (turn_min.go). Re-enabled in 1.3.11 after fixing the 1.3.9 bug:
+	// MessageIntegrity.AddTo was computing HMAC over m.Raw with the
+	// STUN magic cookie still zero (Encode wrote it later), so the
+	// server's recomputed HMAC over the wire bytes never matched →
+	// 401 on every authenticated allocate. Fixed by calling
+	// m.WriteHeader() right after NewTransactionID() in all three
+	// builders (allocate, channelBind, refresh).
+	const useMinimalTURN = true
 
 	var relayConn net.PacketConn
 	if useMinimalTURN {
@@ -1120,12 +1123,14 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
     host := ""
     port := ""
     n := int(cN)
-    // Hard cap on N. With minimal TURN disabled (see useMinimalTURN
-    // in oneTurnConnection), we're back on pion which carries the
-    // per-session goroutine zoo and hits available≈0 around N=50 on
-    // a fresh tunnel. 40 keeps a healthy floor of free memory; we
-    // can raise it once the minimal-TURN auth bug is fixed.
-    const maxN = 40
+    // Hard cap on N. 1.3.11 re-enables the minimal TURN client (the
+    // auth bug from 1.3.9 is fixed), adds debug.SetMemoryLimit(75MB)
+    // + SetGCPercent(50) + periodic FreeOSMemory, tightens the
+    // captcha solver's HTTP idle pool, and lowers solve concurrency
+    // 5 → 3. The combined memory wins should comfortably support
+    // N=100, but we cap at 60 conservatively until field-tested —
+    // raising it once the new floor is empirically known.
+    const maxN = 60
     if n > maxN {
         log.Printf("StartProxy: N=%d capped to %d (iOS memory budget)", n, maxN)
         n = maxN
