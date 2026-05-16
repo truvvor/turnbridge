@@ -15,10 +15,13 @@ import Combine
 final class CaptchaStatsState: ObservableObject {
     @Published private(set) var direct: Int = 0
     @Published private(set) var tunnel: Int = 0
+    @Published private(set) var remote: Int = 0
     @Published private(set) var directAttempts: Int = 0
     @Published private(set) var tunnelAttempts: Int = 0
+    @Published private(set) var remoteAttempts: Int = 0
     @Published private(set) var directInFlight: Int = 0
     @Published private(set) var tunnelInFlight: Int = 0
+    @Published private(set) var remoteInFlight: Int = 0
     @Published private(set) var sessionsReady: Int = 0
     @Published private(set) var sessionsTarget: Int = 0
     @Published private(set) var directSaturated: Bool = false
@@ -39,10 +42,13 @@ final class CaptchaStatsState: ObservableObject {
         timer = nil
         direct = 0
         tunnel = 0
+        remote = 0
         directAttempts = 0
         tunnelAttempts = 0
+        remoteAttempts = 0
         directInFlight = 0
         tunnelInFlight = 0
+        remoteInFlight = 0
         sessionsReady = 0
         sessionsTarget = 0
         directSaturated = false
@@ -55,10 +61,13 @@ final class CaptchaStatsState: ObservableObject {
         }
         direct = defaults.integer(forKey: "captchaDirectCount")
         tunnel = defaults.integer(forKey: "captchaTunnelCount")
+        remote = defaults.integer(forKey: "captchaRemoteCount")
         directAttempts = defaults.integer(forKey: "captchaDirectAttempts")
         tunnelAttempts = defaults.integer(forKey: "captchaTunnelAttempts")
+        remoteAttempts = defaults.integer(forKey: "captchaRemoteAttempts")
         directInFlight = defaults.integer(forKey: "captchaDirectInFlight")
         tunnelInFlight = defaults.integer(forKey: "captchaTunnelInFlight")
+        remoteInFlight = defaults.integer(forKey: "captchaRemoteInFlight")
         sessionsReady = defaults.integer(forKey: "sessionsReady")
         sessionsTarget = defaults.integer(forKey: "sessionsTarget")
         directSaturated = defaults.bool(forKey: "captchaDirectSaturated")
@@ -85,21 +94,34 @@ struct CaptchaStatsBadge: View {
             Divider().padding(.horizontal, 4)
 
             // Bottom row: per-egress counters with in-flight indicators.
-            HStack(spacing: 14) {
+            // Three buckets — Direct (phone IP), Tunnel (WG egress
+            // routed through utun), Server (captcha-service cluster).
+            // The Server cell is the entire reason the total session
+            // count exceeds Direct+Tunnel: server-side solves never
+            // touch this phone's HTTP stack so they don't show up in
+            // the other two buckets. With multi-link configured, the
+            // Server cell is typically the largest of the three.
+            HStack(spacing: 10) {
                 cell(label: "Direct",
                      ok: stats.direct,
                      attempts: stats.directAttempts,
                      inFlight: stats.directInFlight,
                      saturated: stats.directSaturated,
                      accent: .blue)
-                Divider()
-                    .frame(height: 30)
+                Divider().frame(height: 30)
                 cell(label: "Tunnel",
                      ok: stats.tunnel,
                      attempts: stats.tunnelAttempts,
                      inFlight: stats.tunnelInFlight,
                      saturated: stats.tunnelSaturated,
                      accent: .green)
+                Divider().frame(height: 30)
+                cell(label: "Server",
+                     ok: stats.remote,
+                     attempts: stats.remoteAttempts,
+                     inFlight: stats.remoteInFlight,
+                     saturated: false,
+                     accent: .purple)
             }
         }
         .padding(.horizontal, 14)

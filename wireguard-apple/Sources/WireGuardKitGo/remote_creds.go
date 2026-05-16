@@ -151,6 +151,10 @@ func getCredsRemote(ctx context.Context, link string) (string, string, string, e
 		return "", "", "", errors.New("remote captcha not configured")
 	}
 
+	captchaRemoteAttempts.Add(1)
+	captchaRemoteInFlight.Add(1)
+	defer captchaRemoteInFlight.Add(-1)
+
 	body, _ := json.Marshal(map[string]string{"link": link})
 	req, err := http.NewRequestWithContext(ctx, "POST", strings.TrimRight(url, "/")+"/cred", bytes.NewReader(body))
 	if err != nil {
@@ -202,6 +206,7 @@ func getCredsRemote(ctx context.Context, link string) (string, string, string, e
 	if resp.User == "" || resp.Pass == "" || resp.Addr == "" {
 		return "", "", "", fmt.Errorf("server returned incomplete creds")
 	}
+	captchaRemoteOK.Add(1)
 	return resp.User, resp.Pass, resp.Addr, nil
 }
 

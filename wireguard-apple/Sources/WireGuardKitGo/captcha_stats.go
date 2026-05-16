@@ -44,6 +44,17 @@ var (
 	captchaTunnelEgress     atomic.Bool  // true once we believe HTTP from this extension routes through utun
 	captchaSessionsReady    atomic.Int64 // DTLS sessions that have reached sessionOk
 	captchaSessionsTarget   atomic.Int64 // requested N
+
+	// Remote-server captcha pool stats. Server-cluster solves are
+	// completely opaque to the markCaptcha{Attempt,Success,Saturated}
+	// helpers above because the captcha never touches this phone's
+	// HTTP stack — getCredsRemote just receives a finished cred. The
+	// counters below are bumped exclusively from remote_creds.go on
+	// every /cred call so the UI can surface the cluster's
+	// contribution alongside Direct/Tunnel.
+	captchaRemoteOK       atomic.Int64
+	captchaRemoteAttempts atomic.Int64
+	captchaRemoteInFlight atomic.Int64
 )
 
 // satThreshold is the number of consecutive ERROR_LIMITs that count as
@@ -73,6 +84,24 @@ func resetCaptchaStats() {
 	captchaTunnelEgress.Store(false)
 	captchaSessionsReady.Store(0)
 	captchaSessionsTarget.Store(0)
+	captchaRemoteOK.Store(0)
+	captchaRemoteAttempts.Store(0)
+	captchaRemoteInFlight.Store(0)
+}
+
+//export TurnBridgeGetCaptchaRemoteCount
+func TurnBridgeGetCaptchaRemoteCount() C.int {
+	return C.int(captchaRemoteOK.Load())
+}
+
+//export TurnBridgeGetCaptchaRemoteAttempts
+func TurnBridgeGetCaptchaRemoteAttempts() C.int {
+	return C.int(captchaRemoteAttempts.Load())
+}
+
+//export TurnBridgeGetCaptchaRemoteInFlight
+func TurnBridgeGetCaptchaRemoteInFlight() C.int {
+	return C.int(captchaRemoteInFlight.Load())
 }
 
 // markCaptchaAttemptStart bumps the in-flight gauge for the egress
