@@ -939,11 +939,17 @@ const credMaxAge = 45 * time.Second
 // Max concurrent captcha solves against VK. Fully-parallel solves at
 // N=30 trigger VK's anti-bot rate-limit (`ERROR_LIMIT` on
 // captcha.isNotRobot, `status: ERROR` on slider getContent) and the
-// per-IP TURN allocation cap (error 486). Five concurrent solves keeps
-// the captcha pipeline well under VK's threshold while still scaling
-// throughput roughly 5× over fully-serial (which was the d917a0e
-// motivation in the first place).
-const maxConcurrentCaptchaSolves = 5
+// per-IP TURN allocation cap (error 486).
+//
+// Lowered 5 → 3 in 1.3.10: each solve transiently holds an HTTP/TLS
+// client + JSON state + image decode buffer + a handful of stdlib
+// http.Transport goroutines (~1.5-2 MB worth). Under a reconnect
+// storm where sessions die past T+30s, 5 simultaneous solves was
+// adding ~10 MB transient + ~50 net/http goroutines on top of the
+// already-loaded steady-state. 3 keeps almost all the throughput
+// (the binding constraint is VK's per-IP rate-limit, not our
+// concurrency) for ~6 MB lower peak.
+const maxConcurrentCaptchaSolves = 3
 
 func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
 	var mu sync.Mutex
@@ -1136,9 +1142,16 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
     proxyCancel = cancel
     defer cancel()
 
-    // Periodic Go runtime memstats. Pair with the Swift-side
-    // os_proc_available_memory logger to understand when the
-    // extension is approaching iOS's kill threshold.
+    // Apply Go runtime memory tunings BEFORE any per-session work
+    // spawns goroutines — SetMemoryLimit applies retroactively but
+    // GCPercent is sampled at the next GC cycle, so earlier is
+    // better. See memstats.go for what these do.
+    tuneGoRuntime()
+
+    // Periodic Go runtime memstats + periodic FreeOSMemory. Pair
+    // with the Swift-side os_proc_available_memory logger to
+    // understand when the extension is approaching iOS's kill
+    // threshold.
     startMemstatsLogger(ctx)
 
     peer, err := net.ResolveUDPAddr("udp", peerAddrStr)
