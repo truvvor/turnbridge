@@ -467,12 +467,28 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
         dtlsConn.SetDeadline(time.Now())
     })
 
-    // Watchdog: if no inbound bytes from dtlsConn for >60s, force a
-    // restart. With WG's PersistentKeepalive=25 we should be seeing
-    // traffic every few seconds; a long silence means the TURN
-    // allocation died or the network changed under us.
+    // Watchdog: catch sessions that were healthy then went silent. The
+    // narrow case it must catch: TURN allocation gets quietly killed
+    // (relay timeout, server restart, NAT rebinding) while DTLS stays
+    // up — wg→dtls writes keep "succeeding" into the void.
+    //
+    // The case it must NOT trigger on: DTLS handshake succeeded, WG
+    // came up, but the fanout dispatcher never round-robined a packet
+    // into this session yet. At N=60 only ~1/N sessions sees the WG
+    // keepalive every 25 s, so most sessions sit idle for minutes
+    // before being useful. Killing them on a 60 s timer just because
+    // they're idle-but-healthy created a reconnect storm: every cull
+    // burns a captcha solve, VK rate-limits, the replacement also
+    // gets culled, repeat. Memory was fine (1.3.12), throughput
+    // wasn't.
+    //
+    // Distinguishing the two: lastRxNanos starts at 0 (not now()),
+    // bumped to time.Now() on the first dtlsConn.Read in the read
+    // loop below. Watchdog only fires after lastRxNanos has actually
+    // been bumped — i.e., we've proven this session can carry
+    // traffic. Sessions that never get data sit and let minimal
+    // TURN's half-lifetime Refresh keep the allocation alive.
     var lastRxNanos atomic.Int64
-    lastRxNanos.Store(time.Now().UnixNano())
     go func() {
         ticker := time.NewTicker(15 * time.Second)
         defer ticker.Stop()
@@ -481,7 +497,11 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
             case <-dtlsctx.Done():
                 return
             case now := <-ticker.C:
-                last := time.Unix(0, lastRxNanos.Load())
+                lastNanos := lastRxNanos.Load()
+                if lastNanos == 0 {
+                    continue // session has never received data yet, give it room
+                }
+                last := time.Unix(0, lastNanos)
                 if now.Sub(last) > 60*time.Second {
                     log.Printf("Watchdog: no inbound DTLS traffic for %s — forcing restart", now.Sub(last).Round(time.Second))
                     dtlscancel()
