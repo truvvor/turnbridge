@@ -31,7 +31,6 @@ import (
     "unsafe"
     "strings"
 
-    "github.com/cbeuw/connutil"
     "github.com/google/uuid"
     "github.com/pion/dtls/v3"
     "github.com/pion/dtls/v3/pkg/crypto/selfsign"
@@ -354,12 +353,11 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
     unregister := registerSession(dtlscancel)
     defer unregister()
     var conn1, conn2 net.PacketConn
-    conn1, conn2 = connutil.AsyncPacketPipe()
-    // AsyncPacketPipe is an unbounded in-memory queue with no
-    // natural close trigger — packets that arrive after the DTLS
-    // session dies (and oneTurnConnection's read loop is wedged or
-    // exited) would otherwise accumulate forever. Closing conn1
-    // tears down both ends per packet_pipe.go.
+    conn1, conn2 = boundedPacketPipe()
+    // Bounded pipe caps in-flight queue per direction at
+    // boundedPipeDepth packets; overflow drops with UDP semantics.
+    // Closing conn1 tears down both ends — pipePair shares one
+    // closed-channel that both pipeConns select on.
     defer conn1.Close()
     go func() {
         for {
@@ -504,7 +502,8 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
     go func() {
         defer wg.Done()
         defer dtlscancel()
-        buf := make([]byte, 1600)
+        buf := borrowReadBuf()
+        defer returnReadBuf(buf)
         for {
             select {
             case <-dtlsctx.Done():
@@ -531,7 +530,8 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
     go func() {
         defer wg.Done()
         defer dtlscancel()
-        buf := make([]byte, 1600)
+        buf := borrowReadBuf()
+        defer returnReadBuf(buf)
         for {
             select {
             case <-dtlsctx.Done():
@@ -762,7 +762,8 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	go func() {
 		defer wg.Done()
 		defer turncancel()
-		buf := make([]byte, 1600)
+		buf := borrowReadBuf()
+		defer returnReadBuf(buf)
 		for {
 			select {
 			case <-turnctx.Done():
@@ -790,7 +791,8 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	go func() {
 		defer wg.Done()
 		defer turncancel()
-		buf := make([]byte, 1600)
+		buf := borrowReadBuf()
+		defer returnReadBuf(buf)
 		for {
 			select {
 			case <-turnctx.Done():

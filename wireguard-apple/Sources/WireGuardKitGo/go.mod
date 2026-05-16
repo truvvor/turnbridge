@@ -3,7 +3,6 @@ module github.com/amnezia-vpn/amneziawg-apple
 go 1.26
 
 require (
-	github.com/cbeuw/connutil v1.0.1
 	github.com/google/uuid v1.6.0
 	github.com/pion/dtls/v3 v3.1.2
 	github.com/pion/logging v0.2.4
