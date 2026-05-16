@@ -684,51 +684,62 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 		}()
 		turnConn = turn.NewSTUNConn(conn)
 	}
-	var addrFamily turn.RequestedAddressFamily
-	if peer.IP.To4() != nil {
-		addrFamily = turn.RequestedAddressFamilyIPv4
-	} else {
-		addrFamily = turn.RequestedAddressFamilyIPv6
-	}
-	// Start a new TURN Client and wrap our net.Conn in a STUNConn
-	// This allows us to simulate datagram based communication over a net.Conn
-	cfg = &turn.ClientConfig{
-		STUNServerAddr:         turnServerAddr,
-		TURNServerAddr:         turnServerAddr,
-		Conn:                   turnConn,
-		Username:               user,
-		Password:               pass,
-		RequestedAddressFamily: addrFamily,
-		LoggerFactory:          logging.NewDefaultLoggerFactory(),
-	}
+	// useMinimalTURN swaps pion/turn for the in-tree minimal client
+	// (turn_min.go). pion runs several goroutines per allocation and
+	// keeps multi-peer permission/channel maps that we don't need —
+	// one allocation, one bound channel, one peer is the entire
+	// shape of our use case. The minimal client cuts per-session
+	// goroutine count and heap residency materially.
+	const useMinimalTURN = true
 
-	client, err1 := turn.NewClient(cfg)
-	if err1 != nil {
-		err = fmt.Errorf("failed to create TURN client: %s", err1)
-		return
-	}
-	defer client.Close()
-
-	// Start listening on the conn provided.
-	err1 = client.Listen()
-	if err1 != nil {
-		err = fmt.Errorf("failed to listen: %s", err1)
-		return
-	}
-
-	// Allocate a relay socket on the TURN server. On success, it
-	// will return a net.PacketConn which represents the remote
-	// socket.
-	relayConn, err1 := client.Allocate()
-	if err1 != nil {
-		err = fmt.Errorf("failed to allocate: %s", err1)
-		return
-	}
-	defer func() {
-		if err1 := relayConn.Close(); err1 != nil {
-			err = fmt.Errorf("failed to close TURN allocated connection: %s", err1)
+	var relayConn net.PacketConn
+	if useMinimalTURN {
+		allocCtx, allocCancel := context.WithTimeout(ctx, 15*time.Second)
+		alloc, err1 := minimalTURNAllocate(allocCtx, turnConn, turnServerUdpAddr, user, pass, peer)
+		allocCancel()
+		if err1 != nil {
+			err = fmt.Errorf("failed to allocate (minimal): %s", err1)
+			return
 		}
-	}()
+		relayConn = alloc
+		defer alloc.Close()
+	} else {
+		var addrFamily turn.RequestedAddressFamily
+		if peer.IP.To4() != nil {
+			addrFamily = turn.RequestedAddressFamilyIPv4
+		} else {
+			addrFamily = turn.RequestedAddressFamilyIPv6
+		}
+		cfg = &turn.ClientConfig{
+			STUNServerAddr:         turnServerAddr,
+			TURNServerAddr:         turnServerAddr,
+			Conn:                   turnConn,
+			Username:               user,
+			Password:               pass,
+			RequestedAddressFamily: addrFamily,
+			LoggerFactory:          logging.NewDefaultLoggerFactory(),
+		}
+		client, err1 := turn.NewClient(cfg)
+		if err1 != nil {
+			err = fmt.Errorf("failed to create TURN client: %s", err1)
+			return
+		}
+		defer client.Close()
+		if err1 = client.Listen(); err1 != nil {
+			err = fmt.Errorf("failed to listen: %s", err1)
+			return
+		}
+		relayConn, err1 = client.Allocate()
+		if err1 != nil {
+			err = fmt.Errorf("failed to allocate: %s", err1)
+			return
+		}
+		defer func() {
+			if err1 := relayConn.Close(); err1 != nil {
+				err = fmt.Errorf("failed to close TURN allocated connection: %s", err1)
+			}
+		}()
+	}
 
 	// The relayConn's local address is actually the transport
 	// address assigned on the TURN server.
@@ -1104,14 +1115,14 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
     host := ""
     port := ""
     n := int(cN)
-    // Hard cap on N to keep the extension inside its iOS memory budget.
-    // Empirical: at N=50 we see rss 97 MB / available 3.7 MB after ~100 s,
-    // i.e. the ~100 MB extension budget is fully consumed. N=40 leaves
-    // ~20 MB of headroom for steady-state growth (goroutine accumulation
-    // from DTLS retry storms, sharedAuthClient idle conns, etc) and keeps
-    // peak resident below 90 MB. If memory leaks get fixed and the steady-
-    // state climb flattens, this can be raised.
-    const maxN = 40
+    // Hard cap on N. Memory budget on iOS is ~100 MB; per-session
+    // cost has been driven down hard in 1.3.8/1.3.9 (bounded pipe,
+    // pooled scratches, minimal TURN client that replaces pion's
+    // per-allocation goroutine zoo). Worst case we observed at
+    // N=40 was ~86 MB rss steady-state, so N=100 should comfortably
+    // fit. iOS will SIGKILL well before this is exceeded — better
+    // than a magic clamp that silently capped the user's setting.
+    const maxN = 100
     if n > maxN {
         log.Printf("StartProxy: N=%d capped to %d (iOS memory budget)", n, maxN)
         n = maxN
