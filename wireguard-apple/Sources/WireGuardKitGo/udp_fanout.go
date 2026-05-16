@@ -39,12 +39,17 @@ import (
 	"time"
 )
 
-// fanoutQueueDepth is the per-virtual-conn buffer size. Big enough
-// to absorb a page-load burst (50–100 packets in a few ms) without
-// blocking the dispatcher, small enough to make a slow consumer
-// visible via the dropped-packet counter rather than via memory
-// growth (which is what AsyncPacketPipe already does silently).
-const fanoutQueueDepth = 256
+// fanoutQueueDepth is the per-virtual-conn buffer size. Each slot
+// holds a fanoutPacket (slice header + ~1500 B payload), so at
+// N=40 and 256-deep queues worst-case the dispatcher could be
+// holding 40 × 256 × 1.5 KB ≈ 15 MB of in-flight WG packets — a
+// lot of headroom for a system that's already inside a ~100 MB
+// extension budget. 64 still absorbs a fast page-load burst
+// (~50-100 packets in a few ms) without dropping, and caps worst-
+// case at ~4 MB. If the consumer is slower than that the drop
+// counter trips earlier, which is the right signal anyway —
+// hiding it behind a deeper queue just delays the inevitable.
+const fanoutQueueDepth = 64
 
 type fanoutPacket struct {
 	data []byte
