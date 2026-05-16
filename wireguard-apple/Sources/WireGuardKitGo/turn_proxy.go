@@ -685,12 +685,11 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 		turnConn = turn.NewSTUNConn(conn)
 	}
 	// useMinimalTURN swaps pion/turn for the in-tree minimal client
-	// (turn_min.go). pion runs several goroutines per allocation and
-	// keeps multi-peer permission/channel maps that we don't need —
-	// one allocation, one bound channel, one peer is the entire
-	// shape of our use case. The minimal client cuts per-session
-	// goroutine count and heap residency materially.
-	const useMinimalTURN = true
+	// (turn_min.go). DISABLED in 1.3.10 — 1.3.9 shipped with a bug
+	// that made every TURN allocation 401 even after long-term auth
+	// challenge, so all sessions fell back to retry storms and OOM'd.
+	// Keeping the code in tree for now so we can fix forward.
+	const useMinimalTURN = false
 
 	var relayConn net.PacketConn
 	if useMinimalTURN {
@@ -1115,14 +1114,12 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
     host := ""
     port := ""
     n := int(cN)
-    // Hard cap on N. Memory budget on iOS is ~100 MB; per-session
-    // cost has been driven down hard in 1.3.8/1.3.9 (bounded pipe,
-    // pooled scratches, minimal TURN client that replaces pion's
-    // per-allocation goroutine zoo). Worst case we observed at
-    // N=40 was ~86 MB rss steady-state, so N=100 should comfortably
-    // fit. iOS will SIGKILL well before this is exceeded — better
-    // than a magic clamp that silently capped the user's setting.
-    const maxN = 100
+    // Hard cap on N. With minimal TURN disabled (see useMinimalTURN
+    // in oneTurnConnection), we're back on pion which carries the
+    // per-session goroutine zoo and hits available≈0 around N=50 on
+    // a fresh tunnel. 40 keeps a healthy floor of free memory; we
+    // can raise it once the minimal-TURN auth bug is fixed.
+    const maxN = 40
     if n > maxN {
         log.Printf("StartProxy: N=%d capped to %d (iOS memory budget)", n, maxN)
         n = maxN
