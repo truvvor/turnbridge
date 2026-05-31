@@ -1113,11 +1113,21 @@ func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
 // through getaddrinfo via cgo) trips a transient sandbox-init race
 // where Go's resolver reports "unknown port" for a perfectly valid
 // numeric port. Manual parsing sidesteps the whole resolver path.
+//
+// Also strips Unicode whitespace before parsing: field log showed
+// the iOS side passing "56010 " (port followed by U+2009 THIN
+// SPACE), which strconv.Atoi rejects. Thin spaces tend to sneak in
+// via copy-paste from web UIs where the address is formatted with
+// a narrow non-breaking space for readability — strings.TrimSpace
+// drops every Unicode whitespace including U+2009.
 func parseLiteralUDPAddr(s string) (*net.UDPAddr, error) {
+	s = strings.TrimSpace(s)
 	host, portStr, err := net.SplitHostPort(s)
 	if err != nil {
 		return nil, fmt.Errorf("split host:port %q: %w", s, err)
 	}
+	host = strings.TrimSpace(host)
+	portStr = strings.TrimSpace(portStr)
 	ip := net.ParseIP(host)
 	if ip == nil {
 		return nil, fmt.Errorf("host %q is not a literal IP", host)
