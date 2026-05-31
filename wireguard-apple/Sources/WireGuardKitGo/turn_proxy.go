@@ -25,6 +25,7 @@ import (
     "net"
     "net/http"
 	neturl "net/url"
+    "strconv"
     "sync"
     "sync/atomic"
     "time"
@@ -1106,6 +1107,28 @@ func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
 	}
 }
 
+// parseLiteralUDPAddr parses "ip:port" without touching the system
+// resolver. The address comes from the iOS profile and is always a
+// literal numeric IP — going through net.ResolveUDPAddr (which dives
+// through getaddrinfo via cgo) trips a transient sandbox-init race
+// where Go's resolver reports "unknown port" for a perfectly valid
+// numeric port. Manual parsing sidesteps the whole resolver path.
+func parseLiteralUDPAddr(s string) (*net.UDPAddr, error) {
+	host, portStr, err := net.SplitHostPort(s)
+	if err != nil {
+		return nil, fmt.Errorf("split host:port %q: %w", s, err)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return nil, fmt.Errorf("host %q is not a literal IP", host)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
+		return nil, fmt.Errorf("port %q invalid", portStr)
+	}
+	return &net.UDPAddr{IP: ip, Port: port}, nil
+}
+
 //export StartProxy
 func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, cUDP C.int) {
     select { case <-proxyReady: default: }
@@ -1179,7 +1202,17 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
     // threshold.
     startMemstatsLogger(ctx)
 
-    peer, err := net.ResolveUDPAddr("udp", peerAddrStr)
+    // The address is a literal "ip:port" from the iOS profile —
+    // never a hostname. Going through net.ResolveUDPAddr means
+    // routing through getaddrinfo via cgo, which on iOS NE
+    // extensions can transiently fail in the first hundred-or-so
+    // milliseconds of startup because the sandbox networking
+    // subsystem isn't fully wired yet. The failure looks like
+    // "lookup udp/<port>: unknown port" — Go's resolver got a weird
+    // answer from getservbyname() for the port string, even though
+    // the port is numeric and shouldn't need a service lookup at all.
+    // Parsing host+port ourselves bypasses the resolver entirely.
+    peer, err := parseLiteralUDPAddr(peerAddrStr)
     if err != nil {
         log.Printf("Resolve UDP error: %v", err)
         return
