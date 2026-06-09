@@ -150,18 +150,25 @@ private struct CaptchaWKWebView: UIViewRepresentable {
             injectionTime: .atDocumentStart,
             forMainFrameOnly: false
         ))
-        // Fingerprint hardening: canvas + audio readback noise so a
-        // fingerprinter computing hashes over getImageData / toDataURL /
-        // AnalyserNode frequencies sees a different bucket each session.
-        // Drawing surfaces are NOT touched, so the visible captcha image
-        // renders cleanly — only readback paths used by fingerprinters
-        // get perturbed. See definition for the threat model and the
-        // rationale on why this lives separately from safariUAOverride.
-        userContent.addUserScript(WKUserScript(
-            source: Self.fingerprintHardening,
-            injectionTime: .atDocumentStart,
-            forMainFrameOnly: false
-        ))
+        // Canvas/audio readback noise — OFF by default, opt-in only.
+        // This is an anti-*tracking* technique (Brave/Tor) and is the
+        // wrong tool against an anti-*bot* captcha: a CAPTCHA classifier
+        // expects a CONSISTENT Safari fingerprint, so per-session /
+        // per-call randomisation is itself a bot tell — real Safari is
+        // deterministic, and two readbacks that differ within a session
+        // never happen on a real device. It also risks perturbing the
+        // slider's own canvas readback. Kept available for experiments
+        // behind the app-group flag "captchaFingerprintNoise"; enable
+        // only to A/B it against a measured baseline.
+        if UserDefaults(suiteName: "group.com.truvvor.turnbridge")?
+            .bool(forKey: "captchaFingerprintNoise") == true {
+            SharedLogger.info("CaptchaWebView: canvas/audio fingerprint noise ENABLED (experimental)", source: .app)
+            userContent.addUserScript(WKUserScript(
+                source: Self.fingerprintHardening,
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: false
+            ))
+        }
         if let url = retryUrl, let body = retryBody, !url.isEmpty {
             let urlJSON = Self.jsString(url)
             let bodyJSON = Self.jsString(body)
@@ -793,48 +800,66 @@ private struct CaptchaWKWebView: UIViewRepresentable {
         // path the interactive solve would have used.
         function scanForPreSolvedToken() {
             if (solved) return null;
-            // Path 1: window.init.{success_token,*.success_token} —
-            // captchaNotRobot bootstraps its UI from window.init, and
-            // pre-verified pages put success_token directly into that
-            // initial object (sometimes nested under a single sub-key).
+            // One-shot diagnostic. We do NOT actually know VK embeds a
+            // usable success_token in the pre-verified page — the field
+            // report was "checkbox already green, can't re-solve, only
+            // Cancel", which is consistent with NO harvestable token.
+            // Log window.init's shape once so a device run tells us
+            // whether harvesting is even possible; if these never fire,
+            // the per-IP cooldown (Go side) is what actually unblocks
+            // the user by deferring to remote.
+            try {
+                if (!window.__preSolvedDiag) {
+                    window.__preSolvedDiag = 1;
+                    const init = window.init;
+                    const shape = (init && typeof init === 'object')
+                        ? ('window.init keys=[' + Object.keys(init).join(',') + ']')
+                        : ('window.init=' + (typeof init));
+                    send({type: 'status', text: 'pre-solved diag: ' + shape});
+                }
+            } catch (e) {}
+            // Path 1: window.init.{success_token,*.success_token}.
             try {
                 const init = window.init;
                 if (init && typeof init === 'object') {
-                    if (init.success_token) return init.success_token;
+                    if (init.success_token) {
+                        send({type: 'status', text: 'pre-solved: token via window.init.success_token'});
+                        return init.success_token;
+                    }
                     const keys = Object.keys(init);
                     for (let i = 0; i < keys.length; i++) {
                         const v = init[keys[i]];
                         if (v && typeof v === 'object' && v.success_token) {
+                            send({type: 'status', text: 'pre-solved: token via window.init.' + keys[i] + '.success_token'});
                             return v.success_token;
                         }
                     }
                 }
             } catch (e) {}
-            // Path 2: hidden form input — older flows reflect the
-            // token into a <input name="success_token" type="hidden">.
+            // Path 2: hidden form input.
             try {
                 const el = document.querySelector('input[name="success_token"]');
-                if (el && el.value) return el.value;
+                if (el && el.value) {
+                    send({type: 'status', text: 'pre-solved: token via hidden input'});
+                    return el.value;
+                }
             } catch (e) {}
-            // Path 3: data-* attribute — some VK variants stamp it
-            // onto the captcha root for the client JS to read.
+            // Path 3: data-* attribute.
             try {
                 const root = document.querySelector('[data-success-token]');
                 if (root) {
                     const v = root.getAttribute('data-success-token');
-                    if (v) return v;
+                    if (v) {
+                        send({type: 'status', text: 'pre-solved: token via data-success-token'});
+                        return v;
+                    }
                 }
             } catch (e) {}
-            // Path 4: regex scan of body text — last-resort catch-all
-            // for JSON blobs server-rendered inline. Bounded by length
-            // so we don't churn the regex engine on 100 KB of HTML.
-            try {
-                const txt = document.body && document.body.innerText || '';
-                if (txt && txt.length < 30000) {
-                    const t = maybeTokenFromText(txt);
-                    if (t) return t;
-                }
-            } catch (e) {}
+            // NOTE: a regex scan of document body text was removed — it
+            // readily matched a STALE token left in the DOM from a prior
+            // solve, feeding an expired token into redemption (burns the
+            // attempt, can trip ERROR_LIMIT). Only structured, current
+            // locations above are trusted.
             return null;
         }
         // Poll for the pre-solved state every 400 ms. Cheap (the
