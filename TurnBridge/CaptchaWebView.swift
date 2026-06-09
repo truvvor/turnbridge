@@ -506,6 +506,31 @@ private struct CaptchaWKWebView: UIViewRepresentable {
             return m ? m[1] : null;
         }
 
+        // Diagnostic: surface VK's verdict on every captchaNotRobot.*
+        // response, even when there's no success_token. status:BOT here
+        // means the solve was rejected IN the WebView (fingerprint /
+        // dirty IP) — a different failure from "token captured but
+        // redemption fell back". Without this the sheet just hangs to
+        // the watchdog and the device log says nothing. Deduped so the
+        // 250 ms pollers don't spam identical lines.
+        let verdictLogged = {};
+        function logVerdict(url, text) {
+            try {
+                if (!url || String(url).indexOf('captchaNotRobot') === -1) return;
+                const after = String(url).split('captchaNotRobot.')[1] || '';
+                const tag = after.split('?')[0].split('&')[0].split('/')[0];
+                let json = null; try { json = JSON.parse(text); } catch (e) {}
+                const r = (json && (json.response || json)) || {};
+                let status = r.status || '';
+                if (!status && json && json.error) status = 'error:' + (json.error.error_code || '?');
+                const showType = r.show_captcha_type || r.show_type || '';
+                const key = tag + '|' + status + '|' + showType;
+                if (verdictLogged[key]) return;
+                verdictLogged[key] = true;
+                send({type: 'status', text: 'verdict ' + tag + ': status=' + (status || '?') + (showType ? (' show_type=' + showType) : '')});
+            } catch (e) {}
+        }
+
         // fetch hook
         const origFetch = window.fetch;
         if (origFetch) {
@@ -516,6 +541,7 @@ private struct CaptchaWKWebView: UIViewRepresentable {
                     p.then(function(res) {
                         try {
                             res.clone().text().then(function(text) {
+                                logVerdict(url, text);
                                 const t = maybeTokenFromText(text);
                                 if (t) handleSuccessToken(t);
                             });
@@ -550,6 +576,7 @@ private struct CaptchaWKWebView: UIViewRepresentable {
                     try {
                         if (xhr.__cap_url &&
                             String(xhr.__cap_url).indexOf('captchaNotRobot') !== -1) {
+                            logVerdict(xhr.__cap_url, xhr.responseText);
                             const t = maybeTokenFromText(xhr.responseText);
                             if (t) handleSuccessToken(t);
                         }
@@ -561,6 +588,7 @@ private struct CaptchaWKWebView: UIViewRepresentable {
             xhr.onreadystatechange = function() {
                 if (xhr.readyState === 4 && xhr.__cap_url &&
                     String(xhr.__cap_url).indexOf('captchaNotRobot') !== -1) {
+                    logVerdict(xhr.__cap_url, xhr.responseText);
                     const t = maybeTokenFromText(xhr.responseText);
                     if (t) handleSuccessToken(t);
                 }
