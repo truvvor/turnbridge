@@ -68,10 +68,24 @@ const manualCaptchaQuotaPerSession = 3
 
 var manualCaptchaInvocations atomic.Int64
 
+// manualCaptchaLastSolveUnix records when the last manual solve
+// SUCCEEDED. VK rate-limits NotRobot success per source IP: once one
+// solve lands on a given IP, the widget short-circuits to an
+// already-checked box for ~a minute and refuses to mint a second
+// success_token — so a second sheet on the same IP is unsolvable, the
+// user can only Cancel (observed in the field). Within the cooldown we
+// therefore don't show another sheet: defer to the remote captcha
+// service (its own IPs) if configured, else fail fast so the caller
+// reuses an identity instead of trapping the user. Reset per StartProxy.
+var manualCaptchaLastSolveUnix atomic.Int64
+
+const manualCaptchaPerIPCooldown = 60 * time.Second
+
 // resetManualCaptchaQuota is called from StartProxy at the top so
 // each fresh session starts the user out at full quota again.
 func resetManualCaptchaQuota() {
 	manualCaptchaInvocations.Store(0)
+	manualCaptchaLastSolveUnix.Store(0)
 }
 
 func manualCaptchaQuotaRemaining() int64 {
@@ -295,6 +309,25 @@ func requestManualCaptcha(redirectURI, retryURL, retryBody string, timeout time.
 		return "", "", errDeferToRemote
 	}
 
+	// Per-IP cooldown. If a manual solve already succeeded in the last
+	// minute, VK won't issue a second success_token on this IP — the
+	// next sheet would render an already-checked box the user can't
+	// re-solve. Catches the race where a queued prompt is dequeued in
+	// the ~1 s before captchaSessionsReady ticks up and shouldDeferTo-
+	// RemoteNow would have caught it. Defer to remote if available;
+	// otherwise fail fast so the caller reuses an identity.
+	if last := manualCaptchaLastSolveUnix.Load(); last > 0 {
+		if elapsed := time.Since(time.Unix(last, 0)); elapsed < manualCaptchaPerIPCooldown {
+			log.Printf("[Captcha] per-IP cooldown after manual solve (%s/%s) — suppressing second sheet",
+				elapsed.Round(time.Second), manualCaptchaPerIPCooldown)
+			if remoteCaptchaEnabled() {
+				return "", "", errDeferToRemote
+			}
+			return "", "", fmt.Errorf("manual captcha per-IP cooldown (%s remaining), no remote configured",
+				(manualCaptchaPerIPCooldown - elapsed).Round(time.Second))
+		}
+	}
+
 	// Reserve a slot in the per-session quota AFTER acquiring the
 	// serialise lock. Without that ordering, all 60 goroutines
 	// could race past the quota gate at once (Add(1) returns a
@@ -348,11 +381,13 @@ func requestManualCaptcha(redirectURI, retryURL, retryBody string, timeout time.
 		if resp == "" {
 			return "", "", fmt.Errorf("manual captcha returned empty response")
 		}
+		manualCaptchaLastSolveUnix.Store(time.Now().Unix())
 		return "", resp, nil
 	case t := <-slot.tokenCh:
 		if t == "" {
 			return "", "", fmt.Errorf("manual captcha returned empty token")
 		}
+		manualCaptchaLastSolveUnix.Store(time.Now().Unix())
 		return t, "", nil
 	case e := <-slot.errCh:
 		return "", "", e
