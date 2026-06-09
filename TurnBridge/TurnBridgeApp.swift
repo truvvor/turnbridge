@@ -33,7 +33,7 @@ struct TurnBridge: App {
         var id: String { request.requestId }
     }
     
-    func turnOnTunnel(vkLink: String, peerAddr: String, listenAddr: String, nValue: Int, useUDP: Bool, streamAggregation: Bool, wgQuickConfig: String, completionHandler: @escaping (Bool) -> Void) {
+    func turnOnTunnel(vkLink: String, peerAddr: String, listenAddr: String, nValue: Int, useUDP: Bool, streamAggregation: Bool, wrapKey: String, wgQuickConfig: String, completionHandler: @escaping (Bool) -> Void) {
         // Strip whitespace (including Unicode thin space U+2009 that
         // sneaks in from web copy-paste). Field log 1.3.14 showed the
         // proxy aborting at startup with `port "56010 " invalid`
@@ -68,7 +68,8 @@ struct TurnBridge: App {
                 "listenAddr": listenAddr,
                 "nValue": nValue,
                 "useUDP": useUDP,
-                "streamAggregation": streamAggregation
+                "streamAggregation": streamAggregation,
+                "wrapKey": wrapKey
             ]
 
             let defaults = UserDefaults.standard

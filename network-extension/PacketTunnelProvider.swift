@@ -104,8 +104,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let useUDP = (providerConfiguration["useUDP"] as? Bool) ?? true
         let udpFlag: Int32 = useUDP ? 1 : 0
         let streamAggregation = (providerConfiguration["streamAggregation"] as? Bool) ?? false
+        let wrapKey = (providerConfiguration["wrapKey"] as? String) ?? ""
 
-        SharedLogger.info("Peer: \(peerAddr), Listen: \(listenAddr), N: \(nValue), UDP: \(useUDP), streamAgg: \(streamAggregation)", source: .tunnel)
+        SharedLogger.info("Peer: \(peerAddr), Listen: \(listenAddr), N: \(nValue), UDP: \(useUDP), streamAgg: \(streamAggregation), wrap: \(wrapKey.isEmpty ? "off" : "on")", source: .tunnel)
         SharedLogger.info("Starting TURN proxy...", source: .tunnel)
 
         ProxySetLogger(nil, goProxyCLoggerCallback)
@@ -116,6 +117,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // DTLS session completes its handshake, so setting it later
         // would race the per-session goroutines.
         TurnBridgeSetStreamAggregation(streamAggregation ? 1 : 0)
+
+        // SRTP/Opus wrap key. Empty string disables wrap and falls
+        // back to the legacy direct DTLS-over-TURN path. Set BEFORE
+        // StartProxy — currentWrapKey() is sampled once per session
+        // start in oneTurnConnection.
+        wrapKey.withCString { TurnBridgeSetWrapKey($0) }
 
         // Captcha trap: every slider captcha buffers its raw VK
         // response + decoded image in memory and only flushes to disk

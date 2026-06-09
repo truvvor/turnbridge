@@ -791,6 +791,24 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 			log.Printf("Failed to set upstream deadline: %s", err)
 		}
 	})
+	// SRTP/Opus mimicry layer (see wrap.go). Built per session
+	// because each wrapConn has its own random SSRC/sessionID/counter
+	// init — if all sessions shared a wrapConn, the SSRC + monotonic
+	// seq would tag every TURN allocation as "the same call leg",
+	// which is a coarser fingerprint than what real VK call traffic
+	// looks like. nil wrap = bypass and use the legacy direct
+	// conn2↔relayConn path; the key takes effect on the NEXT
+	// allocation after the user changes it, not on already-live
+	// ones (mid-stream AEAD key rotation isn't worth the complexity).
+	var wrap *wrapConn
+	if key := currentWrapKey(); key != nil {
+		if w, werr := newWrapConn(key, false); werr != nil {
+			log.Printf("wrap: session disabled — newWrapConn: %v", werr)
+		} else {
+			wrap = w
+		}
+	}
+
 	var addr atomic.Value
 	// Start read-loop on conn2 (output of DTLS)
 	go func() {
@@ -798,6 +816,14 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 		defer turncancel()
 		buf := borrowReadBuf()
 		defer returnReadBuf(buf)
+		// wireBuf carries the wrapped (SRTP-shaped) bytes when wrap
+		// is on. +wrapOverhead headroom over the DTLS payload max.
+		// Allocated once per goroutine — borrowing from readBufPool
+		// won't help because the pool's slices are exactly 1600.
+		var wireBuf []byte
+		if wrap != nil {
+			wireBuf = make([]byte, len(buf)+wrapOverhead)
+		}
 		for {
 			select {
 			case <-turnctx.Done():
@@ -812,7 +838,17 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 
 			addr.Store(addr1) // store peer
 
-			_, err1 = relayConn.WriteTo(buf[:n], peer)
+			out := buf[:n]
+			if wrap != nil {
+				wn, werr := wrap.wrapInto(wireBuf, buf[:n])
+				if werr != nil {
+					log.Printf("wrap: wrapInto failed: %v", werr)
+					return
+				}
+				out = wireBuf[:wn]
+			}
+
+			_, err1 = relayConn.WriteTo(out, peer)
 			if err1 != nil {
 				log.Printf("Failed: %s", err1)
 				return
@@ -827,6 +863,12 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 		defer turncancel()
 		buf := borrowReadBuf()
 		defer returnReadBuf(buf)
+		// plainBuf carries the unwrapped DTLS bytes when wrap is on.
+		// Unwrapped is always smaller than wrapped, so 1600 is plenty.
+		var plainBuf []byte
+		if wrap != nil {
+			plainBuf = make([]byte, len(buf))
+		}
 		for {
 			select {
 			case <-turnctx.Done():
@@ -844,7 +886,23 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 				return
 			}
 
-			_, err1 = conn2.WriteTo(buf[:n], addr1)
+			out := buf[:n]
+			if wrap != nil {
+				un, werr := wrap.unwrapPacket(buf[:n], plainBuf)
+				if werr != nil {
+					// AEAD failure here means the peer end didn't
+					// wrap (server-side wrap not configured / wrong
+					// key) — drop the packet rather than tear down
+					// the whole session, since a stray non-wrapped
+					// packet on a wrap-enabled session is a real
+					// possibility right at session bring-up.
+					log.Printf("wrap: unwrap dropped: %v", werr)
+					continue
+				}
+				out = plainBuf[:un]
+			}
+
+			_, err1 = conn2.WriteTo(out, addr1)
 			if err1 != nil {
 				log.Printf("Failed: %s", err1)
 				return

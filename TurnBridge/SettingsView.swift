@@ -75,6 +75,24 @@ struct SettingsView: View {
                     .foregroundColor(.secondary)
             }
 
+            Section(header: Text("SRTP Wrap (DPI bypass)"),
+                    footer: Text("Disguises DTLS-over-TURN as SRTP/Opus voice so VK's relay can't fingerprint the traffic. Requires the matching key on the server side (vk-turn-proxy with -wrap -wrap-key=<hex>). Leave empty to disable.")) {
+                TextField("Wrap key (64 hex chars)", text: binding(\.wrapKey))
+                    .font(.system(.footnote, design: .monospaced))
+                    .autocapitalization(.none)
+                    .disableAutocorrection(true)
+                Button("Generate new key") {
+                    if let hex = TurnBridgeGenerateWrapKey() {
+                        let newKey = String(cString: hex)
+                        free(UnsafeMutablePointer(mutating: hex))
+                        if let idx = store.profiles.firstIndex(where: { $0.id == profile.id }) {
+                            store.profiles[idx].wrapKey = newKey
+                        }
+                    }
+                }
+                .font(.footnote)
+            }
+
             Section(header: Text("WireGuard Config")) {
                 TextEditor(text: binding(\.wgQuickConfig))
                     .font(.system(.footnote, design: .monospaced))

@@ -61,4 +61,17 @@ extern int TurnBridgeIsCaptchaTunnelSaturated(void);
 extern int TurnBridgeGetSessionsReady(void);
 extern int TurnBridgeGetSessionsTarget(void);
 
+/* SRTP/Opus mimicry layer (see wrap.go). Empty / NULL key disables the
+ * wrap and falls back to the legacy direct DTLS-over-TURN path. Set
+ * BEFORE StartProxy — already-live sessions don't pick up key changes.
+ * The matching server must be running vk-turn-proxy with the same key
+ * configured (-wrap -wrap-key=<hex>); without that, AEAD will fail on
+ * every packet and no traffic flows. */
+extern void TurnBridgeSetWrapKey(const char *hexKey);
+
+/* Returns a fresh 64-char hex string suitable for use as a wrap key.
+ * Caller must free() the returned pointer. Useful for one-shot
+ * "generate key" buttons in the iOS Settings UI. */
+extern char *TurnBridgeGenerateWrapKey(void);
+
 #endif

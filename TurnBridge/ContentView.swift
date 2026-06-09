@@ -346,6 +346,7 @@ struct ContentView: View {
                 nValue: profile.nValue,
                 useUDP: profile.useUDP,
                 streamAggregation: profile.streamAggregation,
+                wrapKey: profile.wrapKey,
                 wgQuickConfig: profile.wgQuickConfig
             ) { isSuccess in
                 if !isSuccess {
