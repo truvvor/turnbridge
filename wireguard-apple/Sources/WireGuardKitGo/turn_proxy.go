@@ -383,7 +383,31 @@ func dtlsFunc(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr) (net.
     return dtlsConn, nil
 }
 
-func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}, c1 chan<- error, streamID int) {
+// dtlsBootstrap couples the inbound side of a session's bounded pipe
+// (conn2 — what oneTurnConnection reads/writes against the relay) to
+// a one-shot "TURN is ready" signal. oneDtlsConnection blocks on the
+// signal before calling dtls.HandshakeContext, so the 30-second
+// handshake budget starts AFTER TURN allocation completes — not at
+// session spawn. Without this, sessions whose getCreds queues behind
+// a manual captcha (>30 s typical) would exhaust the DTLS deadline
+// during their wait and die with "context deadline exceeded" while
+// the relay never got a single ClientHello.
+//
+// signalReady is idempotent (sync.Once). oneTurnConnection's outer
+// loop can re-invoke with the same bootstrap struct on relay
+// reconnect; closing the channel only happens for the first
+// successful Allocate.
+type dtlsBootstrap struct {
+	conn2     net.PacketConn
+	turnReady chan struct{}
+	once      *sync.Once
+}
+
+func (b dtlsBootstrap) signalReady() {
+	b.once.Do(func() { close(b.turnReady) })
+}
+
+func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.PacketConn, connchan chan<- dtlsBootstrap, okchan chan<- struct{}, c1 chan<- error, streamID int) {
     var err error = nil
     defer func() { c1 <- err }()
     sessionStart := time.Now()
@@ -415,15 +439,37 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
     // Closing conn1 tears down both ends — pipePair shares one
     // closed-channel that both pipeConns select on.
     defer conn1.Close()
+    bootstrap := dtlsBootstrap{
+        conn2:     conn2,
+        turnReady: make(chan struct{}),
+        once:      &sync.Once{},
+    }
     go func() {
         for {
             select {
             case <-dtlsctx.Done():
                 return
-            case connchan <- conn2:
+            case connchan <- bootstrap:
             }
         }
     }()
+    // Wait for oneTurnConnection to allocate the relay AND wire up
+    // its read loops before starting the DTLS handshake clock. The
+    // 30 s budget inside dtlsFunc was being burned waiting for
+    // getCreds to clear the manual-captcha queue; once we let pion
+    // start handshake only when TURN is actually proxying, the
+    // budget covers the genuine pion ↔ peer RTT instead of internal
+    // pipeline latency. Field log 1.3.29 showed all but 2 of 60
+    // sessions dying at exactly T+30s because TURN setup ran past
+    // the handshake deadline.
+    select {
+    case <-bootstrap.turnReady:
+    case <-dtlsctx.Done():
+        return
+    case <-time.After(turnReadyWaitBudget):
+        err = fmt.Errorf("turn-ready timeout after %s", turnReadyWaitBudget)
+        return
+    }
     dtlsConn, err1 := dtlsFunc(dtlsctx, conn1, peer)
     if err1 != nil {
         err = fmt.Errorf("failed to connect DTLS: %s", err1)
@@ -676,7 +722,8 @@ func (p *turnParams) nextLink() string {
 	return p.links[int(idx)%len(p.links)]
 }
 
-func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UDPAddr, conn2 net.PacketConn, c chan<- error) {
+func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UDPAddr, bootstrap dtlsBootstrap, c chan<- error) {
+	conn2 := bootstrap.conn2
 	var err error = nil
 	defer func() { c <- err }()
 	sessionStart := time.Now()
@@ -966,6 +1013,16 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 		}
 	}()
 
+	// Both read loops are now live: conn2 → relay (DTLS-encrypted
+	// WG packets going out) and relay → conn2 (DTLS-encrypted
+	// replies coming back). Safe to unblock the paired
+	// oneDtlsConnection: its DTLS ClientHello will flow straight
+	// through to the peer instead of sitting in the bounded pipe
+	// buffer until the loops drain it. The 30 s handshake budget
+	// inside dtlsFunc starts from this point — see dtlsBootstrap.
+	// Idempotent on oneTurnConnection reconnect.
+	bootstrap.signalReady()
+
 	// Byte counters are folded into the per-session lifetime log on
 	// exit; the periodic 10s dump that proved data was flowing
 	// during the throughput investigation is no longer interesting.
@@ -1002,7 +1059,7 @@ func reconnectBackoff(prev time.Duration, success bool) time.Duration {
 	return prev + jitter
 }
 
-func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConnChan <-chan net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}, streamID int) {
+func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConnChan <-chan net.PacketConn, connchan chan<- dtlsBootstrap, okchan chan<- struct{}, streamID int) {
 	var backoff time.Duration
 	for {
 		select {
@@ -1028,17 +1085,17 @@ func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConnCha
 	}
 }
 
-func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *net.UDPAddr, connchan <-chan net.PacketConn, t <-chan time.Time) {
+func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *net.UDPAddr, connchan <-chan dtlsBootstrap, t <-chan time.Time) {
 	var backoff time.Duration
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case conn2 := <-connchan:
+		case bootstrap := <-connchan:
 			select {
 			case <-t:
 				c := make(chan error)
-				go oneTurnConnection(ctx, turnParams, peer, conn2, c)
+				go oneTurnConnection(ctx, turnParams, peer, bootstrap, c)
 				err := <-c
 				if err != nil {
 					log.Printf("%s", err)
@@ -1072,6 +1129,16 @@ type turnCred struct {
 // margin under VK's actual rotation window while still letting the
 // burst-recycle path (fresh creds added in the last ~5 s) work.
 const credMaxAge = 45 * time.Second
+
+// turnReadyWaitBudget bounds how long oneDtlsConnection will wait for
+// its paired oneTurnConnection to allocate the relay. The dominant
+// term is the manual-captcha queue: with quota=3 sequential sheets
+// at ~30 s each, plus a buffer for the remote-handover retry path,
+// 5 min is enough headroom for the slowest realistic startup at
+// N=60 without holding sessions hostage on a server that simply
+// isn't responding. Past this budget, the session bails and the
+// reconnect-loop picks a fresh start.
+const turnReadyWaitBudget = 300 * time.Second
 
 // Max concurrent captcha solves against VK. Fully-parallel solves at
 // N=30 trigger VK's anti-bot rate-limit (`ERROR_LIMIT` on
@@ -1489,7 +1556,7 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
 	sessionReady := make(chan int, n)
 	spawnSession := func(i int) {
 		fanoutChan := makeFanoutChan(fanouts[i])
-		cChan := make(chan net.PacketConn)
+		cChan := make(chan dtlsBootstrap)
 		sessionOk := make(chan struct{})
 
 		wg1.Go(func() {
