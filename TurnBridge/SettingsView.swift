@@ -93,9 +93,11 @@ struct SettingsView: View {
                     let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
                     guard status == errSecSuccess else { return }
                     let newKey = bytes.map { String(format: "%02x", $0) }.joined()
-                    if let idx = store.profiles.firstIndex(where: { $0.id == profile.id }) {
-                        store.profiles[idx].wrapKey = newKey
-                    }
+                    // Route through the same draft pipeline the
+                    // TextField uses; writing directly to
+                    // store.profiles[idx] gets shadowed by the still-
+                    // empty draft value until .onDisappear.
+                    binding(\.wrapKey).wrappedValue = newKey
                 }
                 .font(.footnote)
             }
