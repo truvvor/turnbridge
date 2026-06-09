@@ -149,6 +149,19 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             return (defaults?.bool(forKey: "manualCaptcha") ?? false) ? 1 : 0
         }()
         TurnBridgeSetManualCaptchaMode(Int32(captchaModeRaw))
+        // Per-session quota on user-facing prompts. Read from the same
+        // App Group key written by ManualCaptchaSetting.quota; default 1
+        // means the user solves the bootstrap captcha and everything
+        // else routes to remote captcha-service. Range clamped to 0…10
+        // on the Go side too as belt-and-braces against a stale write.
+        let captchaQuota: Int32 = {
+            if let raw = defaults?.object(forKey: "manualCaptchaQuota") as? Int {
+                return Int32(max(0, min(10, raw)))
+            }
+            return 1
+        }()
+        TurnBridgeSetManualCaptchaQuota(captchaQuota)
+        SharedLogger.info("Manual captcha quota per session: \(captchaQuota)", source: .tunnel)
         let captchaModeLabel: String
         switch captchaModeRaw {
         case 1: captchaModeLabel = "manual (forced — always browser sheet)"

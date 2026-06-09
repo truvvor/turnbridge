@@ -6,6 +6,7 @@ struct GlobalSettingsView: View {
     @AppStorage("excludeLocalNetworks") private var excludeLocalNetworks = true
 
     @State private var captchaMode: CaptchaMode = ManualCaptchaSetting.mode
+    @State private var captchaQuota: Int = ManualCaptchaSetting.quota
     @State private var remoteCaptchaURL: String = RemoteCaptchaSetting.url
     @State private var remoteCaptchaAPIKey: String = RemoteCaptchaSetting.apiKey
 
@@ -27,6 +28,23 @@ struct GlobalSettingsView: View {
                         title: { Text("Captured Captchas") },
                         icon: { Image(systemName: "tray.full").foregroundColor(.secondary) }
                     )
+                }
+            }
+
+            Section(header: Text("Captcha quota"),
+                    footer: Text(captchaQuotaFooter)) {
+                Stepper(value: $captchaQuota,
+                        in: ManualCaptchaSetting.quotaRange,
+                        step: 1) {
+                    HStack {
+                        Text("Solve on device")
+                        Spacer()
+                        Text("\(captchaQuota)")
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .onChange(of: captchaQuota) { newValue in
+                    ManualCaptchaSetting.quota = newValue
                 }
             }
 
@@ -100,6 +118,17 @@ struct GlobalSettingsView: View {
         }
         .navigationTitle("Settings")
         .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private var captchaQuotaFooter: String {
+        switch captchaQuota {
+        case 0:
+            return "Never solve on this device. Every captcha goes straight to the remote captcha-service. Requires a working remote URL + key above; without it, sessions fall back to recycled identities."
+        case 1:
+            return "Solve only the first captcha on this device (needed to bring up the first WG session); every subsequent challenge offloads to the remote captcha-service. Recommended — VK rate-limits success_token per source IP for ~1 minute after each solve."
+        default:
+            return "Solve up to \(captchaQuota) captchas on this device before offloading to the remote captcha-service. Higher values let more bootstrap identities use your mobile IP but expose you to back-to-back prompts on the same IP."
+        }
     }
 
     private var captchaModeFooter: String {
