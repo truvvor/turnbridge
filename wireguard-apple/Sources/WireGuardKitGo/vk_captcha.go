@@ -7,6 +7,7 @@ import (
     "encoding/base64"
     "encoding/hex"
     "encoding/json"
+    "errors"
     "fmt"
     "io"
     "log"
@@ -122,6 +123,32 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, retryURL, r
     if manualCaptchaForcedMode() {
         log.Printf("[Captcha] Manual mode enabled — handing the challenge to the UI")
         return requestManualCaptcha(captchaErr.RedirectUri, retryURL, retryBody, 180*time.Second)
+    }
+
+    // Bootstrap-manual-first. Under hard network blocking there is no
+    // tunnel and no reachable captcha-service until the very first
+    // session is up, so the first few identities MUST be earned by
+    // hand. Running the tls-client auto-solver first in that window is
+    // actively harmful: it reliably draws status:BOT, and that BOT
+    // verdict poisons the captcha session / source IP that the user is
+    // about to solve in a real WebKit engine moments later. So while no
+    // session is ready (and the user opted into prompts at all), skip
+    // the auto chain and go straight to the manual sheet. Gated on
+    // mode != off so pure-auto users never see a surprise prompt, and
+    // bounded by the per-session prompt quota inside requestManualCaptcha.
+    if manualCaptchaBootstrapActive() {
+        log.Printf("[Captcha] bootstrap (sessions_ready=0) — manual-first, skipping auto solve to avoid poisoning the session")
+        tok, resp, err := requestManualCaptcha(captchaErr.RedirectUri, retryURL, retryBody, 180*time.Second)
+        if err == nil {
+            return tok, resp, nil
+        }
+        // errDeferToRemote (quota exhausted / a session came up while we
+        // queued) means "let the normal routing take over" — fall
+        // through to the auto chain rather than failing the solve.
+        if !errors.Is(err, errDeferToRemote) {
+            return "", "", err
+        }
+        log.Printf("[Captcha] bootstrap manual deferred (%v) — falling through to auto chain", err)
     }
 
     // Egress decision. The default is whatever captchaTunnelEgress
