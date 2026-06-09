@@ -1317,6 +1317,10 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
     // better. See memstats.go for what these do.
     tuneGoRuntime()
 
+    // Fresh session = fresh manual-captcha quota. See
+    // manualCaptchaQuotaPerSession.
+    resetManualCaptchaQuota()
+
     // Periodic Go runtime memstats + periodic FreeOSMemory. Pair
     // with the Swift-side os_proc_available_memory logger to
     // understand when the extension is approaching iOS's kill

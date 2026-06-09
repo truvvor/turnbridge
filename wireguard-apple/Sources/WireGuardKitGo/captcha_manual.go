@@ -26,7 +26,9 @@ import "C"
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 )
@@ -48,6 +50,36 @@ type manualCaptchaSlot struct {
 	// with the actual token before sending.
 	retryURL  string
 	retryBody string
+}
+
+// manualCaptchaQuotaPerSession bounds how many times the iOS UI may
+// be prompted within a single StartProxy session. Without this cap a
+// forced-mode user at N=60 would face up to 60 sequential captcha
+// sheets — past the first ~5 the perceived "stuck sheet" reports
+// flood in even though the pipeline is working as designed.
+//
+// Once the quota is exhausted, manualCaptchaForcedMode /
+// manualCaptchaFallbackAvailable return false for the remainder of
+// the session and the caller degrades gracefully (auto-only with
+// recycle on failure). Quota resets on the next StartProxy via the
+// counter being reset there.
+const manualCaptchaQuotaPerSession = 5
+
+var manualCaptchaInvocations atomic.Int64
+
+// resetManualCaptchaQuota is called from StartProxy at the top so
+// each fresh session starts the user out at full quota again.
+func resetManualCaptchaQuota() {
+	manualCaptchaInvocations.Store(0)
+}
+
+func manualCaptchaQuotaRemaining() int64 {
+	used := manualCaptchaInvocations.Load()
+	rem := int64(manualCaptchaQuotaPerSession) - used
+	if rem < 0 {
+		return 0
+	}
+	return rem
 }
 
 // Captcha solve mode. 0 = off (auto only, on auto-fail the caller
@@ -80,23 +112,32 @@ func TurnBridgeSetManualCaptchaMode(mode C.int) {
 
 // manualCaptchaForcedMode reports whether every captcha challenge
 // should bypass the auto solver and go straight to the UI prompt.
-// Returns false if mode is off, fallback, or no UI callback is
-// installed (without a callback there's no way to display the prompt).
+// Returns false if mode is off, fallback, no UI callback is
+// installed (without a callback there's no way to display the
+// prompt), OR the per-session quota has been exhausted (see
+// manualCaptchaQuotaPerSession — without the cap a forced-mode user
+// at N=60 would face 60 sequential sheets in a row).
 func manualCaptchaForcedMode() bool {
 	manualCaptchaMu.RLock()
 	defer manualCaptchaMu.RUnlock()
-	return manualCaptchaMode == manualCaptchaModeForced && manualCaptchaCB != nil
+	if manualCaptchaMode != manualCaptchaModeForced || manualCaptchaCB == nil {
+		return false
+	}
+	return manualCaptchaQuotaRemaining() > 0
 }
 
 // manualCaptchaFallbackAvailable reports whether the UI prompt can
 // be used as a last-resort fallback when both the auto solver and
 // the remote /cred path have given up on this captcha. Different
 // from forced mode: only consulted by solveVkCaptcha at the end of
-// the auto chain, not at the start.
+// the auto chain, not at the start. Same per-session quota applies.
 func manualCaptchaFallbackAvailable() bool {
 	manualCaptchaMu.RLock()
 	defer manualCaptchaMu.RUnlock()
-	return manualCaptchaMode == manualCaptchaModeFallback && manualCaptchaCB != nil
+	if manualCaptchaMode != manualCaptchaModeFallback || manualCaptchaCB == nil {
+		return false
+	}
+	return manualCaptchaQuotaRemaining() > 0
 }
 
 //export TurnBridgeSetManualCaptchaCallback
@@ -181,6 +222,17 @@ func requestManualCaptcha(redirectURI, retryURL, retryBody string, timeout time.
 	if redirectURI == "" {
 		return "", "", fmt.Errorf("manual captcha redirect_uri is empty")
 	}
+
+	// Reserve a slot in the per-session quota up front. The Forced /
+	// Fallback mode checks already gated us on quotaRemaining > 0,
+	// but check again under the increment in case multiple goroutines
+	// race past the check at the same time.
+	used := manualCaptchaInvocations.Add(1)
+	if used > int64(manualCaptchaQuotaPerSession) {
+		manualCaptchaInvocations.Add(-1)
+		return "", "", fmt.Errorf("manual captcha quota exhausted (%d/%d)", used-1, manualCaptchaQuotaPerSession)
+	}
+	log.Printf("[Captcha] manual prompt %d/%d this session", used, manualCaptchaQuotaPerSession)
 
 	reqID := randomHex(8)
 	slot := &manualCaptchaSlot{
