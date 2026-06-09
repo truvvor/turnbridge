@@ -53,6 +53,20 @@ struct CaptchaWebView: View {
                             dismiss()
                         }
                     },
+                    onTerminal: { reason in
+                        // VK rendered a terminal failure page ("Attempt
+                        // limit reached" etc). No way for the user to
+                        // recover from inside the sheet — cancel and
+                        // let Go bail to identity recycling.
+                        guard !didFinish else { return }
+                        didFinish = true
+                        status = "VK refused: \(reason.prefix(80))"
+                        SharedLogger.info("CaptchaWebView terminal page detected: \(reason)", source: .app)
+                        Task {
+                            await manager.cancel(reason: "vk terminal: \(reason.prefix(120))")
+                            dismiss()
+                        }
+                    },
                     onStatus: { s in status = s }
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -74,6 +88,20 @@ struct CaptchaWebView: View {
             }
             .onAppear {
                 SharedLogger.info("Captcha sheet appeared. redirect_uri=\(redirectUri)", source: .app)
+                // Watchdog: if nothing — solve, terminal, user cancel
+                // — happens in 175 s, cancel ourselves. Go's
+                // requestManualCaptcha times out at 180 s; firing 5 s
+                // earlier on our side means the UI never lingers past
+                // a backend already-gave-up state.
+                Task {
+                    try? await Task.sleep(nanoseconds: 175_000_000_000)
+                    guard !didFinish else { return }
+                    didFinish = true
+                    status = "Timed out waiting for solve"
+                    SharedLogger.warning("CaptchaWebView watchdog timeout (175 s) — auto-cancelling", source: .app)
+                    await manager.cancel(reason: "ui watchdog timeout")
+                    dismiss()
+                }
             }
         }
         .navigationViewStyle(.stack)
@@ -86,10 +114,14 @@ private struct CaptchaWKWebView: UIViewRepresentable {
     let retryBody: String?
     let onToken: (String) -> Void
     let onResponse: (String) -> Void
+    let onTerminal: (String) -> Void
     let onStatus: (String) -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onToken: onToken, onResponse: onResponse, onStatus: onStatus)
+        Coordinator(onToken: onToken,
+                    onResponse: onResponse,
+                    onTerminal: onTerminal,
+                    onStatus: onStatus)
     }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -175,11 +207,15 @@ private struct CaptchaWKWebView: UIViewRepresentable {
         let onResponse: (String) -> Void
         let onStatus: (String) -> Void
 
+        let onTerminal: (String) -> Void
+
         init(onToken: @escaping (String) -> Void,
              onResponse: @escaping (String) -> Void,
+             onTerminal: @escaping (String) -> Void,
              onStatus: @escaping (String) -> Void) {
             self.onToken = onToken
             self.onResponse = onResponse
+            self.onTerminal = onTerminal
             self.onStatus = onStatus
         }
 
@@ -210,6 +246,16 @@ private struct CaptchaWKWebView: UIViewRepresentable {
                 if let s = body["text"] as? String {
                     onStatus(s)
                 }
+            case "terminal":
+                // Server-rendered failure page ("Attempt limit
+                // reached" etc). The captcha isn't going anywhere,
+                // and the user has no way to recover from inside
+                // the sheet — close it. The Cancel path in the
+                // CaptchaManager fires the cancel IPC so Go's
+                // requestManualCaptcha unblocks immediately rather
+                // than waiting for its 180s timeout.
+                let reason = (body["reason"] as? String) ?? "terminal page"
+                onTerminal(reason)
             default:
                 break
             }
@@ -463,6 +509,34 @@ private struct CaptchaWKWebView: UIViewRepresentable {
                 } catch (e) {}
             }
         }, 250);
+
+        // Terminal-state polling. VK renders some failure pages
+        // server-side as plain HTML — no XHR for our fetch/XHR hooks
+        // to catch — so the only way to detect them is to inspect
+        // the rendered DOM text. When found, fire 'terminal' so
+        // native dismisses the sheet instead of leaving the user
+        // staring at a dead end (the most common: "Attempt limit
+        // reached", which the user has to currently kill the whole
+        // app to escape).
+        const terminalPatterns = [
+            /attempt[\\s_]?limit[\\s_]?reached/i,
+            /превышен[оа]?\\s*колич/i,
+            /попыток.*исчерпан/i,
+            /please\\s*try\\s*again\\s*later/i,
+            /повторите\\s*попытку\\s*позже/i,
+        ];
+        let terminalFired = false;
+        setInterval(function() {
+            if (solved || terminalFired || !document.body) return;
+            const txt = document.body.innerText || '';
+            for (let i = 0; i < terminalPatterns.length; i++) {
+                if (terminalPatterns[i].test(txt)) {
+                    terminalFired = true;
+                    send({type:'terminal', reason: txt.slice(0, 200)});
+                    return;
+                }
+            }
+        }, 750);
 
         send({type:'status', text:'Loaded captcha helper'});
     })();
