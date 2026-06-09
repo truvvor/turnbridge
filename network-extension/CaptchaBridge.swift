@@ -145,4 +145,22 @@ enum CaptchaBridge {
         }
         return Data("ok".utf8)
     }
+
+    /// Called from stopTunnel: the Go side is going away, so any
+    /// pending captcha prompt can never be answered. Clear the
+    /// published request and tell the app to drop its sheet --
+    /// otherwise the user keeps solving captchas into a dead session
+    /// (1.3.27 field log: tunnel died with stop reason 9 four seconds
+    /// after the first sheet appeared; the sheet stayed up for 20+
+    /// minutes while the user kept solving into the void).
+    static func teardown() {
+        if let defaults = UserDefaults(suiteName: CaptchaIPC.appGroupID) {
+            defaults.removeObject(forKey: CaptchaIPC.requestUserDefaultsKey)
+        }
+        let name = CFNotificationName(CaptchaIPC.cancelDarwinNotification as CFString)
+        CFNotificationCenterPostNotification(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            name, nil, nil, true
+        )
+    }
 }

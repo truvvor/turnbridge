@@ -34,6 +34,23 @@ final class CaptchaManager: ObservableObject {
             .deliverImmediately
         )
 
+        // Cancel notification fired from the extension when the tunnel
+        // stops: the pending prompt is unanswerable, drop it so the
+        // sheet dismisses instead of trapping the user on a dead page.
+        let cancelName = CaptchaIPC.cancelDarwinNotification as CFString
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            observer,
+            { _, observer, _, _, _ in
+                guard let observer = observer else { return }
+                let mgr = Unmanaged<CaptchaManager>.fromOpaque(observer).takeUnretainedValue()
+                Task { @MainActor in mgr.refresh() }
+            },
+            cancelName,
+            nil,
+            .deliverImmediately
+        )
+
         // Also refresh on becoming active in case the notification arrived while
         // the app was suspended.
         NotificationCenter.default.addObserver(

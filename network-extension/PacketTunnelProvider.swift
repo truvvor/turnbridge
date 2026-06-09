@@ -353,6 +353,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         sharedLogger.log("Stopping tunnel")
         SharedLogger.info("Stopping tunnel (reason: \(reason.rawValue))", source: .tunnel)
 
+        // Tear down any in-flight manual captcha prompt FIRST: after
+        // StopProxy the Go waiter is gone and the sheet can never
+        // resolve. The app observes the cancel Darwin notification and
+        // dismisses the sheet.
+        CaptchaBridge.teardown()
+
         pathMonitor?.cancel()
         pathMonitor = nil
         lastPathStatus = nil
