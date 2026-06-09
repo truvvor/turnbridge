@@ -176,13 +176,34 @@ func getCredsRemote(ctx context.Context, link string) (string, string, string, e
 		return "", "", "", errors.New("remote captcha not configured")
 	}
 
-	captchaRemoteAttempts.Add(1)
-	captchaRemoteInFlight.Add(1)
+	attemptID := captchaRemoteAttempts.Add(1)
+	inFlight := captchaRemoteInFlight.Add(1)
 	defer captchaRemoteInFlight.Add(-1)
+	started := time.Now()
+	// Field log 1.3.34 showed 3 defer-to-remote calls firing in the
+	// same second after the user's manual solve, then 50+ s of
+	// silence — no TURN allocate, no DTLS, no "deferred retry failed"
+	// log. The calls were stuck inside remoteCredsClient.Do (90 s
+	// HTTP timeout) without any indication to the operator. Log
+	// every remote call's start and end with duration + outcome so
+	// the next field log shows exactly whether the server is slow,
+	// erroring, or simply not reached. The shorter "deferred retry
+	// failed" line still fires from getCredsRouted on error; this is
+	// the per-call ground truth.
+	log.Printf("remote-captcha: call #%d START (in_flight=%d, url=%s)", attemptID, inFlight, url)
+	defer func() {
+		// elapsed captured at defer-time; success/error is inferred
+		// from the named return values, but we don't have access to
+		// those from a plain defer — instead the END log lives at
+		// each return path below, and this just covers the panic
+		// case (which shouldn't happen but is cheap insurance).
+		_ = started
+	}()
 
 	body, _ := json.Marshal(map[string]string{"link": link})
 	req, err := http.NewRequestWithContext(ctx, "POST", strings.TrimRight(url, "/")+"/cred", bytes.NewReader(body))
 	if err != nil {
+		log.Printf("remote-captcha: call #%d END error build_request elapsed=%s err=%v", attemptID, time.Since(started).Round(time.Millisecond), err)
 		return "", "", "", fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -190,6 +211,7 @@ func getCredsRemote(ctx context.Context, link string) (string, string, string, e
 
 	httpResp, err := remoteCredsClient.Do(req)
 	if err != nil {
+		log.Printf("remote-captcha: call #%d END error transport elapsed=%s err=%v", attemptID, time.Since(started).Round(time.Millisecond), err)
 		return "", "", "", fmt.Errorf("call server: %w", err)
 	}
 	defer httpResp.Body.Close()
@@ -197,6 +219,8 @@ func getCredsRemote(ctx context.Context, link string) (string, string, string, e
 	rawBody, _ := io.ReadAll(httpResp.Body)
 	var resp remoteCredResponse
 	if jsonErr := json.Unmarshal(rawBody, &resp); jsonErr != nil {
+		log.Printf("remote-captcha: call #%d END error decode elapsed=%s status=%d body_len=%d err=%v",
+			attemptID, time.Since(started).Round(time.Millisecond), httpResp.StatusCode, len(rawBody), jsonErr)
 		return "", "", "", fmt.Errorf("decode server response (status=%d): %w", httpResp.StatusCode, jsonErr)
 	}
 	if httpResp.StatusCode == http.StatusTooManyRequests {
@@ -219,6 +243,8 @@ func getCredsRemote(ctx context.Context, link string) (string, string, string, e
 		if msg == "" {
 			msg = "all peers saturated"
 		}
+		log.Printf("remote-captcha: call #%d END saturated elapsed=%s status=429 cooldown=%v msg=%q",
+			attemptID, time.Since(started).Round(time.Millisecond), cooldown, msg)
 		return "", "", "", fmt.Errorf("server: %s", msg)
 	}
 	if httpResp.StatusCode != http.StatusOK {
@@ -226,12 +252,18 @@ func getCredsRemote(ctx context.Context, link string) (string, string, string, e
 		if msg == "" {
 			msg = fmt.Sprintf("HTTP %d", httpResp.StatusCode)
 		}
+		log.Printf("remote-captcha: call #%d END http_error elapsed=%s status=%d msg=%q",
+			attemptID, time.Since(started).Round(time.Millisecond), httpResp.StatusCode, msg)
 		return "", "", "", fmt.Errorf("server: %s", msg)
 	}
 	if resp.User == "" || resp.Pass == "" || resp.Addr == "" {
+		log.Printf("remote-captcha: call #%d END incomplete elapsed=%s user=%q pass=%q addr=%q",
+			attemptID, time.Since(started).Round(time.Millisecond), resp.User, resp.Pass, resp.Addr)
 		return "", "", "", fmt.Errorf("server returned incomplete creds")
 	}
 	captchaRemoteOK.Add(1)
+	log.Printf("remote-captcha: call #%d END ok elapsed=%s addr=%s",
+		attemptID, time.Since(started).Round(time.Millisecond), resp.Addr)
 	return resp.User, resp.Pass, resp.Addr, nil
 }
 
