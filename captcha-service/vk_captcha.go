@@ -228,6 +228,16 @@ func fetchPowInput(ctx context.Context, client tlsclient.HttpClient, profile Pro
         }
     }
 
+    // Stash not_robot_captcha.js URL so the caller can fetch debug_info
+    // dynamically. See captcha_debug_info.go.
+    scriptURL := extractScriptURL(html)
+    if scriptURL != "" {
+        if htmlSettings == nil {
+            htmlSettings = map[string]interface{}{}
+        }
+        htmlSettings["_scriptURL"] = scriptURL
+    }
+
     return powInput, difficulty, htmlSettings, nil
 }
 
@@ -302,34 +312,27 @@ func callCaptchaNotRobot(ctx context.Context, client tlsclient.HttpClient, profi
     // Step 2: componentDone
     log.Printf("[Captcha] Step 2/4: componentDone")
 
-    browserFp := fmt.Sprintf("%016x%016x", mathrand.Int63(), mathrand.Int63())
+    // crypto/rand-backed 32-hex-char browser fingerprint (v2).
+    browserFp := randomHex(16)
 
-    resolutions := [][]int{{1920, 1080}, {1366, 768}, {1440, 900}, {1536, 864}, {2560, 1440}}
-    res := resolutions[mathrand.Intn(len(resolutions))]
-    screenW, screenH := res[0], res[1]
-
-    cores := []int{4, 8, 12, 16}[mathrand.Intn(4)]
-    ram := []int{4, 8, 16, 32}[mathrand.Intn(4)]
-
-    baseDownlink := 8.0 + mathrand.Float64()*4.0
-    downlinkStr := fmt.Sprintf("%.1f", baseDownlink)
-
+    // v2 device shape: fixed desktop Chrome 8-core/1080p. See iOS-side
+    // captcha-vk for full rationale.
+    const (
+        screenW = 1920
+        screenH = 1080
+    )
     deviceMap := map[string]interface{}{
         "screenWidth":             screenW,
         "screenHeight":            screenH,
         "screenAvailWidth":        screenW,
-        "screenAvailHeight":       screenH - 40,
-        "innerWidth":              screenW - mathrand.Intn(100),
-        "innerHeight":             screenH - 100 - mathrand.Intn(50),
-        "devicePixelRatio":        []float64{1, 1.25, 1.5, 2}[mathrand.Intn(4)],
+        "screenAvailHeight":       screenH,
+        "innerWidth":              screenW,
+        "innerHeight":             951,
+        "devicePixelRatio":        1,
         "language":                "en-US",
         "languages":               []string{"en-US", "en"},
         "webdriver":               false,
-        "hardwareConcurrency":     cores,
-        "deviceMemory":            ram,
-        "connectionEffectiveType": "4g",
-        "connectionRtt":           []int{50, 100, 150}[mathrand.Intn(3)],
-        "connectionDownlink":      baseDownlink,
+        "hardwareConcurrency":     8,
         "notificationsPermission": "denied",
     }
     deviceBytes, _ := json.Marshal(deviceMap)
@@ -367,11 +370,19 @@ func callCaptchaNotRobot(ctx context.Context, client tlsclient.HttpClient, profi
     }
     cursorBytes, _ := json.Marshal(cursor)
 
-    connectionDownlink := "[" + downlinkStr + "," + downlinkStr + "," + downlinkStr + "," + downlinkStr + "," + downlinkStr + "," + downlinkStr + "," + downlinkStr + "]"
-
     answer := base64.StdEncoding.EncodeToString([]byte("{}"))
-    debugInfo := "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
+    // Dynamic debug_info from not_robot_captcha.js. See iOS-side
+    // captcha_debug_info.go for the rationale; fallback to legacy
+    // constant when fetch fails.
+    scriptURL, _ := htmlSettings["_scriptURL"].(string)
+    debugInfo, debugErr := fetchDebugInfo(ctx, client, profile, scriptURL)
+    if debugErr != nil {
+        log.Printf("[Captcha] fetchDebugInfo: %v — using legacy constant", debugErr)
+        debugInfo = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+
+    // v2 wire shape: all motion arrays empty including connectionDownlink.
     checkData := baseParams + fmt.Sprintf(
         "&accelerometer=%s&gyroscope=%s&motion=%s&cursor=%s&taps=%s&connectionRtt=%s&connectionDownlink=%s"+
             "&browser_fp=%s&hash=%s&answer=%s&debug_info=%s",
@@ -381,7 +392,7 @@ func callCaptchaNotRobot(ctx context.Context, client tlsclient.HttpClient, profi
         url.QueryEscape(string(cursorBytes)),
         url.QueryEscape("[]"),
         url.QueryEscape("[]"),
-        url.QueryEscape(connectionDownlink),
+        url.QueryEscape("[]"),
         browserFp,
         hash,
         answer,
@@ -399,7 +410,8 @@ func callCaptchaNotRobot(ctx context.Context, client tlsclient.HttpClient, profi
     }
 
     status, _ := respObj["status"].(string)
-    log.Printf("[Captcha] checkbox status: %s", status)
+    showType, _ := respObj["show_captcha_type"].(string)
+    log.Printf("[Captcha] checkbox status: %s show_type=%q", status, showType)
 
     if status == "OK" {
         successToken, ok := respObj["success_token"].(string)
@@ -412,17 +424,17 @@ func callCaptchaNotRobot(ctx context.Context, client tlsclient.HttpClient, profi
     }
 
     if status == "ERROR_LIMIT" {
-        // Mark the egress that owns this request as saturated. The
-        // bootstrap fleet runs from the client IP (saturates direct);
-        // the deferred fleet runs after WG handshake completes so its
-        // HTTP routes through utun and saturates the tunnel egress.
-        // StartProxy reads these flags to stop spawning new sessions
-        // when the second pool is also dry.
         markCaptchaSaturated(isTunnel)
+        return "", fmt.Errorf("captchaNotRobot.check ERROR_LIMIT (no slider fallback under rate-limit)")
     }
 
-    // Checkbox failed — try slider captcha
-    log.Printf("[Captcha] Checkbox failed, trying slider captcha...")
+    // v2 routing: only try slider on explicit BOT status with slider show_type.
+    sliderEligible := status == "BOT" && (showType == "" || showType == "slider")
+    if !sliderEligible {
+        return "", fmt.Errorf("captchaNotRobot.check non-OK status=%q show_type=%q", status, showType)
+    }
+
+    log.Printf("[Captcha] Checkbox status=BOT show_type=%q, switching to slider", showType)
 
     // Use htmlSettings from the HTML page if available, otherwise use API settings
     mergedSettings := settingsResp
@@ -430,7 +442,7 @@ func callCaptchaNotRobot(ctx context.Context, client tlsclient.HttpClient, profi
         mergedSettings = htmlSettings
     }
 
-    sliderToken, sliderErr := solveSliderCaptcha(vkReq, baseParams, browserFp, hash, mergedSettings, isTunnel)
+    sliderToken, sliderErr := solveSliderCaptcha(vkReq, baseParams, browserFp, hash, debugInfo, mergedSettings, isTunnel)
     if sliderErr != nil {
         // saturation accounting now happens inside solveSliderCaptcha
         // at the exact branch (ERROR_LIMIT or unparseable_response),

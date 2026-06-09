@@ -57,6 +57,7 @@ func solveSliderCaptcha(
     baseParams string,
     browserFp string,
     hash string,
+    debugInfo string,
     settingsResp map[string]interface{},
     isTunnel bool,
 ) (string, error) {
@@ -169,7 +170,7 @@ func solveSliderCaptcha(
             neturl.QueryEscape(cursor),
             neturl.QueryEscape("[]"), neturl.QueryEscape("[]"), neturl.QueryEscape("[]"),
             browserFp, hash, neturl.QueryEscape(answer),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            debugInfo,
         )
 
         checkResp, err := vkReq("captchaNotRobot.check", checkData)
