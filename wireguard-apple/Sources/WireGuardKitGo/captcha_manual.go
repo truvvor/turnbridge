@@ -163,6 +163,33 @@ func manualCaptchaFallbackAvailable() bool {
 	return manualCaptchaQuotaRemaining() > 0
 }
 
+// manualCaptchaBootstrapActive reports whether we're still bringing up
+// the very first session and should solve by hand BEFORE trying the
+// auto tls-client chain. Rationale (see solveVkCaptcha): under hard
+// blocking there's no tunnel and no reachable captcha-service until the
+// first session exists, and the auto chain's status:BOT verdict poisons
+// the session/IP the user is about to solve in real WebKit. So when no
+// session is ready yet, a manual handler is registered, the user opted
+// into prompts (mode != off), and quota remains, do manual-first.
+//
+// Unlike manualCaptchaFallbackAvailable this also fires in fallback
+// mode — the whole point is to pre-empt the auto attempt during
+// bootstrap. After the first session comes up (captchaSessionsReady>0)
+// this returns false and normal mode behaviour resumes.
+func manualCaptchaBootstrapActive() bool {
+	manualCaptchaMu.RLock()
+	mode := manualCaptchaMode
+	cb := manualCaptchaCB
+	manualCaptchaMu.RUnlock()
+	if cb == nil || mode == manualCaptchaModeOff {
+		return false
+	}
+	if captchaSessionsReady.Load() > 0 {
+		return false
+	}
+	return manualCaptchaQuotaRemaining() > 0
+}
+
 //export TurnBridgeSetManualCaptchaCallback
 func TurnBridgeSetManualCaptchaCallback(cb C.manual_captcha_cb) {
 	manualCaptchaMu.Lock()

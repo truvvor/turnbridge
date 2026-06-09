@@ -196,9 +196,28 @@ private struct CaptchaWKWebView: UIViewRepresentable {
         webView.isOpaque = true
 
         if let url = url {
-            SharedLogger.info("CaptchaWebView loading URL: \(url.absoluteString)", source: .app)
-            onStatus("Loading…")
-            webView.load(URLRequest(url: url))
+            context.coordinator.captchaURL = url
+            // Cookie / state warm-up. VK's classifier reads a captcha
+            // session with zero prior vk.com cookies + localStorage as a
+            // freshly-spun-up automation environment — exactly the BOT
+            // signal we're trying to avoid on the first hand-solved
+            // sessions. So before navigating to the captcha, briefly
+            // load m.vk.com so the persistent data store picks up the
+            // organic "I've been here before" state a real Safari user
+            // would have. The real captcha load is kicked off from the
+            // warm-up's didFinish (or a 3 s hard cap, whichever first)
+            // so a blocked / slow warm-up never strands the user.
+            SharedLogger.info("CaptchaWebView warming up vk.com cookies before captcha load", source: .app)
+            onStatus("Preparing…")
+            if let warmURL = URL(string: "https://m.vk.com/") {
+                webView.load(URLRequest(url: warmURL))
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak webView] in
+                    guard let webView = webView else { return }
+                    context.coordinator.loadCaptchaIfNeeded(webView, reason: "warmup cap 3s")
+                }
+            } else {
+                context.coordinator.loadCaptchaIfNeeded(webView, reason: "no warmup url")
+            }
         } else {
             SharedLogger.error("CaptchaWebView: URL is nil — won't load", source: .app)
             onStatus("Bad captcha URL")
@@ -215,6 +234,12 @@ private struct CaptchaWKWebView: UIViewRepresentable {
 
         let onTerminal: (String) -> Void
 
+        /// The real captcha URL, loaded only AFTER the cookie warm-up
+        /// (or its 3 s cap) so VK sees an aged vk.com session rather
+        /// than a cold one. Set in makeUIView.
+        var captchaURL: URL?
+        private var captchaLoadStarted = false
+
         init(onToken: @escaping (String) -> Void,
              onResponse: @escaping (String) -> Void,
              onTerminal: @escaping (String) -> Void,
@@ -223,6 +248,17 @@ private struct CaptchaWKWebView: UIViewRepresentable {
             self.onResponse = onResponse
             self.onTerminal = onTerminal
             self.onStatus = onStatus
+        }
+
+        /// Navigate to the real captcha page exactly once. Called from
+        /// the warm-up's didFinish and from a 3 s fallback timer —
+        /// whichever fires first wins; the flag makes the loser a no-op.
+        func loadCaptchaIfNeeded(_ webView: WKWebView, reason: String) {
+            guard !captchaLoadStarted, let url = captchaURL else { return }
+            captchaLoadStarted = true
+            SharedLogger.info("CaptchaWebView loading captcha after warmup (\(reason)): \(url.absoluteString)", source: .app)
+            onStatus("Loading…")
+            webView.load(URLRequest(url: url))
         }
 
         func userContentController(_ userContentController: WKUserContentController,
@@ -250,6 +286,13 @@ private struct CaptchaWKWebView: UIViewRepresentable {
                 }
             case "status":
                 if let s = body["text"] as? String {
+                    // Mirror WebView-side status into the shared log so a
+                    // device sysdiagnose shows whether the in-session
+                    // replay actually produced a final_response or quietly
+                    // fell back to the bot-prone raw-token path (CORS/CSP
+                    // on the cross-origin api.vk.com fetch is the usual
+                    // culprit). See injectedJS handleSuccessToken.
+                    SharedLogger.debug("CaptchaWebView JS: \(s)", source: .app)
                     onStatus(s)
                 }
             case "terminal":
@@ -289,6 +332,13 @@ private struct CaptchaWKWebView: UIViewRepresentable {
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             SharedLogger.info("CaptchaWebView: page finished loading: \(webView.url?.absoluteString ?? "?")", source: .app)
+            // The first finished navigation is the cookie warm-up
+            // (m.vk.com). Now that the data store has organic vk.com
+            // state, navigate to the real captcha. Subsequent didFinish
+            // calls (the captcha page itself) are no-ops via the flag.
+            if captchaURL != nil {
+                loadCaptchaIfNeeded(webView, reason: "warmup finished")
+            }
             onStatus("Solve the VK challenge below")
         }
 
@@ -368,6 +418,12 @@ private struct CaptchaWKWebView: UIViewRepresentable {
         try {
             Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'], configurable: true });
         } catch (e) {}
+        // Touch surface: real Mobile Safari on iPhone reports
+        // maxTouchPoints = 5. WKWebView sometimes reports 0/1, which is
+        // an obvious "this isn't a phone browser" tell to a fingerprinter.
+        try {
+            Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 5, configurable: true });
+        } catch (e) {}
         // Real Safari iOS doesn't expose userAgentData (Client Hints).
         // WKWebView under some configurations does — strip it to match.
         try { delete navigator.userAgentData; } catch (e) {}
@@ -410,7 +466,7 @@ private struct CaptchaWKWebView: UIViewRepresentable {
                 return;
             }
             const body = cfg.body.replace(/__TOKEN__/g, encodeURIComponent(token));
-            send({type: 'status', text: 'Redeeming token in-session…'});
+            send({type: 'status', text: 'replay: redeeming token in-session (POST ' + cfg.url + ')'});
             fetch(cfg.url, {
                 method: 'POST',
                 credentials: 'include',
@@ -419,13 +475,21 @@ private struct CaptchaWKWebView: UIViewRepresentable {
             }).then(function(r) { return r.text(); })
               .then(function(text) {
                   if (text && text.length > 0) {
+                      send({type: 'status', text: 'replay OK: final_response (' + text.length + ' bytes) — single coherent session'});
                       send({type: 'final_response', json: text});
                   } else {
+                      // 2xx but empty body — treat as replay miss so the
+                      // log makes the silent-degrade-to-raw-token explicit.
+                      send({type: 'status', text: 'replay FALLBACK: empty response body → raw token (Go will redeem, session switch risk)'});
                       send({type: 'success_token', token: token});
                   }
               })
               .catch(function(e) {
-                  send({type: 'status', text: 'In-session retry failed: ' + e});
+                  // The common cause here is the cross-origin fetch to
+                  // api.vk.com being blocked by the captcha page's CSP
+                  // connect-src or by missing CORS — which silently
+                  // demotes us to the bot-prone Go redemption path.
+                  send({type: 'status', text: 'replay FALLBACK: fetch threw (' + e + ') → raw token (likely CORS/CSP; Go will redeem, session switch risk)'});
                   send({type: 'success_token', token: token});
               });
         }
