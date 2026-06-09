@@ -752,6 +752,77 @@ private struct CaptchaWKWebView: UIViewRepresentable {
             }
         }, 250);
 
+        // Pre-solved detection. Field report (1.3.31 build): when a
+        // forced-mode user gets a 2nd/3rd captcha at the same IP, VK
+        // renders a page already showing the green checkbox — the
+        // success_token is embedded in the initial page state but no
+        // XHR/fetch ever fires that our hooks could catch. The user
+        // is stuck staring at "solve" UI that won't accept input,
+        // their only escape is Cancel, and we lose what would have
+        // been an instant identity. This scanner walks the canonical
+        // locations VK puts the token in when the page boots already-
+        // verified, and feeds it into the same handleSuccessToken
+        // path the interactive solve would have used.
+        function scanForPreSolvedToken() {
+            if (solved) return null;
+            // Path 1: window.init.{success_token,*.success_token} —
+            // captchaNotRobot bootstraps its UI from window.init, and
+            // pre-verified pages put success_token directly into that
+            // initial object (sometimes nested under a single sub-key).
+            try {
+                const init = window.init;
+                if (init && typeof init === 'object') {
+                    if (init.success_token) return init.success_token;
+                    const keys = Object.keys(init);
+                    for (let i = 0; i < keys.length; i++) {
+                        const v = init[keys[i]];
+                        if (v && typeof v === 'object' && v.success_token) {
+                            return v.success_token;
+                        }
+                    }
+                }
+            } catch (e) {}
+            // Path 2: hidden form input — older flows reflect the
+            // token into a <input name="success_token" type="hidden">.
+            try {
+                const el = document.querySelector('input[name="success_token"]');
+                if (el && el.value) return el.value;
+            } catch (e) {}
+            // Path 3: data-* attribute — some VK variants stamp it
+            // onto the captcha root for the client JS to read.
+            try {
+                const root = document.querySelector('[data-success-token]');
+                if (root) {
+                    const v = root.getAttribute('data-success-token');
+                    if (v) return v;
+                }
+            } catch (e) {}
+            // Path 4: regex scan of body text — last-resort catch-all
+            // for JSON blobs server-rendered inline. Bounded by length
+            // so we don't churn the regex engine on 100 KB of HTML.
+            try {
+                const txt = document.body && document.body.innerText || '';
+                if (txt && txt.length < 30000) {
+                    const t = maybeTokenFromText(txt);
+                    if (t) return t;
+                }
+            } catch (e) {}
+            return null;
+        }
+        // Poll for the pre-solved state every 400 ms. Cheap (the
+        // function early-exits once `solved` is set after the first
+        // catch). Fires alongside the existing URL / terminal pollers;
+        // they're orthogonal — one catches pre-verified token state,
+        // the others catch user-interactive solves and dead-end pages.
+        setInterval(function() {
+            if (solved) return;
+            const t = scanForPreSolvedToken();
+            if (t) {
+                send({type:'status', text:'pre-solved captcha detected — extracting embedded success_token'});
+                handleSuccessToken(t);
+            }
+        }, 400);
+
         // Terminal-state polling. VK renders some failure pages
         // server-side as plain HTML — no XHR for our fetch/XHR hooks
         // to catch — so the only way to detect them is to inspect
