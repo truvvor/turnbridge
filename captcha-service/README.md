@@ -82,6 +82,82 @@ Error responses:
 | `LISTEN_ADDR` | `:8080` | bind address |
 | `API_KEY` | *(required)* | bearer token clients must send |
 | `CAPTCHA_TRAP_DIR` | `./trap` | where to write debug artefacts for failed solves (slider images, etc.) |
+| `WARP_INTERFACE` | *(unset)* | name of a pre-existing WireGuard interface (typically Cloudflare WARP) to pin VK-bound HTTP sockets to. See **WARP egress** below |
+
+## WARP egress
+
+In mid-2026 VK rolled out per-source-IP traffic-shaping on captcha
+endpoints. Hosts that solve many captchas in a short window get
+throttled or temp-blacklisted by source IP. Routing the captcha
+service's outbound HTTP through Cloudflare's WARP (free WireGuard
+tunnel) moves egress to Cloudflare's IP space, which VK has not been
+observed to throttle (so far).
+
+The captcha-service does NOT manage the WireGuard interface itself —
+key generation, registration with Cloudflare, and `wg-quick`
+lifecycle stay at the OS layer. We only consume an interface name and
+bind sockets to it via `SO_BINDTODEVICE`.
+
+### Operator setup
+
+1. **Get WARP credentials** with `wgcf` (https://github.com/ViRb3/wgcf):
+
+   ```sh
+   wgcf register
+   wgcf generate
+   mv wgcf-profile.conf /etc/wireguard/wgcf.conf
+   ```
+
+2. **Edit `/etc/wireguard/wgcf.conf`** and add `Table = off` to the
+   `[Interface]` section so wg-quick doesn't install default routes
+   (we only want VK traffic on WARP, not all egress):
+
+   ```ini
+   [Interface]
+   PrivateKey = ...
+   Address = 172.16.0.2/32, 2606:4700:110:.../128
+   Table = off                                          # <-- add this
+   MTU = 1280
+   ```
+
+3. **Bring the interface up**:
+
+   ```sh
+   sudo wg-quick up /etc/wireguard/wgcf.conf
+   ip link show wgcf                # confirm it exists
+   ```
+
+4. **Run captcha-service with `WARP_INTERFACE=wgcf`** and grant it
+   `CAP_NET_RAW` so non-root processes can call `SO_BINDTODEVICE`:
+
+   ```sh
+   docker run -d \
+     -p 8080:8080 \
+     -e API_KEY=$(openssl rand -hex 32) \
+     -e WARP_INTERFACE=wgcf \
+     --cap-add=NET_RAW \
+     --network=host \
+     turnbridge/captcha-service
+   ```
+
+   `--network=host` is required so the container shares the host's
+   network namespace and can see the `wgcf` interface.
+
+5. **Verify**:
+
+   ```sh
+   curl -s http://localhost:8080/stats | jq .warp
+   # "on:wgcf"
+   ```
+
+   Then trigger a `/cred` call and check the WARP interface counters
+   went up (`wg show wgcf transfer`).
+
+### Falling back
+
+Unset `WARP_INTERFACE` (or simply don't pass it) and outbound goes via
+the host's default route again. No code change, no restart of the
+WireGuard interface — captcha-service just doesn't pin sockets.
 
 ## Deployment (Docker)
 

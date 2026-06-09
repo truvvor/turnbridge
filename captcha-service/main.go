@@ -78,7 +78,7 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	log.Printf("captcha-service listening on %s (max concurrent solves=%d)", addr, maxConcurrentCaptchaSolves)
+	log.Printf("captcha-service listening on %s (max concurrent solves=%d, WARP=%s)", addr, maxConcurrentCaptchaSolves, warpStatus())
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatalf("ListenAndServe: %v", err)
 	}
@@ -317,6 +317,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		CredsErrors   int64      `json:"creds_errors"`
 		SaturatedNow  bool       `json:"saturated_now"`
 		UptimeSeconds int64      `json:"uptime_seconds"`
+		WARP          string     `json:"warp"`
 		Peers         []peerStat `json:"peers"`
 	}{
 		Attempts:      stats.attempts,
@@ -327,6 +328,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 		CredsErrors:   credsErrs.Load(),
 		SaturatedNow:  directSaturated(),
 		UptimeSeconds: int64(time.Since(startedAt).Seconds()),
+		WARP:          warpStatus(),
 		Peers:         peerStats,
 	}
 	stats.mu.Unlock()

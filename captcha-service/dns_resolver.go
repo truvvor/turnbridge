@@ -50,11 +50,14 @@ const (
 )
 
 // dohClient is used ONLY for the DoH lookup itself. Plain net.Dialer
-// so we don't recurse into customDial.
+// (no recursion into customDial), with the WARP control hook so DoH
+// queries to 1.1.1.1 also egress via the WARP interface when
+// WARP_INTERFACE is set. Cloudflare's 1.1.1.1 is reachable from inside
+// WARP just fine.
 var dohClient = &http.Client{
 	Timeout: 5 * time.Second,
 	Transport: &http.Transport{
-		DialContext:     (&net.Dialer{Timeout: 4 * time.Second}).DialContext,
+		DialContext:     (&net.Dialer{Timeout: 4 * time.Second, Control: warpControl}).DialContext,
 		TLSClientConfig: &tls.Config{},
 	},
 }
@@ -92,12 +95,14 @@ func customDial(ctx context.Context, network, address string) (net.Conn, error) 
 	}
 
 	// Fast path: literal IP needs no resolution.
+	// Control hook pins the socket to WARP_INTERFACE when set; no-op
+	// otherwise. See warp_dialer.go.
 	if net.ParseIP(host) != nil {
-		return (&net.Dialer{Timeout: 8 * time.Second}).DialContext(ctx, network, address)
+		return (&net.Dialer{Timeout: 8 * time.Second, Control: warpControl}).DialContext(ctx, network, address)
 	}
 
-	// Layer 1: system resolver.
-	d := &net.Dialer{Timeout: dohDialBudget}
+	// Layer 1: system resolver. WARP-pinned via Control hook.
+	d := &net.Dialer{Timeout: dohDialBudget, Control: warpControl}
 	sysCtx, cancel := context.WithTimeout(ctx, systemDialBudget)
 	conn, sysErr := d.DialContext(sysCtx, network, address)
 	cancel()

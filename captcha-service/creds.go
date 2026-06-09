@@ -26,6 +26,9 @@ type getCredsFunc func(context.Context, string) (string, string, string, error)
 
 // sharedAuthClient — package-level so the connection pool spans the
 // whole server lifetime. See F4 in the iOS-side commit history.
+// customDial already carries the WARP control hook (see dns_resolver.go),
+// so VK token-acquisition POSTs egress via WARP when WARP_INTERFACE is
+// configured.
 var sharedAuthClient = &http.Client{
 	Timeout: 20 * time.Second,
 	Transport: &http.Transport{

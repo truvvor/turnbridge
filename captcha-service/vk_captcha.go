@@ -4,7 +4,6 @@ import (
     "context"
     "crypto/rand"
     "crypto/sha256"
-    "crypto/tls"
     "encoding/base64"
     "encoding/hex"
     "encoding/json"
@@ -12,13 +11,14 @@ import (
     "io"
     "log"
     mathrand "math/rand"
-    "net/http"
-    "net/http/cookiejar"
     "net/url"
     "regexp"
     "strconv"
     "strings"
     "time"
+
+    fhttp "github.com/bogdanfinn/fhttp"
+    tlsclient "github.com/bogdanfinn/tls-client"
 )
 
 type VkCaptchaError struct {
@@ -43,34 +43,18 @@ func randomHex(n int) string {
     return hex.EncodeToString(bytes)
 }
 
-func newCaptchaClient(forceDirect bool) *http.Client {
-    jar, _ := cookiejar.New(nil)
-    dialer := customDial
-    if forceDirect {
-        // After WG comes up the extension's default route is utun, so
-        // every captcha HTTP normally goes through the tunnel egress.
-        // When the tunnel egress has hit VK's per-IP rate-limit we
-        // want to retry from the original physical egress (cellular /
-        // WiFi). cellularDial pins the socket to a non-utun interface
-        // index via IP_BOUND_IF so the kernel routes through the
-        // physical NIC instead of utun.
-        dialer = cellularDial
+// newCaptchaClient now returns a TLS-fingerprinted client (Safari iOS
+// 18) that also pins outbound sockets to the WARP WireGuard interface
+// when WARP_INTERFACE is set. See captcha_client.go and warp_dialer.go.
+// forceDirect kept in the signature for callsite compat but ignored:
+// the iOS-side meaning (bypass utun for tunnel-egress rate-limit) has
+// no analog on a Linux server.
+func newCaptchaClient(_ bool) tlsclient.HttpClient {
+    c, err := newTLSCaptchaClient()
+    if err != nil {
+        panic(fmt.Sprintf("newTLSCaptchaClient: %v", err))
     }
-    return &http.Client{
-        Timeout: 20 * time.Second,
-        Jar:     jar,
-        Transport: &http.Transport{
-            // customDial layers system DNS → DoH (1.1.1.1) → hardcoded
-            // VK IPs. Russian mobile carriers regularly return NXDOMAIN
-            // or hijacked records for api.vk.ru / id.vk.ru, which
-            // bricks the captcha solver before any other retry can
-            // engage. See dns_resolver.go.
-            DialContext: dialer,
-            TLSClientConfig: &tls.Config{
-                InsecureSkipVerify: false,
-            },
-        },
-    }
+    return c
 }
 
 func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
@@ -182,28 +166,23 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError) (string, er
     return successToken, nil
 }
 
-func fetchPowInput(ctx context.Context, client *http.Client, profile Profile, redirectUri string) (string, int, map[string]interface{}, error) {
-    req, err := http.NewRequestWithContext(ctx, "GET", redirectUri, nil)
+func fetchPowInput(ctx context.Context, client tlsclient.HttpClient, profile Profile, redirectUri string) (string, int, map[string]interface{}, error) {
+    req, err := fhttp.NewRequest("GET", redirectUri, nil)
     if err != nil {
         return "", 0, nil, err
     }
+    req = withCaptchaCtx(ctx, req)
 
     req.Header.Set("User-Agent", profile.UserAgent)
     req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
     req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-    // Safari deliberately doesn't implement Client Hints — sending
-    // these headers from a Safari UA is itself a bot tell. Skip them
-    // when the profile didn't define any.
-    if profile.SecChUa != "" {
-        req.Header.Set("sec-ch-ua", profile.SecChUa)
-        req.Header.Set("sec-ch-ua-mobile", profile.SecChUaMobile)
-        req.Header.Set("sec-ch-ua-platform", profile.SecChUaPlatform)
-    }
+    // Safari iOS doesn't implement Client Hints. With Safari_IOS_18_0
+    // fingerprint we mirror real Safari at every layer, so drop
+    // sec-ch-ua* unconditionally.
     req.Header.Set("Sec-Fetch-Site", "none")
     req.Header.Set("Sec-Fetch-Mode", "navigate")
     req.Header.Set("Sec-Fetch-Dest", "document")
-    req.Header.Set("Sec-GPC", "1")
-    req.Header.Set("DNT", "1")
+    applySafariHeaderOrder(req)
 
     resp, err := client.Do(req)
     if err != nil {
@@ -267,14 +246,15 @@ func solvePoW(powInput string, difficulty int) string {
     return ""
 }
 
-func callCaptchaNotRobot(ctx context.Context, client *http.Client, profile Profile, sessionToken, hash string, htmlSettings map[string]interface{}, isTunnel bool) (string, error) {
+func callCaptchaNotRobot(ctx context.Context, client tlsclient.HttpClient, profile Profile, sessionToken, hash string, htmlSettings map[string]interface{}, isTunnel bool) (string, error) {
     vkReq := func(method string, postData string) (map[string]interface{}, error) {
         requestURL := "https://api.vk.com/method/" + method + "?v=5.131"
 
-        req, err := http.NewRequestWithContext(ctx, "POST", requestURL, strings.NewReader(postData))
+        req, err := fhttp.NewRequest("POST", requestURL, strings.NewReader(postData))
         if err != nil {
             return nil, err
         }
+        req = withCaptchaCtx(ctx, req)
 
         req.Header.Set("User-Agent", profile.UserAgent)
         req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -282,17 +262,11 @@ func callCaptchaNotRobot(ctx context.Context, client *http.Client, profile Profi
         req.Header.Set("Accept-Language", "en-US,en;q=0.9")
         req.Header.Set("Origin", "https://id.vk.com")
         req.Header.Set("Referer", "https://id.vk.com/")
-        if profile.SecChUa != "" {
-            req.Header.Set("sec-ch-ua", profile.SecChUa)
-            req.Header.Set("sec-ch-ua-mobile", profile.SecChUaMobile)
-            req.Header.Set("sec-ch-ua-platform", profile.SecChUaPlatform)
-        }
         req.Header.Set("Sec-Fetch-Site", "same-site")
         req.Header.Set("Sec-Fetch-Mode", "cors")
         req.Header.Set("Sec-Fetch-Dest", "empty")
-        req.Header.Set("Sec-GPC", "1")
-        req.Header.Set("DNT", "1")
         req.Header.Set("Priority", "u=1, i")
+        applySafariHeaderOrder(req)
 
         httpResp, err := client.Do(req)
         if err != nil {
