@@ -1,4 +1,5 @@
 import SwiftUI
+import Security // SecRandomCopyBytes for wrap-key generation
 
 struct SettingsView: View {
     @ObservedObject var store: ProfileStore
@@ -82,12 +83,18 @@ struct SettingsView: View {
                     .autocapitalization(.none)
                     .disableAutocorrection(true)
                 Button("Generate new key") {
-                    if let hex = TurnBridgeGenerateWrapKey() {
-                        let newKey = String(cString: hex)
-                        free(UnsafeMutablePointer(mutating: hex))
-                        if let idx = store.profiles.firstIndex(where: { $0.id == profile.id }) {
-                            store.profiles[idx].wrapKey = newKey
-                        }
+                    // Generate 32 random bytes → 64 hex chars locally
+                    // via SecRandomCopyBytes. We can't call the Go-side
+                    // TurnBridgeGenerateWrapKey from the main app target
+                    // — the Go library is only linked into the
+                    // NetworkExtension. Same wire shape, same entropy
+                    // source (kernel CSPRNG via Security.framework).
+                    var bytes = [UInt8](repeating: 0, count: 32)
+                    let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+                    guard status == errSecSuccess else { return }
+                    let newKey = bytes.map { String(format: "%02x", $0) }.joined()
+                    if let idx = store.profiles.firstIndex(where: { $0.id == profile.id }) {
+                        store.profiles[idx].wrapKey = newKey
                     }
                 }
                 .font(.footnote)

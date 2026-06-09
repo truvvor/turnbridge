@@ -69,9 +69,4 @@ extern int TurnBridgeGetSessionsTarget(void);
  * every packet and no traffic flows. */
 extern void TurnBridgeSetWrapKey(const char *hexKey);
 
-/* Returns a fresh 64-char hex string suitable for use as a wrap key.
- * Caller must free() the returned pointer. Useful for one-shot
- * "generate key" buttons in the iOS Settings UI. */
-extern char *TurnBridgeGenerateWrapKey(void);
-
 #endif
