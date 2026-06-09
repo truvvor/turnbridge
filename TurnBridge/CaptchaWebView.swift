@@ -75,21 +75,50 @@ private struct CaptchaWKWebView: UIViewRepresentable {
         let userContent = WKUserContentController()
         userContent.add(context.coordinator, name: "captcha")
 
-        let script = WKUserScript(
+        // Inject the bot-tell scrubbers BEFORE any page JS runs.
+        // - safariUAOverride: WKWebView's default JS-side
+        //   navigator.userAgent lacks "Version/X.Y Safari/604.1" that
+        //   real Mobile Safari emits; classifiers key on this exact
+        //   diff. We mock navigator.userAgent + navigator.vendor on
+        //   document-start so VK's bootstrap script sees the same UA
+        //   string that the HTTP request carries (set via
+        //   customUserAgent below).
+        // - The original captcha helper script then runs and hooks
+        //   fetch/XHR for success_token.
+        userContent.addUserScript(WKUserScript(
+            source: Self.safariUAOverride,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        ))
+        userContent.addUserScript(WKUserScript(
             source: Self.injectedJS,
             injectionTime: .atDocumentStart,
             forMainFrameOnly: false
-        )
-        userContent.addUserScript(script)
+        ))
 
         let config = WKWebViewConfiguration()
         config.userContentController = userContent
         if #available(iOS 14.0, *) {
             config.defaultWebpagePreferences.allowsContentJavaScript = true
         }
-        config.websiteDataStore = .nonPersistent()
+        // Persistent data store: VK's classifier treats a captcha
+        // session with zero prior vk.com cookies / localStorage as a
+        // signal of a freshly-spun-up automation environment. Sharing
+        // state across captcha sheets within the app gives real users
+        // the same "I've been here before" signal that web Safari has.
+        // We don't share with the system Safari (that requires
+        // ASWebAuthenticationSession), but app-scoped persistence is
+        // enough for the classifier.
+        config.websiteDataStore = .default()
 
         let webView = WKWebView(frame: UIScreen.main.bounds, configuration: config)
+        // Send the EXACT Mobile Safari UA. WKWebView's default UA is
+        // missing the "Version/X.Y Safari/604.1" suffix — that gap is
+        // one of the cheapest bot tells VK has. iOS 18 is the current
+        // production version; if Apple ships 19 the suffix updates
+        // organically but anything in the 17-18-19 range matches what
+        // VK sees from real Safari iOS users.
+        webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
         webView.navigationDelegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = true
         webView.backgroundColor = .systemBackground
@@ -193,6 +222,48 @@ private struct CaptchaWKWebView: UIViewRepresentable {
             return ""
         }
     }
+
+    // Mock navigator.userAgent + companion fields BEFORE any page JS
+    // runs so VK's classifier sees the Mobile Safari signature instead
+    // of WKWebView's truncated default. customUserAgent on the WKWebView
+    // handles the HTTP request side; this script handles the JS side
+    // (window.navigator.userAgent + navigator.userAgentData + vendor).
+    // Must run at document-start so vk's bootstrap doesn't capture the
+    // un-patched values before us.
+    //
+    // Also strips `navigator.webdriver` (some WKWebView builds set it
+    // to false but the property's mere presence is a tell), and forces
+    // languages to match what an en-US Safari iOS reports.
+    private static let safariUAOverride = """
+    (function() {
+        const ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1";
+        try {
+            Object.defineProperty(navigator, 'userAgent', { get: () => ua, configurable: true });
+        } catch (e) {}
+        try {
+            Object.defineProperty(navigator, 'appVersion', { get: () => ua.replace(/^Mozilla\\//, ''), configurable: true });
+        } catch (e) {}
+        try {
+            Object.defineProperty(navigator, 'vendor', { get: () => 'Apple Computer, Inc.', configurable: true });
+        } catch (e) {}
+        try {
+            Object.defineProperty(navigator, 'platform', { get: () => 'iPhone', configurable: true });
+        } catch (e) {}
+        try {
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'], configurable: true });
+        } catch (e) {}
+        // Real Safari iOS doesn't expose userAgentData (Client Hints).
+        // WKWebView under some configurations does — strip it to match.
+        try { delete navigator.userAgentData; } catch (e) {}
+        // Drop the webdriver flag entirely. Real Safari has no such
+        // property; WKWebView sets it (usually false). Presence ≠
+        // absence to a fingerprinter.
+        try { delete navigator.webdriver; } catch (e) {}
+        try {
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true });
+        } catch (e) {}
+    })();
+    """
 
     // Injected as document-start so we patch fetch/XHR before VK's page code
     // gets a chance to fire. Looks for any response from `captchaNotRobot.*`
