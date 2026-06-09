@@ -22,6 +22,8 @@ struct TurnBridge: App {
                     }
                 )) { identified in
                     CaptchaWebView(redirectUri: identified.request.redirectUri,
+                                   retryUrl: identified.request.retryUrl,
+                                   retryBody: identified.request.retryBody,
                                    manager: captchaManager)
                         .interactiveDismissDisabled()
                 }

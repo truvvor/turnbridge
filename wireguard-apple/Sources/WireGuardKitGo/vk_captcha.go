@@ -106,10 +106,22 @@ func (e *VkCaptchaError) IsCaptchaError() bool {
     return e.ErrorCode == 14 && e.RedirectUri != "" && e.SessionToken != ""
 }
 
-func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError) (string, error) {
+// solveVkCaptcha returns either a success_token (legacy path: caller
+// retries the failing VK API call themselves) OR a full JSON response
+// (new path: the WebView did the retry inside its own browser
+// session, so the caller skips its own retry and uses the response
+// directly).
+//
+// retryURL + retryBody describe the request the WebView should make
+// after extracting success_token. retryBody contains the literal
+// "__TOKEN__" placeholder. Pass empty strings to fall back to the
+// token-only flow — that's still wired and works for backwards
+// compat with older Swift bridges that don't know about the new
+// response path.
+func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, retryURL, retryBody string) (string, string, error) {
     if manualCaptchaForcedMode() {
         log.Printf("[Captcha] Manual mode enabled — handing the challenge to the UI")
-        return requestManualCaptcha(captchaErr.RedirectUri, 180*time.Second)
+        return requestManualCaptcha(captchaErr.RedirectUri, retryURL, retryBody, 180*time.Second)
     }
 
     // Egress decision. The default is whatever captchaTunnelEgress
@@ -141,7 +153,7 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError) (string, er
 
     sessionToken := captchaErr.SessionToken
     if sessionToken == "" {
-        return "", fmt.Errorf("no session_token in redirect_uri")
+        return "", "", fmt.Errorf("no session_token in redirect_uri")
     }
 
     profile := getRandomProfile()
@@ -149,7 +161,7 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError) (string, er
 
     powInput, difficulty, htmlSettings, err := fetchPowInput(ctx, client, profile, captchaErr.RedirectUri)
     if err != nil {
-        return "", fmt.Errorf("failed to fetch PoW input: %w", err)
+        return "", "", fmt.Errorf("failed to fetch PoW input: %w", err)
     }
 
     log.Printf("[Captcha] PoW input: %s, difficulty: %d, htmlSettings=%v", powInput, difficulty, htmlSettings != nil)
@@ -167,19 +179,19 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError) (string, er
         // 15-20% of identities the solver couldn't earn on its own.
         if manualCaptchaFallbackAvailable() {
             log.Printf("[Captcha] auto failed (%v) — escalating to manual prompt", err)
-            tok, mErr := requestManualCaptcha(captchaErr.RedirectUri, 180*time.Second)
+            tok, resp, mErr := requestManualCaptcha(captchaErr.RedirectUri, retryURL, retryBody, 180*time.Second)
             if mErr == nil {
-                log.Printf("[Captcha] Success via manual fallback")
+                log.Printf("[Captcha] Success via manual fallback (response_path=%v)", resp != "")
                 markCaptchaSuccess(isTunnel)
-                return tok, nil
+                return tok, resp, nil
             }
-            return "", fmt.Errorf("captchaNotRobot API failed: %w (manual fallback also failed: %v)", err, mErr)
+            return "", "", fmt.Errorf("captchaNotRobot API failed: %w (manual fallback also failed: %v)", err, mErr)
         }
-        return "", fmt.Errorf("captchaNotRobot API failed: %w", err)
+        return "", "", fmt.Errorf("captchaNotRobot API failed: %w", err)
     }
 
     log.Printf("[Captcha] Success! Got success_token")
-    return successToken, nil
+    return successToken, "", nil
 }
 
 func fetchPowInput(ctx context.Context, client tlsclient.HttpClient, profile Profile, redirectUri string) (string, int, map[string]interface{}, error) {

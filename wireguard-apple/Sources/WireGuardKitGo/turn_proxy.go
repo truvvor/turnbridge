@@ -251,15 +251,68 @@ func getCreds(ctx context.Context, link string) (resUser string, resPass string,
                 if captchaErr.IsCaptchaError() {
                     log.Printf("[Captcha] Attempt %d/%d: solving...", attempt+1, maxCaptchaAttempts)
 
-                    successToken, solveErr := solveVkCaptcha(ctx, captchaErr)
-                    if solveErr != nil {
-                        return "", "", "", fmt.Errorf("captcha solve error: %v", solveErr)
-                    }
-
                     if captchaErr.CaptchaAttempt == "0" || captchaErr.CaptchaAttempt == "" {
                         captchaErr.CaptchaAttempt = "1"
                     }
 
+                    // Build the retry body template up front so the
+                    // WebView can replay it inside the same browser
+                    // session that solved the captcha — VK then sees
+                    // one coherent actor (cookies / fingerprint / IP)
+                    // instead of "token minted here, redeemed
+                    // somewhere else". Literal "__TOKEN__" gets swapped
+                    // for the actual success_token inside the WebView's
+                    // injected JS. WebView passes the JSON response
+                    // back via TurnBridgeSubmitManualCaptchaResponse;
+                    // see solveVkCaptcha's return shape.
+                    retryURL := reqURL
+                    retryBody := fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s"+
+                        "&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=__TOKEN__"+
+                        "&captcha_ts=%s&captcha_attempt=%s&access_token=%s",
+                        link, escapedName, captchaErr.CaptchaSid,
+                        captchaErr.CaptchaTs, captchaErr.CaptchaAttempt, token1)
+
+                    successToken, manualResp, solveErr := solveVkCaptcha(ctx, captchaErr, retryURL, retryBody)
+                    if solveErr != nil {
+                        return "", "", "", fmt.Errorf("captcha solve error: %v", solveErr)
+                    }
+
+                    if manualResp != "" {
+                        // WebView did the retry itself and gave us back
+                        // the final JSON response. Splice it into the
+                        // outer for-loop's resp variable so the next
+                        // iteration of the loop (which checks resp for
+                        // error vs success) sees what we'd have gotten
+                        // from our own doRequest. Then `continue` —
+                        // but with a special marker: we set data to
+                        // empty so the next doRequest call would be a
+                        // no-op; instead we short-circuit by parsing
+                        // here.
+                        var parsed map[string]interface{}
+                        if jerr := json.Unmarshal([]byte(manualResp), &parsed); jerr != nil {
+                            return "", "", "", fmt.Errorf("manual captcha response not JSON: %v (raw=%s)", jerr, manualResp)
+                        }
+                        resp = parsed
+                        if errObj2, hasErr := resp["error"].(map[string]interface{}); hasErr {
+                            return "", "", "", fmt.Errorf("VK API error in manual-retry response: %v", errObj2)
+                        }
+                        rspObj, ok := resp["response"].(map[string]interface{})
+                        if !ok {
+                            return "", "", "", fmt.Errorf("manual-retry response missing 'response' field: %s", manualResp)
+                        }
+                        tok, ok := rspObj["token"].(string)
+                        if !ok || tok == "" {
+                            return "", "", "", fmt.Errorf("manual-retry response missing token: %s", manualResp)
+                        }
+                        token2 = tok
+                        log.Printf("[Captcha] Used in-WebView retry response, token2 acquired")
+                        break // exit the for-attempt loop with token2 set
+                    }
+
+                    // Legacy path: WebView gave us just the token, do
+                    // the retry ourselves from Go's HTTP client. VK
+                    // may reject because of session mismatch — that's
+                    // the failure mode the response_path above fixes.
                     data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s"+
                         "&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s"+
                         "&captcha_ts=%s&captcha_attempt=%s&access_token=%s",

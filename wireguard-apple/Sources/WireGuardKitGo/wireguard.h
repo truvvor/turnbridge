@@ -45,6 +45,21 @@ extern void TurnBridgeSetManualCaptchaCallback(manual_captcha_cb_t cb);
 extern void TurnBridgeSubmitManualCaptchaToken(const char *request_id, const char *token);
 extern void TurnBridgeCancelManualCaptcha(const char *request_id, const char *reason);
 extern void TurnBridgeSetManualCaptchaMode(int enabled);
+
+/* Returns a JSON {"url":..., "body":...} describing the request the
+ * WebView should make after extracting success_token, inside its own
+ * browser session. Caller must free() the returned string. NULL when
+ * no retry is configured for this request_id (legacy token-only flow).
+ * Used by the network-extension's CaptchaBridge to populate the
+ * PendingRequest with retry params for the app. */
+extern char *TurnBridgeGetManualCaptchaRetryRequest(const char *request_id);
+
+/* Delivers the full JSON response from the WebView's in-session API
+ * replay. getCreds then skips its own redemption call. Pass a non-
+ * empty token via TurnBridgeSubmitManualCaptchaToken when the WebView
+ * couldn't do the replay (fetch failed) so the legacy path still
+ * runs. */
+extern void TurnBridgeSubmitManualCaptchaResponse(const char *request_id, const char *response_json);
 extern void TurnBridgeSetStreamAggregation(int enabled);
 extern void TurnBridgeSetCaptchaTrapDir(const char *path);
 extern int TurnBridgeGetCaptchaDirectCount(void);

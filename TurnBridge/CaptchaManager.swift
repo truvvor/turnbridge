@@ -66,12 +66,31 @@ final class CaptchaManager: ObservableObject {
         pending = req
     }
 
+    /// WebView extracted just the success_token (legacy or fallback
+    /// when the in-WebView retry failed). The extension will do the
+    /// VK API retry itself — VK may reject because of session
+    /// mismatch.
     func submit(token: String) async {
         guard let req = pending else { return }
         await sendMessage(.init(type: "captcha_answer",
                                 requestId: req.requestId,
                                 successToken: token,
-                                reason: nil))
+                                reason: nil,
+                                responseJson: nil))
+        clearPending()
+    }
+
+    /// WebView solved the captcha AND replayed the failing VK API
+    /// call in the same browser session. This is what we want: VK
+    /// sees a single coherent session for both the solve and the
+    /// redemption, no fingerprint switch.
+    func submit(response: String) async {
+        guard let req = pending else { return }
+        await sendMessage(.init(type: "captcha_answer",
+                                requestId: req.requestId,
+                                successToken: nil,
+                                reason: nil,
+                                responseJson: response))
         clearPending()
     }
 
@@ -80,7 +99,8 @@ final class CaptchaManager: ObservableObject {
         await sendMessage(.init(type: "captcha_cancel",
                                 requestId: req.requestId,
                                 successToken: nil,
-                                reason: reason))
+                                reason: reason,
+                                responseJson: nil))
         clearPending()
     }
 

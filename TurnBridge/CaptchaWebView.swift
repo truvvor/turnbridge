@@ -7,6 +7,13 @@ import Combine
 /// CaptchaManager.
 struct CaptchaWebView: View {
     let redirectUri: String
+    /// When non-nil, the injected JS will, after extracting
+    /// success_token, replay this request inside the WebView's session
+    /// (POST `retryBody` with literal "__TOKEN__" swapped for the
+    /// actual token, to `retryUrl`). The full JSON response goes back
+    /// via `onResponse`. nil = legacy token-only flow.
+    let retryUrl: String?
+    let retryBody: String?
     @ObservedObject var manager: CaptchaManager = .shared
     @Environment(\.dismiss) private var dismiss
 
@@ -26,12 +33,23 @@ struct CaptchaWebView: View {
 
                 CaptchaWKWebView(
                     url: URL(string: redirectUri),
+                    retryUrl: retryUrl,
+                    retryBody: retryBody,
                     onToken: { token in
                         guard !didFinish else { return }
                         didFinish = true
                         status = "Got token, finishing…"
                         Task {
                             await manager.submit(token: token)
+                            dismiss()
+                        }
+                    },
+                    onResponse: { responseJson in
+                        guard !didFinish else { return }
+                        didFinish = true
+                        status = "Got response, finishing…"
+                        Task {
+                            await manager.submit(response: responseJson)
                             dismiss()
                         }
                     },
@@ -64,11 +82,14 @@ struct CaptchaWebView: View {
 
 private struct CaptchaWKWebView: UIViewRepresentable {
     let url: URL?
+    let retryUrl: String?
+    let retryBody: String?
     let onToken: (String) -> Void
+    let onResponse: (String) -> Void
     let onStatus: (String) -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onToken: onToken, onStatus: onStatus)
+        Coordinator(onToken: onToken, onResponse: onResponse, onStatus: onStatus)
     }
 
     func makeUIView(context: Context) -> WKWebView {
@@ -76,20 +97,31 @@ private struct CaptchaWKWebView: UIViewRepresentable {
         userContent.add(context.coordinator, name: "captcha")
 
         // Inject the bot-tell scrubbers BEFORE any page JS runs.
-        // - safariUAOverride: WKWebView's default JS-side
-        //   navigator.userAgent lacks "Version/X.Y Safari/604.1" that
-        //   real Mobile Safari emits; classifiers key on this exact
-        //   diff. We mock navigator.userAgent + navigator.vendor on
-        //   document-start so VK's bootstrap script sees the same UA
-        //   string that the HTTP request carries (set via
-        //   customUserAgent below).
-        // - The original captcha helper script then runs and hooks
-        //   fetch/XHR for success_token.
+        // - safariUAOverride: navigator.* spoofing so JS-visible UA
+        //   matches the HTTP UA set via customUserAgent.
+        // - retry config: small script that defines window.__capRetry
+        //   with the URL + body template before the captcha helper
+        //   reads it. JSON-stringified to handle the body's special
+        //   chars safely.
+        // - injectedJS: the helper that hooks fetch/XHR for
+        //   success_token and either fires onResponse (if retry params
+        //   are present and the in-WebView retry succeeded) or
+        //   onToken (legacy).
         userContent.addUserScript(WKUserScript(
             source: Self.safariUAOverride,
             injectionTime: .atDocumentStart,
             forMainFrameOnly: false
         ))
+        if let url = retryUrl, let body = retryBody, !url.isEmpty {
+            let urlJSON = Self.jsString(url)
+            let bodyJSON = Self.jsString(body)
+            let retryScript = "window.__capRetry = {url: \(urlJSON), body: \(bodyJSON)};"
+            userContent.addUserScript(WKUserScript(
+                source: retryScript,
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: false
+            ))
+        }
         userContent.addUserScript(WKUserScript(
             source: Self.injectedJS,
             injectionTime: .atDocumentStart,
@@ -140,10 +172,14 @@ private struct CaptchaWKWebView: UIViewRepresentable {
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         let onToken: (String) -> Void
+        let onResponse: (String) -> Void
         let onStatus: (String) -> Void
 
-        init(onToken: @escaping (String) -> Void, onStatus: @escaping (String) -> Void) {
+        init(onToken: @escaping (String) -> Void,
+             onResponse: @escaping (String) -> Void,
+             onStatus: @escaping (String) -> Void) {
             self.onToken = onToken
+            self.onResponse = onResponse
             self.onStatus = onStatus
         }
 
@@ -153,7 +189,20 @@ private struct CaptchaWKWebView: UIViewRepresentable {
                   let body = message.body as? [String: Any],
                   let type = body["type"] as? String else { return }
             switch type {
+            case "final_response":
+                // Preferred path: WebView did the VK API replay
+                // inside the same browser session that solved the
+                // captcha, and the response is the raw JSON the
+                // extension would have gotten by doing the redemption
+                // itself. No session switch.
+                if let json = body["json"] as? String, !json.isEmpty {
+                    onResponse(json)
+                }
             case "success_token":
+                // Legacy / fallback path: the in-WebView retry didn't
+                // happen (no retry params, fetch threw, etc). Pass
+                // the raw token; the extension does the retry from Go
+                // and hopes VK accepts the session switch.
                 if let token = body["token"] as? String, !token.isEmpty {
                     onToken(token)
                 }
@@ -223,6 +272,21 @@ private struct CaptchaWKWebView: UIViewRepresentable {
         }
     }
 
+    /// JSON-quote a Swift string for embedding into JS source code.
+    /// Handles backslashes, quotes, newlines, etc.
+    fileprivate static func jsString(_ s: String) -> String {
+        let data = try? JSONSerialization.data(withJSONObject: [s], options: [])
+        guard let data = data,
+              let json = String(data: data, encoding: .utf8) else {
+            return "\"\""
+        }
+        // Strip the surrounding [ ... ] so we get just the quoted string.
+        let inner = json.dropFirst().dropLast()
+        // Belt-and-braces: escape "</" so it can't terminate a <script>
+        // tag if the source ever ends up embedded in HTML directly.
+        return String(inner).replacingOccurrences(of: "</", with: "<\\/")
+    }
+
     // Mock navigator.userAgent + companion fields BEFORE any page JS
     // runs so VK's classifier sees the Mobile Safari signature instead
     // of WKWebView's truncated default. customUserAgent on the WKWebView
@@ -275,6 +339,45 @@ private struct CaptchaWKWebView: UIViewRepresentable {
             try { window.webkit.messageHandlers.captcha.postMessage(payload); } catch (e) {}
         }
 
+        // Once true, no more sends — first solve wins.
+        let solved = false;
+
+        // When the captcha helper grabs success_token, this runs.
+        // If window.__capRetry is set (retryUrl + retryBody from the
+        // extension), do the follow-up VK API call inside this
+        // browser session — same cookies, same TLS, same IP, no
+        // session switch for VK to flag. Send the JSON response as
+        // 'final_response'. Fall back to sending the raw token on any
+        // hiccup so the legacy Go-side retry still gets a chance.
+        function handleSuccessToken(token) {
+            if (solved) return;
+            solved = true;
+            const cfg = window.__capRetry;
+            if (!cfg || !cfg.url || !cfg.body) {
+                send({type: 'success_token', token: token});
+                return;
+            }
+            const body = cfg.body.replace(/__TOKEN__/g, encodeURIComponent(token));
+            send({type: 'status', text: 'Redeeming token in-session…'});
+            fetch(cfg.url, {
+                method: 'POST',
+                credentials: 'include',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: body
+            }).then(function(r) { return r.text(); })
+              .then(function(text) {
+                  if (text && text.length > 0) {
+                      send({type: 'final_response', json: text});
+                  } else {
+                      send({type: 'success_token', token: token});
+                  }
+              })
+              .catch(function(e) {
+                  send({type: 'status', text: 'In-session retry failed: ' + e});
+                  send({type: 'success_token', token: token});
+              });
+        }
+
         function maybeTokenFromText(text) {
             if (!text) return null;
             try {
@@ -298,7 +401,7 @@ private struct CaptchaWKWebView: UIViewRepresentable {
                         try {
                             res.clone().text().then(function(text) {
                                 const t = maybeTokenFromText(text);
-                                if (t) send({type:'success_token', token: t});
+                                if (t) handleSuccessToken(t);
                             });
                         } catch (e) {}
                     }).catch(function() {});
@@ -321,7 +424,7 @@ private struct CaptchaWKWebView: UIViewRepresentable {
                 if (xhr.readyState === 4 && xhr.__cap_url &&
                     String(xhr.__cap_url).indexOf('captchaNotRobot') !== -1) {
                     const t = maybeTokenFromText(xhr.responseText);
-                    if (t) send({type:'success_token', token: t});
+                    if (t) handleSuccessToken(t);
                 }
                 if (typeof prev === 'function') return prev.apply(this, arguments);
             };
@@ -333,13 +436,13 @@ private struct CaptchaWKWebView: UIViewRepresentable {
             try {
                 const data = ev.data;
                 if (data && typeof data === 'object') {
-                    if (data.success_token) send({type:'success_token', token: data.success_token});
+                    if (data.success_token) handleSuccessToken(data.success_token);
                     if (data.type === 'captcha_success' && data.token) {
-                        send({type:'success_token', token: data.token});
+                        handleSuccessToken(data.token);
                     }
                 } else if (typeof data === 'string') {
                     const t = maybeTokenFromText(data);
-                    if (t) send({type:'success_token', token: t});
+                    if (t) handleSuccessToken(t);
                 }
             } catch (e) {}
         });
@@ -356,7 +459,7 @@ private struct CaptchaWKWebView: UIViewRepresentable {
                         const params = new URLSearchParams(u.hash.replace(/^#/, ''));
                         t = params.get('success_token');
                     }
-                    if (t) send({type:'success_token', token: t});
+                    if (t) handleSuccessToken(t);
                 } catch (e) {}
             }
         }, 250);
