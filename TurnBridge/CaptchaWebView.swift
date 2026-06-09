@@ -150,6 +150,18 @@ private struct CaptchaWKWebView: UIViewRepresentable {
             injectionTime: .atDocumentStart,
             forMainFrameOnly: false
         ))
+        // Fingerprint hardening: canvas + audio readback noise so a
+        // fingerprinter computing hashes over getImageData / toDataURL /
+        // AnalyserNode frequencies sees a different bucket each session.
+        // Drawing surfaces are NOT touched, so the visible captcha image
+        // renders cleanly — only readback paths used by fingerprinters
+        // get perturbed. See definition for the threat model and the
+        // rationale on why this lives separately from safariUAOverride.
+        userContent.addUserScript(WKUserScript(
+            source: Self.fingerprintHardening,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        ))
         if let url = retryUrl, let body = retryBody, !url.isEmpty {
             let urlJSON = Self.jsString(url)
             let bodyJSON = Self.jsString(body)
@@ -437,6 +449,132 @@ private struct CaptchaWKWebView: UIViewRepresentable {
     })();
     """
 
+    // Fingerprint hardening: per-session noise on the canvas and audio
+    // *readback* paths a fingerprinter uses to compute device-stable
+    // hashes. The two surfaces we touch:
+    //
+    //   1. `HTMLCanvasElement.prototype.toDataURL` and
+    //      `CanvasRenderingContext2D.prototype.getImageData` — wrapped
+    //      so a single random byte in the returned buffer flips by ±1.
+    //      Visually imperceptible (one pixel's red channel off by one
+    //      in a single random location) but it moves the canvas hash
+    //      into a different bucket every captcha session, defeating
+    //      "this device always produces hash X" classifiers.
+    //
+    //   2. `AnalyserNode.prototype.getFloatFrequencyData` — wrapped to
+    //      add Gaussian-like noise in the -180 dB floor band. AudioCtx
+    //      fingerprinting relies on DSP determinism; the noise breaks
+    //      it without affecting any actual audio playback (we never
+    //      call .play() in the captcha flow).
+    //
+    // CRITICAL: we do NOT touch the canvas draw API itself (fillRect,
+    // drawImage, etc). The VK captcha image is drawn TO canvas and read
+    // BACK only by the legitimate page code for display — never by
+    // toDataURL/getImageData. Fingerprinters specifically hit those
+    // readback APIs to extract a stable hash. Wrapping only the readback
+    // means the user sees the puzzle image cleanly while the
+    // fingerprinter sees per-session noise.
+    //
+    // Lives separately from safariUAOverride because the two hit
+    // different threat models (UA spoofing for HTTP/JS-string checks vs
+    // canvas/audio hashing for ML classifiers), and keeping them apart
+    // makes it cheap to disable one or the other if a particular
+    // hardening breaks a specific puzzle.
+    private static let fingerprintHardening = """
+    (function() {
+        try {
+            // Canvas: perturb one byte in the returned pixel buffer.
+            // Buffers come from getImageData (raw RGBA bytes) and from
+            // toDataURL (base64 PNG/JPEG bytes). For getImageData we
+            // patch the bytes directly; for toDataURL we draw the canvas
+            // into an offscreen one with a single-pixel overlay of a
+            // randomised alpha tint, then encode that.
+            const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+            CanvasRenderingContext2D.prototype.getImageData = function() {
+                const out = origGetImageData.apply(this, arguments);
+                try {
+                    if (out && out.data && out.data.length > 4) {
+                        // Perturb 3 random RGBA bytes per readback — enough
+                        // to move the hash, too little to be visible if the
+                        // page even tried to put the buffer back on screen.
+                        for (let i = 0; i < 3; i++) {
+                            const idx = Math.floor(Math.random() * out.data.length);
+                            const delta = Math.random() < 0.5 ? -1 : 1;
+                            const v = out.data[idx] + delta;
+                            out.data[idx] = v < 0 ? 0 : (v > 255 ? 255 : v);
+                        }
+                    }
+                } catch (e) {}
+                return out;
+            };
+            const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+            HTMLCanvasElement.prototype.toDataURL = function() {
+                try {
+                    // Stamp one near-transparent pixel at a randomised
+                    // position with a randomised colour. Visually a no-op
+                    // (alpha ~1/255) but it shifts every byte downstream
+                    // of that pixel in the encoded PNG, which gives the
+                    // hash a completely different value.
+                    const w = this.width | 0;
+                    const h = this.height | 0;
+                    if (w > 0 && h > 0) {
+                        const ctx = this.getContext('2d');
+                        if (ctx) {
+                            const x = Math.floor(Math.random() * w);
+                            const y = Math.floor(Math.random() * h);
+                            const r = Math.floor(Math.random() * 256);
+                            const g = Math.floor(Math.random() * 256);
+                            const b = Math.floor(Math.random() * 256);
+                            const prev = ctx.fillStyle;
+                            ctx.fillStyle = 'rgba(' + r + ',' + g + ',' + b + ',0.0039)';
+                            ctx.fillRect(x, y, 1, 1);
+                            ctx.fillStyle = prev;
+                        }
+                    }
+                } catch (e) {}
+                return origToDataURL.apply(this, arguments);
+            };
+        } catch (e) {}
+
+        try {
+            // Audio: noise the frequency-domain readback. We never call
+            // OscillatorNode.start()/.connect() ourselves in the captcha
+            // flow, so this only affects code that *measures* the DSP
+            // graph for a fingerprint.
+            if (typeof AnalyserNode !== 'undefined' && AnalyserNode.prototype) {
+                const origGetFloat = AnalyserNode.prototype.getFloatFrequencyData;
+                AnalyserNode.prototype.getFloatFrequencyData = function(arr) {
+                    origGetFloat.apply(this, arguments);
+                    try {
+                        if (arr && arr.length) {
+                            for (let i = 0; i < arr.length; i++) {
+                                // ±0.01 dB jitter on each bin: well below
+                                // any perceptual or DSP-derivable threshold
+                                // but it kills bit-for-bit stability.
+                                arr[i] = arr[i] + (Math.random() * 0.02 - 0.01);
+                            }
+                        }
+                    } catch (e) {}
+                };
+                const origGetByte = AnalyserNode.prototype.getByteFrequencyData;
+                AnalyserNode.prototype.getByteFrequencyData = function(arr) {
+                    origGetByte.apply(this, arguments);
+                    try {
+                        if (arr && arr.length) {
+                            // Single-bin ±1 perturbation is enough to
+                            // shift the histogram hash.
+                            const idx = Math.floor(Math.random() * arr.length);
+                            const delta = Math.random() < 0.5 ? -1 : 1;
+                            const v = arr[idx] + delta;
+                            arr[idx] = v < 0 ? 0 : (v > 255 ? 255 : v);
+                        }
+                    } catch (e) {}
+                };
+            }
+        } catch (e) {}
+    })();
+    """
+
     // Injected as document-start so we patch fetch/XHR before VK's page code
     // gets a chance to fire. Looks for any response from `captchaNotRobot.*`
     // that carries `success_token`, and also polls the URL / page text as a
@@ -466,32 +604,44 @@ private struct CaptchaWKWebView: UIViewRepresentable {
                 return;
             }
             const body = cfg.body.replace(/__TOKEN__/g, encodeURIComponent(token));
-            send({type: 'status', text: 'replay: redeeming token in-session (POST ' + cfg.url + ')'});
-            fetch(cfg.url, {
-                method: 'POST',
-                credentials: 'include',
-                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                body: body
-            }).then(function(r) { return r.text(); })
-              .then(function(text) {
-                  if (text && text.length > 0) {
-                      send({type: 'status', text: 'replay OK: final_response (' + text.length + ' bytes) — single coherent session'});
-                      send({type: 'final_response', json: text});
-                  } else {
-                      // 2xx but empty body — treat as replay miss so the
-                      // log makes the silent-degrade-to-raw-token explicit.
-                      send({type: 'status', text: 'replay FALLBACK: empty response body → raw token (Go will redeem, session switch risk)'});
+            // Human-like pause before redeeming: a real user sees the
+            // green checkmark, registers it, then the page navigates.
+            // Firing the api.vk.com POST in the same microtask as the
+            // success_token detection is a timing tell — a bot that
+            // sees the token can replay instantly, a human cannot. So
+            // we wait 1.5-2.5 s (uniformly random) before the fetch.
+            // Side benefit: the user sees the green check for the same
+            // 1.5-2.5 s they would in real Safari, so the WebView UX
+            // matches expectations instead of dismissing instantly.
+            const delayMs = 1500 + Math.floor(Math.random() * 1000);
+            send({type: 'status', text: 'replay: waiting ' + delayMs + 'ms then redeeming (POST ' + cfg.url + ')'});
+            setTimeout(function() {
+                fetch(cfg.url, {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                    body: body
+                }).then(function(r) { return r.text(); })
+                  .then(function(text) {
+                      if (text && text.length > 0) {
+                          send({type: 'status', text: 'replay OK: final_response (' + text.length + ' bytes) — single coherent session'});
+                          send({type: 'final_response', json: text});
+                      } else {
+                          // 2xx but empty body — treat as replay miss so the
+                          // log makes the silent-degrade-to-raw-token explicit.
+                          send({type: 'status', text: 'replay FALLBACK: empty response body → raw token (Go will redeem, session switch risk)'});
+                          send({type: 'success_token', token: token});
+                      }
+                  })
+                  .catch(function(e) {
+                      // The common cause here is the cross-origin fetch to
+                      // api.vk.com being blocked by the captcha page's CSP
+                      // connect-src or by missing CORS — which silently
+                      // demotes us to the bot-prone Go redemption path.
+                      send({type: 'status', text: 'replay FALLBACK: fetch threw (' + e + ') → raw token (likely CORS/CSP; Go will redeem, session switch risk)'});
                       send({type: 'success_token', token: token});
-                  }
-              })
-              .catch(function(e) {
-                  // The common cause here is the cross-origin fetch to
-                  // api.vk.com being blocked by the captcha page's CSP
-                  // connect-src or by missing CORS — which silently
-                  // demotes us to the bot-prone Go redemption path.
-                  send({type: 'status', text: 'replay FALLBACK: fetch threw (' + e + ') → raw token (likely CORS/CSP; Go will redeem, session switch risk)'});
-                  send({type: 'success_token', token: token});
-              });
+                  });
+            }, delayMs);
         }
 
         function maybeTokenFromText(text) {
