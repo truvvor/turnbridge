@@ -82,13 +82,35 @@ func manualCaptchaQuotaRemaining() int64 {
 	return rem
 }
 
-// Captcha solve mode. 0 = off (auto only, on auto-fail the caller
-// recycles a previously-acquired identity). 1 = forced (every captcha
-// is handed to the UI immediately, auto solver is never tried). 2 =
-// fallback (auto solver runs first; if it fails AND the remote /cred
-// cluster has nothing for us either, the UI gets the prompt as a
-// last resort before we degrade to identity recycling). Values
-// preserved across the old 0/1 bool API: 1 still means "forced".
+// manualCaptchaSerialise enforces that only one captcha sheet is
+// shown to the user at a time. Without it — see the 1.3.27 field
+// log — the first wave of N=60 session goroutines all called
+// requestManualCaptcha within the same millisecond. Each one
+// publishRequest'd its own PendingRequest into the App Group
+// UserDefaults under the SAME KEY; only the last write survived.
+// The Swift Manager only ever saw the LATEST request, the sheet
+// kept swapping URLs under the user's fingers, and the visible
+// "stuck on green checkmark" was actually the page from one
+// request being overwritten by the next request's URL while the
+// JS helper from the first request was mid-flight.
+//
+// Serialising at the Go entry point means goroutines line up in
+// arrival order. Each waits for the previous one to fully finish
+// (solve, cancel, or timeout) before publishRequest fires the
+// callback. The Swift side never sees overlapping requests.
+//
+// Quota and serialisation interact cleanly: the lock acquisition
+// happens first, then quota is checked (and decrements on
+// rejection). At most 5 ever hold the lock; the 6th — 60th wait
+// in line until the 5th completes, then immediately fall through
+// to the quota-exhausted branch.
+// manualCaptchaSerialise is a binary semaphore implemented as a
+// 1-buffered channel: send to claim, receive to release. Channel
+// pick at send time is FIFO-ish under Go's runtime, which matches
+// the "arrival order" intent better than sync.Mutex's unspecified
+// wakeup order.
+var manualCaptchaSerialise = make(chan struct{}, 1)
+
 const (
 	manualCaptchaModeOff      = 0
 	manualCaptchaModeForced   = 1
@@ -223,10 +245,23 @@ func requestManualCaptcha(redirectURI, retryURL, retryBody string, timeout time.
 		return "", "", fmt.Errorf("manual captcha redirect_uri is empty")
 	}
 
-	// Reserve a slot in the per-session quota up front. The Forced /
-	// Fallback mode checks already gated us on quotaRemaining > 0,
-	// but check again under the increment in case multiple goroutines
-	// race past the check at the same time.
+	// Serialise: only one captcha sheet is shown at a time. See
+	// manualCaptchaSerialise comment. Goroutines stack up here and
+	// release the slot on return (success, cancel, or timeout).
+	// CRITICAL: the slot is held across the entire user-facing
+	// solve so PendingRequest in App Group UserDefaults isn't
+	// overwritten by the next goroutine while the user is still
+	// looking at the current sheet.
+	manualCaptchaSerialise <- struct{}{}
+	defer func() { <-manualCaptchaSerialise }()
+
+	// Reserve a slot in the per-session quota AFTER acquiring the
+	// serialise lock. Without that ordering, all 60 goroutines
+	// could race past the quota gate at once (Add(1) returns a
+	// monotonic counter but doesn't block), then only the first 5
+	// to acquire the lock actually run. The remaining 55 would
+	// have already burned a slot. With this ordering, only as
+	// many slots are spent as sheets are actually shown.
 	used := manualCaptchaInvocations.Add(1)
 	if used > int64(manualCaptchaQuotaPerSession) {
 		manualCaptchaInvocations.Add(-1)
