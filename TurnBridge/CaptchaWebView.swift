@@ -7,6 +7,13 @@ import Combine
 /// CaptchaManager.
 struct CaptchaWebView: View {
     let redirectUri: String
+    /// When non-nil, the injected JS will, after extracting
+    /// success_token, replay this request inside the WebView's session
+    /// (POST `retryBody` with literal "__TOKEN__" swapped for the
+    /// actual token, to `retryUrl`). The full JSON response goes back
+    /// via `onResponse`. nil = legacy token-only flow.
+    let retryUrl: String?
+    let retryBody: String?
     @ObservedObject var manager: CaptchaManager = .shared
     @Environment(\.dismiss) private var dismiss
 
@@ -26,12 +33,37 @@ struct CaptchaWebView: View {
 
                 CaptchaWKWebView(
                     url: URL(string: redirectUri),
+                    retryUrl: retryUrl,
+                    retryBody: retryBody,
                     onToken: { token in
                         guard !didFinish else { return }
                         didFinish = true
                         status = "Got token, finishing…"
                         Task {
                             await manager.submit(token: token)
+                            dismiss()
+                        }
+                    },
+                    onResponse: { responseJson in
+                        guard !didFinish else { return }
+                        didFinish = true
+                        status = "Got response, finishing…"
+                        Task {
+                            await manager.submit(response: responseJson)
+                            dismiss()
+                        }
+                    },
+                    onTerminal: { reason in
+                        // VK rendered a terminal failure page ("Attempt
+                        // limit reached" etc). No way for the user to
+                        // recover from inside the sheet — cancel and
+                        // let Go bail to identity recycling.
+                        guard !didFinish else { return }
+                        didFinish = true
+                        status = "VK refused: \(reason.prefix(80))"
+                        SharedLogger.info("CaptchaWebView terminal page detected: \(reason)", source: .app)
+                        Task {
+                            await manager.cancel(reason: "vk terminal: \(reason.prefix(120))")
                             dismiss()
                         }
                     },
@@ -45,8 +77,14 @@ struct CaptchaWebView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") {
-                        guard !didFinish else { return }
+                        // Cancel ALWAYS works, even if didFinish is
+                        // already true. This is the user's escape
+                        // hatch when something downstream wedges —
+                        // we'd rather double-cancel (idempotent on
+                        // both Swift and Go sides) than trap the
+                        // user staring at a frozen sheet.
                         didFinish = true
+                        SharedLogger.info("CaptchaWebView: user pressed Cancel (state.didFinish was \(didFinish))", source: .app)
                         Task {
                             await manager.cancel()
                             dismiss()
@@ -56,6 +94,20 @@ struct CaptchaWebView: View {
             }
             .onAppear {
                 SharedLogger.info("Captcha sheet appeared. redirect_uri=\(redirectUri)", source: .app)
+                // Watchdog: if nothing — solve, terminal, user cancel
+                // — happens in 175 s, cancel ourselves. Go's
+                // requestManualCaptcha times out at 180 s; firing 5 s
+                // earlier on our side means the UI never lingers past
+                // a backend already-gave-up state.
+                Task {
+                    try? await Task.sleep(nanoseconds: 175_000_000_000)
+                    guard !didFinish else { return }
+                    didFinish = true
+                    status = "Timed out waiting for solve"
+                    SharedLogger.warning("CaptchaWebView watchdog timeout (175 s) — auto-cancelling", source: .app)
+                    await manager.cancel(reason: "ui watchdog timeout")
+                    dismiss()
+                }
             }
         }
         .navigationViewStyle(.stack)
@@ -64,32 +116,79 @@ struct CaptchaWebView: View {
 
 private struct CaptchaWKWebView: UIViewRepresentable {
     let url: URL?
+    let retryUrl: String?
+    let retryBody: String?
     let onToken: (String) -> Void
+    let onResponse: (String) -> Void
+    let onTerminal: (String) -> Void
     let onStatus: (String) -> Void
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onToken: onToken, onStatus: onStatus)
+        Coordinator(onToken: onToken,
+                    onResponse: onResponse,
+                    onTerminal: onTerminal,
+                    onStatus: onStatus)
     }
 
     func makeUIView(context: Context) -> WKWebView {
         let userContent = WKUserContentController()
         userContent.add(context.coordinator, name: "captcha")
 
-        let script = WKUserScript(
+        // Inject the bot-tell scrubbers BEFORE any page JS runs.
+        // - safariUAOverride: navigator.* spoofing so JS-visible UA
+        //   matches the HTTP UA set via customUserAgent.
+        // - retry config: small script that defines window.__capRetry
+        //   with the URL + body template before the captcha helper
+        //   reads it. JSON-stringified to handle the body's special
+        //   chars safely.
+        // - injectedJS: the helper that hooks fetch/XHR for
+        //   success_token and either fires onResponse (if retry params
+        //   are present and the in-WebView retry succeeded) or
+        //   onToken (legacy).
+        userContent.addUserScript(WKUserScript(
+            source: Self.safariUAOverride,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        ))
+        if let url = retryUrl, let body = retryBody, !url.isEmpty {
+            let urlJSON = Self.jsString(url)
+            let bodyJSON = Self.jsString(body)
+            let retryScript = "window.__capRetry = {url: \(urlJSON), body: \(bodyJSON)};"
+            userContent.addUserScript(WKUserScript(
+                source: retryScript,
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: false
+            ))
+        }
+        userContent.addUserScript(WKUserScript(
             source: Self.injectedJS,
             injectionTime: .atDocumentStart,
             forMainFrameOnly: false
-        )
-        userContent.addUserScript(script)
+        ))
 
         let config = WKWebViewConfiguration()
         config.userContentController = userContent
         if #available(iOS 14.0, *) {
             config.defaultWebpagePreferences.allowsContentJavaScript = true
         }
-        config.websiteDataStore = .nonPersistent()
+        // Persistent data store: VK's classifier treats a captcha
+        // session with zero prior vk.com cookies / localStorage as a
+        // signal of a freshly-spun-up automation environment. Sharing
+        // state across captcha sheets within the app gives real users
+        // the same "I've been here before" signal that web Safari has.
+        // We don't share with the system Safari (that requires
+        // ASWebAuthenticationSession), but app-scoped persistence is
+        // enough for the classifier.
+        config.websiteDataStore = .default()
 
         let webView = WKWebView(frame: UIScreen.main.bounds, configuration: config)
+        // Send the EXACT Mobile Safari UA. WKWebView's default UA is
+        // missing the "Version/X.Y Safari/604.1" suffix — that gap is
+        // one of the cheapest bot tells VK has. iOS 18 is the current
+        // production version; if Apple ships 19 the suffix updates
+        // organically but anything in the 17-18-19 range matches what
+        // VK sees from real Safari iOS users.
+        webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
         webView.navigationDelegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = true
         webView.backgroundColor = .systemBackground
@@ -111,10 +210,18 @@ private struct CaptchaWKWebView: UIViewRepresentable {
 
     final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
         let onToken: (String) -> Void
+        let onResponse: (String) -> Void
         let onStatus: (String) -> Void
 
-        init(onToken: @escaping (String) -> Void, onStatus: @escaping (String) -> Void) {
+        let onTerminal: (String) -> Void
+
+        init(onToken: @escaping (String) -> Void,
+             onResponse: @escaping (String) -> Void,
+             onTerminal: @escaping (String) -> Void,
+             onStatus: @escaping (String) -> Void) {
             self.onToken = onToken
+            self.onResponse = onResponse
+            self.onTerminal = onTerminal
             self.onStatus = onStatus
         }
 
@@ -124,7 +231,20 @@ private struct CaptchaWKWebView: UIViewRepresentable {
                   let body = message.body as? [String: Any],
                   let type = body["type"] as? String else { return }
             switch type {
+            case "final_response":
+                // Preferred path: WebView did the VK API replay
+                // inside the same browser session that solved the
+                // captcha, and the response is the raw JSON the
+                // extension would have gotten by doing the redemption
+                // itself. No session switch.
+                if let json = body["json"] as? String, !json.isEmpty {
+                    onResponse(json)
+                }
             case "success_token":
+                // Legacy / fallback path: the in-WebView retry didn't
+                // happen (no retry params, fetch threw, etc). Pass
+                // the raw token; the extension does the retry from Go
+                // and hopes VK accepts the session switch.
                 if let token = body["token"] as? String, !token.isEmpty {
                     onToken(token)
                 }
@@ -132,6 +252,16 @@ private struct CaptchaWKWebView: UIViewRepresentable {
                 if let s = body["text"] as? String {
                     onStatus(s)
                 }
+            case "terminal":
+                // Server-rendered failure page ("Attempt limit
+                // reached" etc). The captcha isn't going anywhere,
+                // and the user has no way to recover from inside
+                // the sheet — close it. The Cancel path in the
+                // CaptchaManager fires the cancel IPC so Go's
+                // requestManualCaptcha unblocks immediately rather
+                // than waiting for its 180s timeout.
+                let reason = (body["reason"] as? String) ?? "terminal page"
+                onTerminal(reason)
             default:
                 break
             }
@@ -194,6 +324,63 @@ private struct CaptchaWKWebView: UIViewRepresentable {
         }
     }
 
+    /// JSON-quote a Swift string for embedding into JS source code.
+    /// Handles backslashes, quotes, newlines, etc.
+    fileprivate static func jsString(_ s: String) -> String {
+        let data = try? JSONSerialization.data(withJSONObject: [s], options: [])
+        guard let data = data,
+              let json = String(data: data, encoding: .utf8) else {
+            return "\"\""
+        }
+        // Strip the surrounding [ ... ] so we get just the quoted string.
+        let inner = json.dropFirst().dropLast()
+        // Belt-and-braces: escape "</" so it can't terminate a <script>
+        // tag if the source ever ends up embedded in HTML directly.
+        return String(inner).replacingOccurrences(of: "</", with: "<\\/")
+    }
+
+    // Mock navigator.userAgent + companion fields BEFORE any page JS
+    // runs so VK's classifier sees the Mobile Safari signature instead
+    // of WKWebView's truncated default. customUserAgent on the WKWebView
+    // handles the HTTP request side; this script handles the JS side
+    // (window.navigator.userAgent + navigator.userAgentData + vendor).
+    // Must run at document-start so vk's bootstrap doesn't capture the
+    // un-patched values before us.
+    //
+    // Also strips `navigator.webdriver` (some WKWebView builds set it
+    // to false but the property's mere presence is a tell), and forces
+    // languages to match what an en-US Safari iOS reports.
+    private static let safariUAOverride = """
+    (function() {
+        const ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1";
+        try {
+            Object.defineProperty(navigator, 'userAgent', { get: () => ua, configurable: true });
+        } catch (e) {}
+        try {
+            Object.defineProperty(navigator, 'appVersion', { get: () => ua.replace(/^Mozilla\\//, ''), configurable: true });
+        } catch (e) {}
+        try {
+            Object.defineProperty(navigator, 'vendor', { get: () => 'Apple Computer, Inc.', configurable: true });
+        } catch (e) {}
+        try {
+            Object.defineProperty(navigator, 'platform', { get: () => 'iPhone', configurable: true });
+        } catch (e) {}
+        try {
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'], configurable: true });
+        } catch (e) {}
+        // Real Safari iOS doesn't expose userAgentData (Client Hints).
+        // WKWebView under some configurations does — strip it to match.
+        try { delete navigator.userAgentData; } catch (e) {}
+        // Drop the webdriver flag entirely. Real Safari has no such
+        // property; WKWebView sets it (usually false). Presence ≠
+        // absence to a fingerprinter.
+        try { delete navigator.webdriver; } catch (e) {}
+        try {
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true });
+        } catch (e) {}
+    })();
+    """
+
     // Injected as document-start so we patch fetch/XHR before VK's page code
     // gets a chance to fire. Looks for any response from `captchaNotRobot.*`
     // that carries `success_token`, and also polls the URL / page text as a
@@ -202,6 +389,45 @@ private struct CaptchaWKWebView: UIViewRepresentable {
     (function() {
         function send(payload) {
             try { window.webkit.messageHandlers.captcha.postMessage(payload); } catch (e) {}
+        }
+
+        // Once true, no more sends — first solve wins.
+        let solved = false;
+
+        // When the captcha helper grabs success_token, this runs.
+        // If window.__capRetry is set (retryUrl + retryBody from the
+        // extension), do the follow-up VK API call inside this
+        // browser session — same cookies, same TLS, same IP, no
+        // session switch for VK to flag. Send the JSON response as
+        // 'final_response'. Fall back to sending the raw token on any
+        // hiccup so the legacy Go-side retry still gets a chance.
+        function handleSuccessToken(token) {
+            if (solved) return;
+            solved = true;
+            const cfg = window.__capRetry;
+            if (!cfg || !cfg.url || !cfg.body) {
+                send({type: 'success_token', token: token});
+                return;
+            }
+            const body = cfg.body.replace(/__TOKEN__/g, encodeURIComponent(token));
+            send({type: 'status', text: 'Redeeming token in-session…'});
+            fetch(cfg.url, {
+                method: 'POST',
+                credentials: 'include',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: body
+            }).then(function(r) { return r.text(); })
+              .then(function(text) {
+                  if (text && text.length > 0) {
+                      send({type: 'final_response', json: text});
+                  } else {
+                      send({type: 'success_token', token: token});
+                  }
+              })
+              .catch(function(e) {
+                  send({type: 'status', text: 'In-session retry failed: ' + e});
+                  send({type: 'success_token', token: token});
+              });
         }
 
         function maybeTokenFromText(text) {
@@ -227,7 +453,7 @@ private struct CaptchaWKWebView: UIViewRepresentable {
                         try {
                             res.clone().text().then(function(text) {
                                 const t = maybeTokenFromText(text);
-                                if (t) send({type:'success_token', token: t});
+                                if (t) handleSuccessToken(t);
                             });
                         } catch (e) {}
                     }).catch(function() {});
@@ -236,7 +462,16 @@ private struct CaptchaWKWebView: UIViewRepresentable {
             };
         }
 
-        // XHR hook
+        // XHR hook. Two hooks because VK sites use both:
+        //   - Override of xhr.onreadystatechange catches code that
+        //     sets the handler via property assignment.
+        //   - addEventListener('load', ...) catches code that
+        //     subscribes via the event listener API. Without this
+        //     second hook, sites that prefer addEventListener (which
+        //     is increasingly the norm for SPA frameworks) fire their
+        //     handlers without our knowledge — we miss the response
+        //     and the captcha sheet looks stuck even though VK has
+        //     already issued the success_token.
         const origOpen = XMLHttpRequest.prototype.open;
         const origSend = XMLHttpRequest.prototype.send;
         XMLHttpRequest.prototype.open = function(method, url) {
@@ -245,12 +480,25 @@ private struct CaptchaWKWebView: UIViewRepresentable {
         };
         XMLHttpRequest.prototype.send = function() {
             const xhr = this;
+            // load-event hook (independent of any onreadystatechange).
+            try {
+                xhr.addEventListener('load', function() {
+                    try {
+                        if (xhr.__cap_url &&
+                            String(xhr.__cap_url).indexOf('captchaNotRobot') !== -1) {
+                            const t = maybeTokenFromText(xhr.responseText);
+                            if (t) handleSuccessToken(t);
+                        }
+                    } catch (e) {}
+                });
+            } catch (e) {}
+            // onreadystatechange wrap (catches direct property assignment).
             const prev = xhr.onreadystatechange;
             xhr.onreadystatechange = function() {
                 if (xhr.readyState === 4 && xhr.__cap_url &&
                     String(xhr.__cap_url).indexOf('captchaNotRobot') !== -1) {
                     const t = maybeTokenFromText(xhr.responseText);
-                    if (t) send({type:'success_token', token: t});
+                    if (t) handleSuccessToken(t);
                 }
                 if (typeof prev === 'function') return prev.apply(this, arguments);
             };
@@ -262,13 +510,13 @@ private struct CaptchaWKWebView: UIViewRepresentable {
             try {
                 const data = ev.data;
                 if (data && typeof data === 'object') {
-                    if (data.success_token) send({type:'success_token', token: data.success_token});
+                    if (data.success_token) handleSuccessToken(data.success_token);
                     if (data.type === 'captcha_success' && data.token) {
-                        send({type:'success_token', token: data.token});
+                        handleSuccessToken(data.token);
                     }
                 } else if (typeof data === 'string') {
                     const t = maybeTokenFromText(data);
-                    if (t) send({type:'success_token', token: t});
+                    if (t) handleSuccessToken(t);
                 }
             } catch (e) {}
         });
@@ -285,10 +533,38 @@ private struct CaptchaWKWebView: UIViewRepresentable {
                         const params = new URLSearchParams(u.hash.replace(/^#/, ''));
                         t = params.get('success_token');
                     }
-                    if (t) send({type:'success_token', token: t});
+                    if (t) handleSuccessToken(t);
                 } catch (e) {}
             }
         }, 250);
+
+        // Terminal-state polling. VK renders some failure pages
+        // server-side as plain HTML — no XHR for our fetch/XHR hooks
+        // to catch — so the only way to detect them is to inspect
+        // the rendered DOM text. When found, fire 'terminal' so
+        // native dismisses the sheet instead of leaving the user
+        // staring at a dead end (the most common: "Attempt limit
+        // reached", which the user has to currently kill the whole
+        // app to escape).
+        const terminalPatterns = [
+            /attempt[\\s_]?limit[\\s_]?reached/i,
+            /превышен[оа]?\\s*колич/i,
+            /попыток.*исчерпан/i,
+            /please\\s*try\\s*again\\s*later/i,
+            /повторите\\s*попытку\\s*позже/i,
+        ];
+        let terminalFired = false;
+        setInterval(function() {
+            if (solved || terminalFired || !document.body) return;
+            const txt = document.body.innerText || '';
+            for (let i = 0; i < terminalPatterns.length; i++) {
+                if (terminalPatterns[i].test(txt)) {
+                    terminalFired = true;
+                    send({type:'terminal', reason: txt.slice(0, 200)});
+                    return;
+                }
+            }
+        }, 750);
 
         send({type:'status', text:'Loaded captcha helper'});
     })();

@@ -34,6 +34,23 @@ final class CaptchaManager: ObservableObject {
             .deliverImmediately
         )
 
+        // Cancel notification fired from the extension when the tunnel
+        // stops: the pending prompt is unanswerable, drop it so the
+        // sheet dismisses instead of trapping the user on a dead page.
+        let cancelName = CaptchaIPC.cancelDarwinNotification as CFString
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            observer,
+            { _, observer, _, _, _ in
+                guard let observer = observer else { return }
+                let mgr = Unmanaged<CaptchaManager>.fromOpaque(observer).takeUnretainedValue()
+                Task { @MainActor in mgr.refresh() }
+            },
+            cancelName,
+            nil,
+            .deliverImmediately
+        )
+
         // Also refresh on becoming active in case the notification arrived while
         // the app was suspended.
         NotificationCenter.default.addObserver(
@@ -66,22 +83,52 @@ final class CaptchaManager: ObservableObject {
         pending = req
     }
 
+    /// WebView extracted just the success_token (legacy or fallback
+    /// when the in-WebView retry failed). The extension will do the
+    /// VK API retry itself — VK may reject because of session
+    /// mismatch.
+    ///
+    /// clearPending() runs BEFORE sendMessage so the sheet dismisses
+    /// the instant the WebView reports a result, even if the IPC
+    /// (NETunnelProviderSession.sendProviderMessage) is slow or
+    /// hangs for some reason. We've observed sheets getting stuck
+    /// on "Got response, finishing…" when the IPC took its time;
+    /// users had no way out except kill the app.
     func submit(token: String) async {
         guard let req = pending else { return }
-        await sendMessage(.init(type: "captcha_answer",
-                                requestId: req.requestId,
-                                successToken: token,
-                                reason: nil))
+        let msg = CaptchaIPC.AppMessage(type: "captcha_answer",
+                                        requestId: req.requestId,
+                                        successToken: token,
+                                        reason: nil,
+                                        responseJson: nil)
         clearPending()
+        await sendMessage(msg)
+    }
+
+    /// WebView solved the captcha AND replayed the failing VK API
+    /// call in the same browser session. This is what we want: VK
+    /// sees a single coherent session for both the solve and the
+    /// redemption, no fingerprint switch.
+    func submit(response: String) async {
+        guard let req = pending else { return }
+        let msg = CaptchaIPC.AppMessage(type: "captcha_answer",
+                                        requestId: req.requestId,
+                                        successToken: nil,
+                                        reason: nil,
+                                        responseJson: response)
+        clearPending()
+        await sendMessage(msg)
     }
 
     func cancel(reason: String = "user cancelled") async {
         guard let req = pending else { return }
-        await sendMessage(.init(type: "captcha_cancel",
-                                requestId: req.requestId,
-                                successToken: nil,
-                                reason: reason))
+        let msg = CaptchaIPC.AppMessage(type: "captcha_cancel",
+                                        requestId: req.requestId,
+                                        successToken: nil,
+                                        reason: reason,
+                                        responseJson: nil)
         clearPending()
+        await sendMessage(msg)
     }
 
     // MARK: - Private

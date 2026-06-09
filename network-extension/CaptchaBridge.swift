@@ -14,6 +14,10 @@ enum CaptchaIPC {
         let requestId: String
         let successToken: String?
         let reason: String?
+        /// New (1.3.24+): full JSON response when the WebView replayed
+        /// the failing VK call inside its own session. See the
+        /// matching field in TurnBridge/CaptchaIPC.swift.
+        let responseJson: String?
     }
 
     /// Persistent payload the extension writes when it needs the app to solve a captcha.
@@ -21,6 +25,9 @@ enum CaptchaIPC {
         let requestId: String
         let redirectUri: String
         let createdAt: TimeInterval
+        /// New (1.3.24+): see TurnBridge/CaptchaIPC.swift.
+        let retryUrl: String?
+        let retryBody: String?
     }
 }
 
@@ -46,11 +53,32 @@ enum CaptchaBridge {
     fileprivate static func publishRequest(requestId: String, redirectUri: String) {
         SharedLogger.info("Manual captcha requested (reqID=\(requestId))", source: .tunnel)
 
+        // Pull the retry-request template from Go. When set, the
+        // WebView will POST the body to this URL after extracting
+        // success_token, INSIDE its own browser session — VK then
+        // sees a single coherent session for both captcha solve and
+        // the follow-up API call. Free the C string after parsing.
+        var retryUrl: String?
+        var retryBody: String?
+        requestId.withCString { reqIDC in
+            if let cStr = TurnBridgeGetManualCaptchaRetryRequest(reqIDC) {
+                defer { free(UnsafeMutablePointer(mutating: cStr)) }
+                let json = String(cString: cStr)
+                if let data = json.data(using: .utf8),
+                   let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
+                    retryUrl = parsed["url"]
+                    retryBody = parsed["body"]
+                }
+            }
+        }
+
         if let defaults = UserDefaults(suiteName: CaptchaIPC.appGroupID) {
             let payload = CaptchaIPC.PendingRequest(
                 requestId: requestId,
                 redirectUri: redirectUri,
-                createdAt: Date().timeIntervalSince1970
+                createdAt: Date().timeIntervalSince1970,
+                retryUrl: retryUrl,
+                retryBody: retryBody
             )
             if let data = try? JSONEncoder().encode(payload) {
                 defaults.set(data, forKey: CaptchaIPC.requestUserDefaultsKey)
@@ -74,13 +102,28 @@ enum CaptchaBridge {
 
         switch msg.type {
         case "captcha_answer":
-            let token = msg.successToken ?? ""
-            msg.requestId.withCString { reqIDC in
-                token.withCString { tokenC in
-                    TurnBridgeSubmitManualCaptchaToken(reqIDC, tokenC)
+            // Prefer the full JSON response (the WebView did the retry
+            // itself, so getCreds can skip its own redemption call).
+            // Fall through to the legacy token-only path when the
+            // WebView fell back to just extracting success_token
+            // (network error during the in-WebView fetch, retryUrl
+            // wasn't provided, etc).
+            if let resp = msg.responseJson, !resp.isEmpty {
+                msg.requestId.withCString { reqIDC in
+                    resp.withCString { respC in
+                        TurnBridgeSubmitManualCaptchaResponse(reqIDC, respC)
+                    }
                 }
+                SharedLogger.info("CaptchaBridge: delivered full response (\(resp.count) bytes) for reqID=\(msg.requestId)", source: .tunnel)
+            } else {
+                let token = msg.successToken ?? ""
+                msg.requestId.withCString { reqIDC in
+                    token.withCString { tokenC in
+                        TurnBridgeSubmitManualCaptchaToken(reqIDC, tokenC)
+                    }
+                }
+                SharedLogger.info("CaptchaBridge: delivered success_token for reqID=\(msg.requestId)", source: .tunnel)
             }
-            SharedLogger.info("CaptchaBridge: delivered success_token for reqID=\(msg.requestId)", source: .tunnel)
 
         case "captcha_cancel":
             let reason = msg.reason ?? "user cancelled"
@@ -101,5 +144,23 @@ enum CaptchaBridge {
             defaults.removeObject(forKey: CaptchaIPC.requestUserDefaultsKey)
         }
         return Data("ok".utf8)
+    }
+
+    /// Called from stopTunnel: the Go side is going away, so any
+    /// pending captcha prompt can never be answered. Clear the
+    /// published request and tell the app to drop its sheet --
+    /// otherwise the user keeps solving captchas into a dead session
+    /// (1.3.27 field log: tunnel died with stop reason 9 four seconds
+    /// after the first sheet appeared; the sheet stayed up for 20+
+    /// minutes while the user kept solving into the void).
+    static func teardown() {
+        if let defaults = UserDefaults(suiteName: CaptchaIPC.appGroupID) {
+            defaults.removeObject(forKey: CaptchaIPC.requestUserDefaultsKey)
+        }
+        let name = CFNotificationName(CaptchaIPC.cancelDarwinNotification as CFString)
+        CFNotificationCenterPostNotification(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            name, nil, nil, true
+        )
     }
 }

@@ -25,13 +25,13 @@ import (
     "net"
     "net/http"
 	neturl "net/url"
+    "strconv"
     "sync"
     "sync/atomic"
     "time"
     "unsafe"
     "strings"
 
-    "github.com/cbeuw/connutil"
     "github.com/google/uuid"
     "github.com/pion/dtls/v3"
     "github.com/pion/dtls/v3/pkg/crypto/selfsign"
@@ -76,7 +76,33 @@ func ProxyForceReconnect() {
 	for _, c := range cancels {
 		c()
 	}
+	// Network-path changes (which is what triggers a force-reconnect
+	// 90% of the time) are exactly when half-dead persistConns
+	// accumulate in the HTTP idle pool — IdleConnTimeout=90s won't
+	// catch them because the socket isn't naturally idle, it's
+	// silently broken. Drop them all so the next captcha solve
+	// dials fresh sockets instead of reusing zombies.
+	flushHTTPIdleConns()
 	log.Printf("ProxyForceReconnect: cancelled %d live session(s)", len(cancels))
+}
+
+// sleepCtx blocks for d, returning early (with ctx.Err()) if ctx
+// fires first. Unlike `select { case <-ctx.Done(): case <-time.After(d): }`,
+// this releases the underlying Timer immediately when ctx wins —
+// so it doesn't leak a Timer object + runtime goroutine on every
+// abandoned wait. In a DTLS reconnect storm this accumulates fast.
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 
@@ -121,6 +147,31 @@ func init() {
 
 type getCredsFunc func(context.Context, string) (string, string, string, error)
 
+// sharedAuthClient is the package-level HTTP client used by getCreds
+// for the 8-RT VK auth + identity-registration pipeline. Sharing one
+// client across every getCreds invocation amortises TLS handshakes
+// (~300-500 ms each) over the connection pool — previously each
+// getCreds built a fresh http.Client whose defer CloseIdleConnections
+// destroyed the idle pool the moment the function returned, so every
+// one of 4×N=200 round trips paid full handshake cost. The captcha
+// solver uses its own client (newCaptchaClient) because it needs a
+// per-attempt cookie jar.
+var sharedAuthClient = &http.Client{
+	Timeout: 20 * time.Second,
+	Transport: &http.Transport{
+		// customDial layers system DNS → DoH (1.1.1.1) → hardcoded
+		// VK fallback IPs. Russian mobile carriers regularly
+		// NXDOMAIN login.vk.com / api.vk.com, so without this
+		// fallback the very first get_anonym_token POST dies on
+		// lookup before any captcha logic engages. See
+		// dns_resolver.go.
+		DialContext:         customDial,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 func getCreds(ctx context.Context, link string) (resUser string, resPass string, resTurn string, resErr error) {
     profile := getRandomProfile()
     name := generateName()
@@ -129,23 +180,6 @@ func getCreds(ctx context.Context, link string) (resUser string, resPass string,
     log.Printf("Connecting - Name: %s | UA: %s", name, profile.UserAgent)
 
 	doRequest := func(data string, url string) (resp map[string]interface{}, err error) {
-
-		client := &http.Client{
-			Timeout: 20 * time.Second,
-			Transport: &http.Transport{
-				// customDial layers system DNS → DoH (1.1.1.1) →
-				// hardcoded VK fallback IPs. Russian mobile carriers
-				// regularly NXDOMAIN login.vk.ru / api.vk.ru, so
-				// without this fallback the very first
-				// get_anonym_token POST dies on lookup before any
-				// captcha logic engages. See dns_resolver.go.
-				DialContext:         customDial,
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 100,
-				IdleConnTimeout:     90 * time.Second,
-			},
-		}
-		defer client.CloseIdleConnections()
 		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer([]byte(data)))
 		if err != nil {
 			return nil, err
@@ -154,7 +188,7 @@ func getCreds(ctx context.Context, link string) (resUser string, resPass string,
 		req.Header.Add("User-Agent", profile.UserAgent)
 		req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 
-		httpResp, err := client.Do(req)
+		httpResp, err := sharedAuthClient.Do(req)
 		if err != nil {
 			return nil, err
 		}
@@ -217,15 +251,70 @@ func getCreds(ctx context.Context, link string) (resUser string, resPass string,
                 if captchaErr.IsCaptchaError() {
                     log.Printf("[Captcha] Attempt %d/%d: solving...", attempt+1, maxCaptchaAttempts)
 
-                    successToken, solveErr := solveVkCaptcha(ctx, captchaErr)
-                    if solveErr != nil {
-                        return "", "", "", fmt.Errorf("captcha solve error: %v", solveErr)
-                    }
-
                     if captchaErr.CaptchaAttempt == "0" || captchaErr.CaptchaAttempt == "" {
                         captchaErr.CaptchaAttempt = "1"
                     }
 
+                    // Build the retry body template up front so the
+                    // WebView can replay it inside the same browser
+                    // session that solved the captcha — VK then sees
+                    // one coherent actor (cookies / fingerprint / IP)
+                    // instead of "token minted here, redeemed
+                    // somewhere else". Literal "__TOKEN__" gets swapped
+                    // for the actual success_token inside the WebView's
+                    // injected JS. WebView passes the JSON response
+                    // back via TurnBridgeSubmitManualCaptchaResponse;
+                    // see solveVkCaptcha's return shape.
+                    retryURL := reqURL
+                    retryBody := fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s"+
+                        "&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=__TOKEN__"+
+                        "&captcha_ts=%s&captcha_attempt=%s&access_token=%s",
+                        link, escapedName, captchaErr.CaptchaSid,
+                        captchaErr.CaptchaTs, captchaErr.CaptchaAttempt, token1)
+
+                    successToken, manualResp, solveErr := solveVkCaptcha(ctx, captchaErr, retryURL, retryBody)
+                    if solveErr != nil {
+                        // %w not %v: lets getCredsRouted unwrap and
+                        // check for errDeferToRemote sentinel.
+                        return "", "", "", fmt.Errorf("captcha solve error: %w", solveErr)
+                    }
+
+                    if manualResp != "" {
+                        // WebView did the retry itself and gave us back
+                        // the final JSON response. Splice it into the
+                        // outer for-loop's resp variable so the next
+                        // iteration of the loop (which checks resp for
+                        // error vs success) sees what we'd have gotten
+                        // from our own doRequest. Then `continue` —
+                        // but with a special marker: we set data to
+                        // empty so the next doRequest call would be a
+                        // no-op; instead we short-circuit by parsing
+                        // here.
+                        var parsed map[string]interface{}
+                        if jerr := json.Unmarshal([]byte(manualResp), &parsed); jerr != nil {
+                            return "", "", "", fmt.Errorf("manual captcha response not JSON: %v (raw=%s)", jerr, manualResp)
+                        }
+                        resp = parsed
+                        if errObj2, hasErr := resp["error"].(map[string]interface{}); hasErr {
+                            return "", "", "", fmt.Errorf("VK API error in manual-retry response: %v", errObj2)
+                        }
+                        rspObj, ok := resp["response"].(map[string]interface{})
+                        if !ok {
+                            return "", "", "", fmt.Errorf("manual-retry response missing 'response' field: %s", manualResp)
+                        }
+                        tok, ok := rspObj["token"].(string)
+                        if !ok || tok == "" {
+                            return "", "", "", fmt.Errorf("manual-retry response missing token: %s", manualResp)
+                        }
+                        token2 = tok
+                        log.Printf("[Captcha] Used in-WebView retry response, token2 acquired")
+                        break // exit the for-attempt loop with token2 set
+                    }
+
+                    // Legacy path: WebView gave us just the token, do
+                    // the retry ourselves from Go's HTTP client. VK
+                    // may reject because of session mismatch — that's
+                    // the failure mode the response_path above fixes.
                     data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s"+
                         "&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s"+
                         "&captcha_ts=%s&captcha_attempt=%s&access_token=%s",
@@ -320,7 +409,12 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
     unregister := registerSession(dtlscancel)
     defer unregister()
     var conn1, conn2 net.PacketConn
-    conn1, conn2 = connutil.AsyncPacketPipe()
+    conn1, conn2 = boundedPacketPipe()
+    // Bounded pipe caps in-flight queue per direction at
+    // boundedPipeDepth packets; overflow drops with UDP semantics.
+    // Closing conn1 tears down both ends — pipePair shares one
+    // closed-channel that both pipeConns select on.
+    defer conn1.Close()
     go func() {
         for {
             select {
@@ -429,12 +523,28 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
         dtlsConn.SetDeadline(time.Now())
     })
 
-    // Watchdog: if no inbound bytes from dtlsConn for >60s, force a
-    // restart. With WG's PersistentKeepalive=25 we should be seeing
-    // traffic every few seconds; a long silence means the TURN
-    // allocation died or the network changed under us.
+    // Watchdog: catch sessions that were healthy then went silent. The
+    // narrow case it must catch: TURN allocation gets quietly killed
+    // (relay timeout, server restart, NAT rebinding) while DTLS stays
+    // up — wg→dtls writes keep "succeeding" into the void.
+    //
+    // The case it must NOT trigger on: DTLS handshake succeeded, WG
+    // came up, but the fanout dispatcher never round-robined a packet
+    // into this session yet. At N=60 only ~1/N sessions sees the WG
+    // keepalive every 25 s, so most sessions sit idle for minutes
+    // before being useful. Killing them on a 60 s timer just because
+    // they're idle-but-healthy created a reconnect storm: every cull
+    // burns a captcha solve, VK rate-limits, the replacement also
+    // gets culled, repeat. Memory was fine (1.3.12), throughput
+    // wasn't.
+    //
+    // Distinguishing the two: lastRxNanos starts at 0 (not now()),
+    // bumped to time.Now() on the first dtlsConn.Read in the read
+    // loop below. Watchdog only fires after lastRxNanos has actually
+    // been bumped — i.e., we've proven this session can carry
+    // traffic. Sessions that never get data sit and let minimal
+    // TURN's half-lifetime Refresh keep the allocation alive.
     var lastRxNanos atomic.Int64
-    lastRxNanos.Store(time.Now().UnixNano())
     go func() {
         ticker := time.NewTicker(15 * time.Second)
         defer ticker.Stop()
@@ -443,7 +553,11 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
             case <-dtlsctx.Done():
                 return
             case now := <-ticker.C:
-                last := time.Unix(0, lastRxNanos.Load())
+                lastNanos := lastRxNanos.Load()
+                if lastNanos == 0 {
+                    continue // session has never received data yet, give it room
+                }
+                last := time.Unix(0, lastNanos)
                 if now.Sub(last) > 60*time.Second {
                     log.Printf("Watchdog: no inbound DTLS traffic for %s — forcing restart", now.Sub(last).Round(time.Second))
                     dtlscancel()
@@ -464,7 +578,8 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
     go func() {
         defer wg.Done()
         defer dtlscancel()
-        buf := make([]byte, 1600)
+        buf := borrowReadBuf()
+        defer returnReadBuf(buf)
         for {
             select {
             case <-dtlsctx.Done():
@@ -491,7 +606,8 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
     go func() {
         defer wg.Done()
         defer dtlscancel()
-        buf := make([]byte, 1600)
+        buf := borrowReadBuf()
+        defer returnReadBuf(buf)
         for {
             select {
             case <-dtlsctx.Done():
@@ -533,11 +649,31 @@ func (c *connectedUDPConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 }
 
 type turnParams struct {
-	host     string
-	port     string
-	link     string
+	host string
+	port string
+	// links is a non-empty list of VK call-join links. The first
+	// call to nextLink returns links[0], then [1], rolling over
+	// after the last entry. With N>1 we hypothesise VK keys its
+	// per-IP captcha rate-limit on (source-IP, link) so spreading
+	// solves across multiple call IDs multiplies the effective
+	// budget proportionally. Also gives a chance of landing on
+	// different turn_server.urls[0] relays, each with its own
+	// voice-grade shaper. linkCursor advances atomically so
+	// concurrent oneTurnConnections don't all hit the same link
+	// simultaneously.
+	links      []string
+	linkCursor atomic.Uint64
+
 	udp      bool
 	getCreds getCredsFunc
+}
+
+func (p *turnParams) nextLink() string {
+	if len(p.links) == 0 {
+		return ""
+	}
+	idx := p.linkCursor.Add(1) - 1
+	return p.links[int(idx)%len(p.links)]
 }
 
 func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UDPAddr, conn2 net.PacketConn, c chan<- error) {
@@ -561,7 +697,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 			time.Since(sessionStart).Round(time.Millisecond),
 			conn2ToRelay.Load(), relayToConn2.Load(), err)
 	}()
-	user, pass, url, err1 := turnParams.getCreds(ctx, turnParams.link)
+	user, pass, url, err1 := turnParams.getCreds(ctx, turnParams.nextLink())
 	if err1 != nil {
 		err = fmt.Errorf("failed to get TURN credentials: %s", err1)
 		return
@@ -624,51 +760,64 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 		}()
 		turnConn = turn.NewSTUNConn(conn)
 	}
-	var addrFamily turn.RequestedAddressFamily
-	if peer.IP.To4() != nil {
-		addrFamily = turn.RequestedAddressFamilyIPv4
-	} else {
-		addrFamily = turn.RequestedAddressFamilyIPv6
-	}
-	// Start a new TURN Client and wrap our net.Conn in a STUNConn
-	// This allows us to simulate datagram based communication over a net.Conn
-	cfg = &turn.ClientConfig{
-		STUNServerAddr:         turnServerAddr,
-		TURNServerAddr:         turnServerAddr,
-		Conn:                   turnConn,
-		Username:               user,
-		Password:               pass,
-		RequestedAddressFamily: addrFamily,
-		LoggerFactory:          logging.NewDefaultLoggerFactory(),
-	}
+	// useMinimalTURN swaps pion/turn for the in-tree minimal client
+	// (turn_min.go). Re-enabled in 1.3.11 after fixing the 1.3.9 bug:
+	// MessageIntegrity.AddTo was computing HMAC over m.Raw with the
+	// STUN magic cookie still zero (Encode wrote it later), so the
+	// server's recomputed HMAC over the wire bytes never matched →
+	// 401 on every authenticated allocate. Fixed by calling
+	// m.WriteHeader() right after NewTransactionID() in all three
+	// builders (allocate, channelBind, refresh).
+	const useMinimalTURN = true
 
-	client, err1 := turn.NewClient(cfg)
-	if err1 != nil {
-		err = fmt.Errorf("failed to create TURN client: %s", err1)
-		return
-	}
-	defer client.Close()
-
-	// Start listening on the conn provided.
-	err1 = client.Listen()
-	if err1 != nil {
-		err = fmt.Errorf("failed to listen: %s", err1)
-		return
-	}
-
-	// Allocate a relay socket on the TURN server. On success, it
-	// will return a net.PacketConn which represents the remote
-	// socket.
-	relayConn, err1 := client.Allocate()
-	if err1 != nil {
-		err = fmt.Errorf("failed to allocate: %s", err1)
-		return
-	}
-	defer func() {
-		if err1 := relayConn.Close(); err1 != nil {
-			err = fmt.Errorf("failed to close TURN allocated connection: %s", err1)
+	var relayConn net.PacketConn
+	if useMinimalTURN {
+		allocCtx, allocCancel := context.WithTimeout(ctx, 15*time.Second)
+		alloc, err1 := minimalTURNAllocate(allocCtx, turnConn, turnServerUdpAddr, user, pass, peer)
+		allocCancel()
+		if err1 != nil {
+			err = fmt.Errorf("failed to allocate (minimal): %s", err1)
+			return
 		}
-	}()
+		relayConn = alloc
+		defer alloc.Close()
+	} else {
+		var addrFamily turn.RequestedAddressFamily
+		if peer.IP.To4() != nil {
+			addrFamily = turn.RequestedAddressFamilyIPv4
+		} else {
+			addrFamily = turn.RequestedAddressFamilyIPv6
+		}
+		cfg = &turn.ClientConfig{
+			STUNServerAddr:         turnServerAddr,
+			TURNServerAddr:         turnServerAddr,
+			Conn:                   turnConn,
+			Username:               user,
+			Password:               pass,
+			RequestedAddressFamily: addrFamily,
+			LoggerFactory:          logging.NewDefaultLoggerFactory(),
+		}
+		client, err1 := turn.NewClient(cfg)
+		if err1 != nil {
+			err = fmt.Errorf("failed to create TURN client: %s", err1)
+			return
+		}
+		defer client.Close()
+		if err1 = client.Listen(); err1 != nil {
+			err = fmt.Errorf("failed to listen: %s", err1)
+			return
+		}
+		relayConn, err1 = client.Allocate()
+		if err1 != nil {
+			err = fmt.Errorf("failed to allocate: %s", err1)
+			return
+		}
+		defer func() {
+			if err1 := relayConn.Close(); err1 != nil {
+				err = fmt.Errorf("failed to close TURN allocated connection: %s", err1)
+			}
+		}()
+	}
 
 	// The relayConn's local address is actually the transport
 	// address assigned on the TURN server.
@@ -676,7 +825,17 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 
 	wg := sync.WaitGroup{}
 	wg.Add(2)
-	turnctx, turncancel := context.WithCancel(context.Background())
+	// Derive turnctx from the parent ctx (StartProxy's, via
+	// oneTurnConnectionLoop). Previously this was rooted at
+	// context.Background(), so StopProxy / Disconnect only cancelled
+	// proxy-ctx — the two read-loop goroutines below kept blocking
+	// on conn2.ReadFrom forever (conn2 is an AsyncPacketPipe with no
+	// natural close trigger). ProxyForceReconnect happened to work
+	// because it iterates the session registry and calls turncancel
+	// directly, but StopProxy doesn't. Result: every session
+	// abandoned via StopProxy left one wedged goroutine behind, plus
+	// its conn2 pipe in memory.
+	turnctx, turncancel := context.WithCancel(ctx)
 	unregister := registerSession(turncancel)
 	defer unregister()
 	context.AfterFunc(turnctx, func() {
@@ -687,12 +846,39 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 			log.Printf("Failed to set upstream deadline: %s", err)
 		}
 	})
+	// SRTP/Opus mimicry layer (see wrap.go). Built per session
+	// because each wrapConn has its own random SSRC/sessionID/counter
+	// init — if all sessions shared a wrapConn, the SSRC + monotonic
+	// seq would tag every TURN allocation as "the same call leg",
+	// which is a coarser fingerprint than what real VK call traffic
+	// looks like. nil wrap = bypass and use the legacy direct
+	// conn2↔relayConn path; the key takes effect on the NEXT
+	// allocation after the user changes it, not on already-live
+	// ones (mid-stream AEAD key rotation isn't worth the complexity).
+	var wrap *wrapConn
+	if key := currentWrapKey(); key != nil {
+		if w, werr := newWrapConn(key, false); werr != nil {
+			log.Printf("wrap: session disabled — newWrapConn: %v", werr)
+		} else {
+			wrap = w
+		}
+	}
+
 	var addr atomic.Value
 	// Start read-loop on conn2 (output of DTLS)
 	go func() {
 		defer wg.Done()
 		defer turncancel()
-		buf := make([]byte, 1600)
+		buf := borrowReadBuf()
+		defer returnReadBuf(buf)
+		// wireBuf carries the wrapped (SRTP-shaped) bytes when wrap
+		// is on. +wrapOverhead headroom over the DTLS payload max.
+		// Allocated once per goroutine — borrowing from readBufPool
+		// won't help because the pool's slices are exactly 1600.
+		var wireBuf []byte
+		if wrap != nil {
+			wireBuf = make([]byte, len(buf)+wrapOverhead)
+		}
 		for {
 			select {
 			case <-turnctx.Done():
@@ -707,7 +893,17 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 
 			addr.Store(addr1) // store peer
 
-			_, err1 = relayConn.WriteTo(buf[:n], peer)
+			out := buf[:n]
+			if wrap != nil {
+				wn, werr := wrap.wrapInto(wireBuf, buf[:n])
+				if werr != nil {
+					log.Printf("wrap: wrapInto failed: %v", werr)
+					return
+				}
+				out = wireBuf[:wn]
+			}
+
+			_, err1 = relayConn.WriteTo(out, peer)
 			if err1 != nil {
 				log.Printf("Failed: %s", err1)
 				return
@@ -720,7 +916,14 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	go func() {
 		defer wg.Done()
 		defer turncancel()
-		buf := make([]byte, 1600)
+		buf := borrowReadBuf()
+		defer returnReadBuf(buf)
+		// plainBuf carries the unwrapped DTLS bytes when wrap is on.
+		// Unwrapped is always smaller than wrapped, so 1600 is plenty.
+		var plainBuf []byte
+		if wrap != nil {
+			plainBuf = make([]byte, len(buf))
+		}
 		for {
 			select {
 			case <-turnctx.Done():
@@ -738,7 +941,23 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 				return
 			}
 
-			_, err1 = conn2.WriteTo(buf[:n], addr1)
+			out := buf[:n]
+			if wrap != nil {
+				un, werr := wrap.unwrapPacket(buf[:n], plainBuf)
+				if werr != nil {
+					// AEAD failure here means the peer end didn't
+					// wrap (server-side wrap not configured / wrong
+					// key) — drop the packet rather than tear down
+					// the whole session, since a stray non-wrapped
+					// packet on a wrap-enabled session is a real
+					// possibility right at session bring-up.
+					log.Printf("wrap: unwrap dropped: %v", werr)
+					continue
+				}
+				out = plainBuf[:un]
+			}
+
+			_, err1 = conn2.WriteTo(out, addr1)
 			if err1 != nil {
 				log.Printf("Failed: %s", err1)
 				return
@@ -798,10 +1017,8 @@ func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConnCha
 				backoff = reconnectBackoff(backoff, false)
 				if backoff > 0 {
 					log.Printf("DTLS reconnect in %s", backoff.Round(time.Millisecond))
-					select {
-					case <-ctx.Done():
+					if err := sleepCtx(ctx, backoff); err != nil {
 						return
-					case <-time.After(backoff):
 					}
 				}
 			} else {
@@ -828,10 +1045,8 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 					backoff = reconnectBackoff(backoff, false)
 					if backoff > 0 {
 						log.Printf("TURN reconnect in %s", backoff.Round(time.Millisecond))
-						select {
-						case <-ctx.Done():
+						if err := sleepCtx(ctx, backoff); err != nil {
 							return
-						case <-time.After(backoff):
 						}
 					}
 				} else {
@@ -845,16 +1060,33 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 
 type turnCred struct {
 	user, pass, addr string
+	acquiredAt       time.Time
 }
+
+// credMaxAge is how long a TURN cred stays usable in the pool. VK
+// rotates TURN allocations roughly every minute, after which Allocate
+// returns 437 (allocation mismatch). Recycling a 90 s-old cred during
+// a reconnect storm just kicks off a brand-new dead TURN session —
+// pion fails fast, the loop reconnects, getCreds returns the same
+// stale cred, and round we go. Capping at 45 s gives a comfortable
+// margin under VK's actual rotation window while still letting the
+// burst-recycle path (fresh creds added in the last ~5 s) work.
+const credMaxAge = 45 * time.Second
 
 // Max concurrent captcha solves against VK. Fully-parallel solves at
 // N=30 trigger VK's anti-bot rate-limit (`ERROR_LIMIT` on
 // captcha.isNotRobot, `status: ERROR` on slider getContent) and the
-// per-IP TURN allocation cap (error 486). Five concurrent solves keeps
-// the captcha pipeline well under VK's threshold while still scaling
-// throughput roughly 5× over fully-serial (which was the d917a0e
-// motivation in the first place).
-const maxConcurrentCaptchaSolves = 5
+// per-IP TURN allocation cap (error 486).
+//
+// Lowered 5 → 3 in 1.3.10: each solve transiently holds an HTTP/TLS
+// client + JSON state + image decode buffer + a handful of stdlib
+// http.Transport goroutines (~1.5-2 MB worth). Under a reconnect
+// storm where sessions die past T+30s, 5 simultaneous solves was
+// adding ~10 MB transient + ~50 net/http goroutines on top of the
+// already-loaded steady-state. 3 keeps almost all the throughput
+// (the binding constraint is VK's per-IP rate-limit, not our
+// concurrency) for ~6 MB lower peak.
+const maxConcurrentCaptchaSolves = 3
 
 func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
 	var mu sync.Mutex
@@ -875,6 +1107,23 @@ func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
 			cTime = time.Time{}
 		}
 
+		// Prune creds older than credMaxAge. Without this both the
+		// cache-hit fast path and the saturation short-circuit would
+		// keep handing out dead identities to oneTurnConnection,
+		// which then 437s on Allocate, dies, reconnects, and burns
+		// another solve attempt. The 45 s budget lines up with VK's
+		// TURN rotation window so any cred in the pool was either
+		// just acquired or is in its useful lifetime.
+		if len(pool) > 0 {
+			fresh := pool[:0]
+			for _, c := range pool {
+				if time.Since(c.acquiredAt) <= credMaxAge {
+					fresh = append(fresh, c)
+				}
+			}
+			pool = fresh
+		}
+
 		// Cache-hit fast path: pool already at capacity, hand out a
 		// rotating cached cred and bail. This path never touches the
 		// solve semaphore — only cold solves are throttled.
@@ -886,26 +1135,63 @@ func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
 			return c.user, c.pass, c.addr, nil
 		}
 
-		// Cache-miss slow path: release the mutex, take a solve slot,
-		// then call f(ctx, link). The mutex is dropped first so we don't
-		// serialise on it while waiting for a slot, and we don't hold
-		// it across the slow solve either. Slot acquisition respects
-		// ctx so a Disconnect during the queue tail bails fast.
+		// Saturation short-circuit. Reconnect loops (oneDtls/oneTurn
+		// ConnectionLoop) call getCreds on every retry, and while the
+		// pool is below poolSize each call would otherwise spin up
+		// another solveVkCaptcha → ERROR_LIMIT → recycle cycle. With
+		// N=50 sessions all hitting VK's rate-limit simultaneously
+		// this snowballs into 100+ doomed captcha attempts per minute
+		// and a fresh TURN allocation per attempt — each of which VK
+		// closes within ~50 s. Detect the burning state and short-
+		// circuit straight to a recycled cred. The cooldown in
+		// directSaturated/tunnelSaturated will auto-clear the streak
+		// after captchaCooldown so this is not permanent — once VK's
+		// rate-limit window expires, real solves resume.
+		if len(pool) > 0 {
+			egressIsTunnel := captchaTunnelEgress.Load()
+			// "currentSat" is the egress this attempt would use by
+			// default. "otherSat" is the egress solveVkCaptcha can
+			// escape to via the force-direct path (cellularDial).
+			// That escape only exists for tunnel → direct, not the
+			// other way around, so when we're already on direct the
+			// short-circuit just looks at directSaturated.
+			currentSat := directSaturated()
+			otherSat := tunnelSaturated()
+			if egressIsTunnel {
+				currentSat, otherSat = tunnelSaturated(), directSaturated()
+			}
+			if currentSat && (otherSat || !egressIsTunnel) {
+				c := pool[idx%len(pool)]
+				idx++
+				cTime = time.Now()
+				mu.Unlock()
+				return c.user, c.pass, c.addr, nil
+			}
+		}
+
+		// Cache-miss slow path: release the mutex, jitter, take a
+		// solve slot, then call f(ctx, link). The mutex is dropped
+		// first so we don't serialise on it while waiting for a slot.
+		// The jitter runs BEFORE slot acquisition so it overlaps the
+		// queue wait instead of holding a slot — previously a 5-slot
+		// pipeline burned 0.75-3 s per slot on jitter alone, halving
+		// effective throughput. Now the slot only covers the actual
+		// PoW + HTTP work. ctx-aware at every step so a Disconnect
+		// during the wait bails fast.
 		mu.Unlock()
+
+		// 1.5-2.5 s pre-slot wait: combined anti-bot pacing (used to
+		// live inside solveVkCaptcha as a fixed 1.5-2.5 s sleep while
+		// the slot was held) and entry desync (used to be a 0-750 ms
+		// post-slot jitter). Both purposes preserved, the slot is
+		// freed earlier.
+		if err := sleepCtx(ctx, time.Duration(1500+rand.Intn(1000))*time.Millisecond); err != nil {
+			return "", "", "", err
+		}
 
 		select {
 		case solveSlot <- struct{}{}:
 		case <-ctx.Done():
-			return "", "", "", ctx.Err()
-		}
-		// 0–750 ms jitter desyncs the first wave so the 5 in-flight
-		// solves don't hit VK's anti-bot in lockstep. Cheap once a
-		// slot is acquired (we're about to do a 5 s network round-trip
-		// anyway), and cheap on hot-path because cache hits skip it.
-		select {
-		case <-time.After(time.Duration(rand.Intn(750)) * time.Millisecond):
-		case <-ctx.Done():
-			<-solveSlot
 			return "", "", "", ctx.Err()
 		}
 		u, p, a, err := f(ctx, link)
@@ -915,7 +1201,7 @@ func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
 		defer mu.Unlock()
 
 		if err == nil {
-			pool = append(pool, turnCred{u, p, a})
+			pool = append(pool, turnCred{u, p, a, time.Now()})
 			cTime = time.Now()
 			log.Printf("Successfully registered User Identity %d/%d", len(pool), poolSize)
 			idx++
@@ -934,13 +1220,68 @@ func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
 	}
 }
 
+// parseLiteralUDPAddr parses "ip:port" without touching the system
+// resolver. The address comes from the iOS profile and is always a
+// literal numeric IP — going through net.ResolveUDPAddr (which dives
+// through getaddrinfo via cgo) trips a transient sandbox-init race
+// where Go's resolver reports "unknown port" for a perfectly valid
+// numeric port. Manual parsing sidesteps the whole resolver path.
+//
+// Also strips Unicode whitespace before parsing: field log showed
+// the iOS side passing "56010 " (port followed by U+2009 THIN
+// SPACE), which strconv.Atoi rejects. Thin spaces tend to sneak in
+// via copy-paste from web UIs where the address is formatted with
+// a narrow non-breaking space for readability — strings.TrimSpace
+// drops every Unicode whitespace including U+2009.
+func parseLiteralUDPAddr(s string) (*net.UDPAddr, error) {
+	s = strings.TrimSpace(s)
+	host, portStr, err := net.SplitHostPort(s)
+	if err != nil {
+		return nil, fmt.Errorf("split host:port %q: %w", s, err)
+	}
+	host = strings.TrimSpace(host)
+	portStr = strings.TrimSpace(portStr)
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return nil, fmt.Errorf("host %q is not a literal IP", host)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
+		return nil, fmt.Errorf("port %q invalid", portStr)
+	}
+	return &net.UDPAddr{IP: ip, Port: port}, nil
+}
+
 //export StartProxy
 func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, cUDP C.int) {
     select { case <-proxyReady: default: }
 
-    link := C.GoString(cLink)
+    rawLink := C.GoString(cLink)
     peerAddrStr := C.GoString(cPeerAddr)
     localAddrStr := C.GoString(cLocalAddr)
+
+    // Parse the link parameter as a list — accept comma OR newline
+    // OR semicolon as separators so the Swift side can stuff
+    // multiple URLs into the existing single-string profile field
+    // without an API break. Empty entries are dropped. Hypothesis
+    // we're testing: VK's per-IP captcha rate-limit might be keyed
+    // on (source-IP, vk_join_link) rather than just source-IP, in
+    // which case M distinct links multiply our effective budget by
+    // roughly M.
+    var links []string
+    for _, sep := range []string{"\n", ",", ";"} {
+        rawLink = strings.ReplaceAll(rawLink, sep, "\n")
+    }
+    for _, l := range strings.Split(rawLink, "\n") {
+        if l = strings.TrimSpace(l); l != "" {
+            links = append(links, l)
+        }
+    }
+    if len(links) == 0 {
+        log.Printf("StartProxy: no usable link in %q, aborting", C.GoString(cLink))
+        return
+    }
+    log.Printf("StartProxy: %d link(s) configured for round-robin: %v", len(links), links)
     
     // host/port: empty by default so we use what VK API returned in
     // turn_server.urls[0]. Override only if you know the TURN endpoint
@@ -948,6 +1289,21 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
     host := ""
     port := ""
     n := int(cN)
+    // Hard cap on N. 1.3.11 re-enables the minimal TURN client (the
+    // auth bug from 1.3.9 is fixed), adds debug.SetMemoryLimit(75MB)
+    // + SetGCPercent(50) + periodic FreeOSMemory, tightens the
+    // captcha solver's HTTP idle pool, and lowers solve concurrency
+    // 5 → 3. The combined memory wins should comfortably support
+    // N=100, but we cap at 60 conservatively until field-tested —
+    // raising it once the new floor is empirically known.
+    const maxN = 60
+    if n > maxN {
+        log.Printf("StartProxy: N=%d capped to %d (iOS memory budget)", n, maxN)
+        n = maxN
+    }
+    if n < 1 {
+        n = 1
+    }
     // udp transport to TURN. true=plain UDP (faster, fragile under loss),
     // false=TCP STUNConn (survives short cellular blips at the cost of HoL).
     udp := cUDP != 0
@@ -957,25 +1313,58 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
     proxyCancel = cancel
     defer cancel()
 
-    peer, err := net.ResolveUDPAddr("udp", peerAddrStr)
+    // Apply Go runtime memory tunings BEFORE any per-session work
+    // spawns goroutines — SetMemoryLimit applies retroactively but
+    // GCPercent is sampled at the next GC cycle, so earlier is
+    // better. See memstats.go for what these do.
+    tuneGoRuntime()
+
+    // Fresh session = fresh manual-captcha quota. See
+    // manualCaptchaQuotaPerSession.
+    resetManualCaptchaQuota()
+
+    // Periodic Go runtime memstats + periodic FreeOSMemory. Pair
+    // with the Swift-side os_proc_available_memory logger to
+    // understand when the extension is approaching iOS's kill
+    // threshold.
+    startMemstatsLogger(ctx)
+
+    // The address is a literal "ip:port" from the iOS profile —
+    // never a hostname. Going through net.ResolveUDPAddr means
+    // routing through getaddrinfo via cgo, which on iOS NE
+    // extensions can transiently fail in the first hundred-or-so
+    // milliseconds of startup because the sandbox networking
+    // subsystem isn't fully wired yet. The failure looks like
+    // "lookup udp/<port>: unknown port" — Go's resolver got a weird
+    // answer from getservbyname() for the port string, even though
+    // the port is numeric and shouldn't need a service lookup at all.
+    // Parsing host+port ourselves bypasses the resolver entirely.
+    peer, err := parseLiteralUDPAddr(peerAddrStr)
     if err != nil {
         log.Printf("Resolve UDP error: %v", err)
         return
     }
 
-    parts := strings.Split(link, "join/")
-    link = parts[len(parts)-1]
-
-    if idx := strings.IndexAny(link, "/?#"); idx != -1 {
-        link = link[:idx]
+    // Normalise each link to the bare "joinID" used in the VK API
+    // body: strip the "vk.com/call/join/" prefix and any trailing
+    // path/query/fragment. Applied per-link so a mixed paste of
+    // full URLs and bare IDs both work.
+    for i, l := range links {
+        if parts := strings.Split(l, "join/"); len(parts) > 1 {
+            l = parts[len(parts)-1]
+        }
+        if idx := strings.IndexAny(l, "/?#"); idx != -1 {
+            l = l[:idx]
+        }
+        links[i] = l
     }
 
 	params := &turnParams{
 		host:     host,
 		port:     port,
-		link:     link,
+		links:    links,
 		udp:      udp,
-		getCreds: poolCreds(getCreds, n),
+		getCreds: poolCreds(getCredsRouted, n),
 	}
 
     listenConnChan := make(chan net.PacketConn)
@@ -1034,7 +1423,13 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
 	_ = listenConnChan
 
     wg1 := sync.WaitGroup{}
-	t := time.Tick(200 * time.Millisecond)
+	// time.Tick (no Stop hook) leaks one ticker goroutine + heap
+	// object per StartProxy invocation — across iOS suspend/wake
+	// cycles and Disconnect/Reconnect this accumulates fast. Use
+	// NewTicker + Stop bound to ctx cleanup.
+	tDispatcher := time.NewTicker(200 * time.Millisecond)
+	defer tDispatcher.Stop()
+	t := tDispatcher.C
 
 	// Re-roll the Stream-Aggregation session ID once per StartProxy.
 	// Each of the N DTLS sessions below will then prepend the same
@@ -1184,9 +1579,15 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
 	}()
 
 	// Phase A: spawn direct sessions until N reached or direct egress
-	// hits ERROR_LIMIT. 400 ms stagger × throttle=5 in poolCreds keeps
-	// VK's anti-bot off our back while we drain its per-IP budget.
-	phaseAStagger := 400 * time.Millisecond
+	// hits ERROR_LIMIT. The 1.5-2.5 s pre-slot jitter inside poolCreds
+	// (see F3) now does the anti-bot pacing that the stagger used to
+	// do; the stagger only exists to give the saturation check inside
+	// this loop enough granularity to fire BEFORE the whole fleet has
+	// kicked off solveVkCaptcha. 100 ms × 50 = 5 s for all N to enter
+	// the slot queue, vs the old 20 s — saves ~15 s of bring-up time
+	// when direct doesn't saturate, while still letting Phase A→B
+	// transition fire within 100 ms of an ERROR_LIMIT landing.
+	phaseAStagger := 100 * time.Millisecond
 	phaseACount := 0
 	for phaseACount < n {
 		if directSaturated() {
@@ -1222,12 +1623,13 @@ func StartProxy(cLink *C.char, cPeerAddr *C.char, cLocalAddr *C.char, cN C.int, 
 	wg1.Go(func() {
 		log.Printf("StartProxy: spawning phase B (target=%d, already=%d)", n, phaseACount)
 
-		// Per-session stagger of 800 ms — slightly slower than
-		// Phase A because the WG server's egress is the only IP
-		// for everyone else's traffic too, so saturating it has
-		// wider blast radius. 800 ms × ~14 (typical remainder) ≈
-		// 11 s phase B warm-up.
-		phaseBStagger := 800 * time.Millisecond
+		// Per-session stagger 200 ms — twice Phase A because the WG
+		// server's egress is the only IP for everyone else's traffic
+		// too, so saturating it has wider blast radius. The 1.5-2.5 s
+		// pre-slot jitter (F3) handles anti-bot pacing; the stagger
+		// only governs how quickly the loop notices tunnel
+		// saturation. 200 ms × 40 ≈ 8 s phase B warm-up vs old 32 s.
+		phaseBStagger := 200 * time.Millisecond
 		for i := phaseACount; i < n; i++ {
 			if ctx.Err() != nil {
 				return
@@ -1257,4 +1659,21 @@ func StopProxy() {
         proxyCancel = nil
         log.Println("Proxy gracefully stopped")
     }
+    // Drop accumulated idle HTTP conns. sharedAuthClient,
+    // remoteCredsClient and dohClient are package-level so their
+    // pools survive StartProxy/StopProxy cycles — without an
+    // explicit flush, every Disconnect carries forward a
+    // potentially-stale persistConn (each with a readLoop +
+    // writeLoop goroutine pair) to the next Connect.
+    flushHTTPIdleConns()
+}
+
+// flushHTTPIdleConns closes idle conns on every package-level
+// http.Client in the bridge. Called from StopProxy and
+// ProxyForceReconnect — both cases where outbound HTTP path may
+// have changed under us.
+func flushHTTPIdleConns() {
+    sharedAuthClient.CloseIdleConnections()
+    remoteCredsClient.CloseIdleConnections()
+    dohClient.CloseIdleConnections()
 }

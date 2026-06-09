@@ -43,15 +43,15 @@ func randomHex(n int) string {
     return hex.EncodeToString(bytes)
 }
 
-// newCaptchaClient is kept for backwards compat with call sites and
-// just defers to the TLS-fingerprinted client. See captcha_client.go
-// for the full rationale and the forceDirect caveat.
-func newCaptchaClient(forceDirect bool) tlsclient.HttpClient {
-    c, err := newTLSCaptchaClient(forceDirect)
+// newCaptchaClient now returns a TLS-fingerprinted client (Safari iOS
+// 18) that also pins outbound sockets to the WARP WireGuard interface
+// when WARP_INTERFACE is set. See captcha_client.go and warp_dialer.go.
+// forceDirect kept in the signature for callsite compat but ignored:
+// the iOS-side meaning (bypass utun for tunnel-egress rate-limit) has
+// no analog on a Linux server.
+func newCaptchaClient(_ bool) tlsclient.HttpClient {
+    c, err := newTLSCaptchaClient()
     if err != nil {
-        // tls-client.NewHttpClient can only fail on misconfigured
-        // options. Our options are static and tested, so a panic
-        // here means we built bogus options at compile time.
         panic(fmt.Sprintf("newTLSCaptchaClient: %v", err))
     }
     return c
@@ -106,22 +106,10 @@ func (e *VkCaptchaError) IsCaptchaError() bool {
     return e.ErrorCode == 14 && e.RedirectUri != "" && e.SessionToken != ""
 }
 
-// solveVkCaptcha returns either a success_token (legacy path: caller
-// retries the failing VK API call themselves) OR a full JSON response
-// (new path: the WebView did the retry inside its own browser
-// session, so the caller skips its own retry and uses the response
-// directly).
-//
-// retryURL + retryBody describe the request the WebView should make
-// after extracting success_token. retryBody contains the literal
-// "__TOKEN__" placeholder. Pass empty strings to fall back to the
-// token-only flow — that's still wired and works for backwards
-// compat with older Swift bridges that don't know about the new
-// response path.
-func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, retryURL, retryBody string) (string, string, error) {
+func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError) (string, error) {
     if manualCaptchaForcedMode() {
         log.Printf("[Captcha] Manual mode enabled — handing the challenge to the UI")
-        return requestManualCaptcha(captchaErr.RedirectUri, retryURL, retryBody, 180*time.Second)
+        return requestManualCaptcha(captchaErr.RedirectUri, 180*time.Second)
     }
 
     // Egress decision. The default is whatever captchaTunnelEgress
@@ -153,7 +141,7 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, retryURL, r
 
     sessionToken := captchaErr.SessionToken
     if sessionToken == "" {
-        return "", "", fmt.Errorf("no session_token in redirect_uri")
+        return "", fmt.Errorf("no session_token in redirect_uri")
     }
 
     profile := getRandomProfile()
@@ -161,7 +149,7 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, retryURL, r
 
     powInput, difficulty, htmlSettings, err := fetchPowInput(ctx, client, profile, captchaErr.RedirectUri)
     if err != nil {
-        return "", "", fmt.Errorf("failed to fetch PoW input: %w", err)
+        return "", fmt.Errorf("failed to fetch PoW input: %w", err)
     }
 
     log.Printf("[Captcha] PoW input: %s, difficulty: %d, htmlSettings=%v", powInput, difficulty, htmlSettings != nil)
@@ -171,27 +159,11 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, retryURL, r
 
     successToken, err := callCaptchaNotRobot(ctx, client, profile, sessionToken, hash, htmlSettings, isTunnel)
     if err != nil {
-        // Manual-fallback mode: hand the redirect_uri to the iOS UI
-        // and let the user solve in SFSafariViewController instead of
-        // returning failure to the caller (which would recycle a
-        // stale identity). Only consulted when the auto chain has
-        // actually run AND failed, so user only sees prompts for the
-        // 15-20% of identities the solver couldn't earn on its own.
-        if manualCaptchaFallbackAvailable() {
-            log.Printf("[Captcha] auto failed (%v) — escalating to manual prompt", err)
-            tok, resp, mErr := requestManualCaptcha(captchaErr.RedirectUri, retryURL, retryBody, 180*time.Second)
-            if mErr == nil {
-                log.Printf("[Captcha] Success via manual fallback (response_path=%v)", resp != "")
-                markCaptchaSuccess(isTunnel)
-                return tok, resp, nil
-            }
-            return "", "", fmt.Errorf("captchaNotRobot API failed: %w (manual fallback also failed: %v)", err, mErr)
-        }
-        return "", "", fmt.Errorf("captchaNotRobot API failed: %w", err)
+        return "", fmt.Errorf("captchaNotRobot API failed: %w", err)
     }
 
     log.Printf("[Captcha] Success! Got success_token")
-    return successToken, "", nil
+    return successToken, nil
 }
 
 func fetchPowInput(ctx context.Context, client tlsclient.HttpClient, profile Profile, redirectUri string) (string, int, map[string]interface{}, error) {
@@ -204,10 +176,9 @@ func fetchPowInput(ctx context.Context, client tlsclient.HttpClient, profile Pro
     req.Header.Set("User-Agent", profile.UserAgent)
     req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
     req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-    // Safari iOS deliberately doesn't implement Client Hints — sending
-    // sec-ch-ua* from a Safari UA was itself a bot tell on the old
-    // net/http path. With Safari_IOS_18_0 fingerprint we mirror real
-    // Safari at every layer, so we drop these unconditionally.
+    // Safari iOS doesn't implement Client Hints. With Safari_IOS_18_0
+    // fingerprint we mirror real Safari at every layer, so drop
+    // sec-ch-ua* unconditionally.
     req.Header.Set("Sec-Fetch-Site", "none")
     req.Header.Set("Sec-Fetch-Mode", "navigate")
     req.Header.Set("Sec-Fetch-Dest", "document")
@@ -257,14 +228,10 @@ func fetchPowInput(ctx context.Context, client tlsclient.HttpClient, profile Pro
         }
     }
 
-    // Locate not_robot_captcha.js so callCaptchaNotRobot can fetch
-    // the live debug_info hash from it (see captcha_debug_info.go).
-    // Empty string is OK — the caller handles the absent-script path.
+    // Stash not_robot_captcha.js URL so the caller can fetch debug_info
+    // dynamically. See captcha_debug_info.go.
     scriptURL := extractScriptURL(html)
     if scriptURL != "" {
-        // Stash on htmlSettings so we don't need to grow the function
-        // signature. The map is opaque downstream apart from
-        // captchaNotRobot.check.
         if htmlSettings == nil {
             htmlSettings = map[string]interface{}{}
         }
@@ -305,8 +272,6 @@ func callCaptchaNotRobot(ctx context.Context, client tlsclient.HttpClient, profi
         req.Header.Set("Accept-Language", "en-US,en;q=0.9")
         req.Header.Set("Origin", "https://id.vk.com")
         req.Header.Set("Referer", "https://id.vk.com/")
-        // No sec-ch-ua* — Safari doesn't send them; sending from a
-        // Safari fingerprint is itself a classifier tell.
         req.Header.Set("Sec-Fetch-Site", "same-site")
         req.Header.Set("Sec-Fetch-Mode", "cors")
         req.Header.Set("Sec-Fetch-Dest", "empty")
@@ -347,18 +312,11 @@ func callCaptchaNotRobot(ctx context.Context, client tlsclient.HttpClient, profi
     // Step 2: componentDone
     log.Printf("[Captcha] Step 2/4: componentDone")
 
-    // crypto/rand-backed 32-hex-char browser fingerprint. The pre-v2
-    // version used math/rand which is seeded weakly and predictably.
+    // crypto/rand-backed 32-hex-char browser fingerprint (v2).
     browserFp := randomHex(16)
 
-    // v2 device shape: 11 fixed fields matching what a real desktop
-    // browser reports through navigator.* probes. The pre-v2 version
-    // randomised resolutions and CPU counts per call, which created
-    // a per-solve fingerprint churn that VK's classifier could
-    // correlate against the stable TLS fingerprint and flag as bot
-    // behaviour. v2 ships the same desktop Chrome 8-core/1080p shape
-    // every time; combined with random browser_fp + cursor jitter
-    // it's noisy enough on the variable signals that matter.
+    // v2 device shape: fixed desktop Chrome 8-core/1080p. See iOS-side
+    // captcha-vk for full rationale.
     const (
         screenW = 1920
         screenH = 1080
@@ -414,10 +372,9 @@ func callCaptchaNotRobot(ctx context.Context, client tlsclient.HttpClient, profi
 
     answer := base64.StdEncoding.EncodeToString([]byte("{}"))
 
-    // Fetch debug_info from not_robot_captcha.js (cached). If we can't
-    // (no scriptURL in HTML, or fetch failed), fall back to the legacy
-    // constant — better than skipping check entirely; on a healthy
-    // build the constant happens to match and we degrade gracefully.
+    // Dynamic debug_info from not_robot_captcha.js. See iOS-side
+    // captcha_debug_info.go for the rationale; fallback to legacy
+    // constant when fetch fails.
     scriptURL, _ := htmlSettings["_scriptURL"].(string)
     debugInfo, debugErr := fetchDebugInfo(ctx, client, profile, scriptURL)
     if debugErr != nil {
@@ -425,11 +382,7 @@ func callCaptchaNotRobot(ctx context.Context, client tlsclient.HttpClient, profi
         debugInfo = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     }
 
-    // All motion arrays empty per v2 wire shape: VK's classifier looks
-    // for "client emits zero device events" as a sign of an honest
-    // desktop browser (not a touch-event-streaming mobile). The pre-v2
-    // populated connectionDownlink array was a low-signal noise
-    // generator that didn't fool anything.
+    // v2 wire shape: all motion arrays empty including connectionDownlink.
     checkData := baseParams + fmt.Sprintf(
         "&accelerometer=%s&gyroscope=%s&motion=%s&cursor=%s&taps=%s&connectionRtt=%s&connectionDownlink=%s"+
             "&browser_fp=%s&hash=%s&answer=%s&debug_info=%s",
@@ -471,20 +424,11 @@ func callCaptchaNotRobot(ctx context.Context, client tlsclient.HttpClient, profi
     }
 
     if status == "ERROR_LIMIT" {
-        // VK rate-limited the source IP. The slider path uses the
-        // same egress and the same rate-limit bucket, so trying slider
-        // would just burn another doomed request and (worse) saturate
-        // the next iteration earlier. Surface the error and let the
-        // outer retry storm controller decide.
         markCaptchaSaturated(isTunnel)
         return "", fmt.Errorf("captchaNotRobot.check ERROR_LIMIT (no slider fallback under rate-limit)")
     }
 
-    // v2 routing: only attempt slider when VK explicitly says BOT
-    // AND we have slider settings to feed it. Other non-OK statuses
-    // (server errors, unknown) shouldn't auto-fall-through to slider
-    // because slider is a separate, heavier request that VK can also
-    // 4xx independently.
+    // v2 routing: only try slider on explicit BOT status with slider show_type.
     sliderEligible := status == "BOT" && (showType == "" || showType == "slider")
     if !sliderEligible {
         return "", fmt.Errorf("captchaNotRobot.check non-OK status=%q show_type=%q", status, showType)

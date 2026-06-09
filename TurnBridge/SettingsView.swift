@@ -1,4 +1,5 @@
 import SwiftUI
+import Security // SecRandomCopyBytes for wrap-key generation
 
 struct SettingsView: View {
     @ObservedObject var store: ProfileStore
@@ -21,10 +22,12 @@ struct SettingsView: View {
                     .disableAutocorrection(true)
             }
 
-            Section(header: Text("Proxy Settings")) {
-                TextField("TURN Server URL", text: binding(\.vkLink))
+            Section(header: Text("Proxy Settings"),
+                    footer: Text("One VK call-join URL per line. Multiple links round-robin across sessions — gives more captcha-rate-limit budget if VK keys it on (source-IP, link).")) {
+                TextEditor(text: binding(\.vkLink))
                     .autocapitalization(.none)
                     .disableAutocorrection(true)
+                    .frame(minHeight: 60)
 
                 TextField("Peer Address (IP:Port)", text: binding(\.peerAddr))
                     .autocapitalization(.none)
@@ -71,6 +74,32 @@ struct SettingsView: View {
                 Text("Requires kiper292/vk-turn-proxy on the WG server. Leave off if you don't run a compatible aggregator.")
                     .font(.caption)
                     .foregroundColor(.secondary)
+            }
+
+            Section(header: Text("SRTP Wrap (DPI bypass)"),
+                    footer: Text("Disguises DTLS-over-TURN as SRTP/Opus voice so VK's relay can't fingerprint the traffic. Requires the matching key on the server side (vk-turn-proxy with -wrap -wrap-key=<hex>). Leave empty to disable.")) {
+                TextField("Wrap key (64 hex chars)", text: binding(\.wrapKey))
+                    .font(.system(.footnote, design: .monospaced))
+                    .autocapitalization(.none)
+                    .disableAutocorrection(true)
+                Button("Generate new key") {
+                    // Generate 32 random bytes → 64 hex chars locally
+                    // via SecRandomCopyBytes. We can't call the Go-side
+                    // TurnBridgeGenerateWrapKey from the main app target
+                    // — the Go library is only linked into the
+                    // NetworkExtension. Same wire shape, same entropy
+                    // source (kernel CSPRNG via Security.framework).
+                    var bytes = [UInt8](repeating: 0, count: 32)
+                    let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+                    guard status == errSecSuccess else { return }
+                    let newKey = bytes.map { String(format: "%02x", $0) }.joined()
+                    // Route through the same draft pipeline the
+                    // TextField uses; writing directly to
+                    // store.profiles[idx] gets shadowed by the still-
+                    // empty draft value until .onDisappear.
+                    binding(\.wrapKey).wrappedValue = newKey
+                }
+                .font(.footnote)
             }
 
             Section(header: Text("WireGuard Config")) {

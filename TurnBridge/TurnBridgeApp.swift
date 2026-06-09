@@ -22,6 +22,8 @@ struct TurnBridge: App {
                     }
                 )) { identified in
                     CaptchaWebView(redirectUri: identified.request.redirectUri,
+                                   retryUrl: identified.request.retryUrl,
+                                   retryBody: identified.request.retryBody,
                                    manager: captchaManager)
                         .interactiveDismissDisabled()
                 }
@@ -33,7 +35,13 @@ struct TurnBridge: App {
         var id: String { request.requestId }
     }
     
-    func turnOnTunnel(vkLink: String, peerAddr: String, listenAddr: String, nValue: Int, useUDP: Bool, streamAggregation: Bool, wgQuickConfig: String, completionHandler: @escaping (Bool) -> Void) {
+    func turnOnTunnel(vkLink: String, peerAddr: String, listenAddr: String, nValue: Int, useUDP: Bool, streamAggregation: Bool, wrapKey: String, wgQuickConfig: String, completionHandler: @escaping (Bool) -> Void) {
+        // Strip whitespace (including Unicode thin space U+2009 that
+        // sneaks in from web copy-paste). Field log 1.3.14 showed the
+        // proxy aborting at startup with `port "56010 " invalid`
+        // — the trailing thin space lived inside the saved profile.
+        let peerAddr = peerAddr.trimmingCharacters(in: .whitespacesAndNewlines)
+        let listenAddr = listenAddr.trimmingCharacters(in: .whitespacesAndNewlines)
         SharedLogger.info("Connecting... peer=\(peerAddr), listen=\(listenAddr), n=\(nValue), udp=\(useUDP), streamAgg=\(streamAggregation)")
 
         NETunnelProviderManager.loadAllFromPreferences { tunnelManagersInSettings, error in
@@ -62,7 +70,8 @@ struct TurnBridge: App {
                 "listenAddr": listenAddr,
                 "nValue": nValue,
                 "useUDP": useUDP,
-                "streamAggregation": streamAggregation
+                "streamAggregation": streamAggregation,
+                "wrapKey": wrapKey
             ]
 
             let defaults = UserDefaults.standard

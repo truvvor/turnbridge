@@ -18,9 +18,15 @@ struct VPNProfile: Codable, Identifiable, Equatable {
     /// compatible aggregator; otherwise the 17 bytes corrupt the very
     /// first WG handshake and the tunnel never comes up.
     var streamAggregation: Bool
+    /// 32-byte ChaCha20-Poly1305 key as 64 hex chars. Empty = disabled.
+    /// When set, each session wraps its DTLS-over-TURN payload to look
+    /// like an SRTP/Opus voice stream so VK's relay DPI can't fingerprint
+    /// us as non-call traffic. The matching server (vk-turn-proxy with
+    /// -wrap -wrap-key=<hex>) MUST have the same key configured.
+    var wrapKey: String
     var wgQuickConfig: String
 
-    init(id: UUID = UUID(), name: String = "", vkLink: String = "", peerAddr: String = "", listenAddr: String = "127.0.0.1:9000", nValue: Int = 1, useUDP: Bool = true, streamAggregation: Bool = false, wgQuickConfig: String = "") {
+    init(id: UUID = UUID(), name: String = "", vkLink: String = "", peerAddr: String = "", listenAddr: String = "127.0.0.1:9000", nValue: Int = 1, useUDP: Bool = true, streamAggregation: Bool = false, wrapKey: String = "", wgQuickConfig: String = "") {
         self.id = id
         self.name = name
         self.vkLink = vkLink
@@ -29,12 +35,13 @@ struct VPNProfile: Codable, Identifiable, Equatable {
         self.nValue = nValue
         self.useUDP = useUDP
         self.streamAggregation = streamAggregation
+        self.wrapKey = wrapKey
         self.wgQuickConfig = wgQuickConfig
     }
 
-    // Backwards compatibility: older saved profiles in UserDefaults won't have useUDP / streamAggregation.
+    // Backwards compatibility: older saved profiles in UserDefaults won't have useUDP / streamAggregation / wrapKey.
     enum CodingKeys: String, CodingKey {
-        case id, name, vkLink, peerAddr, listenAddr, nValue, useUDP, streamAggregation, wgQuickConfig
+        case id, name, vkLink, peerAddr, listenAddr, nValue, useUDP, streamAggregation, wrapKey, wgQuickConfig
     }
 
     init(from decoder: Decoder) throws {
@@ -47,6 +54,7 @@ struct VPNProfile: Codable, Identifiable, Equatable {
         nValue = try c.decode(Int.self, forKey: .nValue)
         useUDP = (try? c.decode(Bool.self, forKey: .useUDP)) ?? true
         streamAggregation = (try? c.decode(Bool.self, forKey: .streamAggregation)) ?? false
+        wrapKey = (try? c.decode(String.self, forKey: .wrapKey)) ?? ""
         wgQuickConfig = try c.decode(String.self, forKey: .wgQuickConfig)
     }
 }

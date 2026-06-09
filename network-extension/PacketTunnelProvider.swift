@@ -2,6 +2,7 @@
 //  Created by nullcstring.
 //
 
+import Darwin
 import NetworkExtension
 import Network
 import WireGuardKit
@@ -103,8 +104,9 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let useUDP = (providerConfiguration["useUDP"] as? Bool) ?? true
         let udpFlag: Int32 = useUDP ? 1 : 0
         let streamAggregation = (providerConfiguration["streamAggregation"] as? Bool) ?? false
+        let wrapKey = (providerConfiguration["wrapKey"] as? String) ?? ""
 
-        SharedLogger.info("Peer: \(peerAddr), Listen: \(listenAddr), N: \(nValue), UDP: \(useUDP), streamAgg: \(streamAggregation)", source: .tunnel)
+        SharedLogger.info("Peer: \(peerAddr), Listen: \(listenAddr), N: \(nValue), UDP: \(useUDP), streamAgg: \(streamAggregation), wrap: \(wrapKey.isEmpty ? "off" : "on")", source: .tunnel)
         SharedLogger.info("Starting TURN proxy...", source: .tunnel)
 
         ProxySetLogger(nil, goProxyCLoggerCallback)
@@ -115,6 +117,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // DTLS session completes its handshake, so setting it later
         // would race the per-session goroutines.
         TurnBridgeSetStreamAggregation(streamAggregation ? 1 : 0)
+
+        // SRTP/Opus wrap key. Empty string disables wrap and falls
+        // back to the legacy direct DTLS-over-TURN path. Set BEFORE
+        // StartProxy — currentWrapKey() is sampled once per session
+        // start in oneTurnConnection.
+        wrapKey.withCString { TurnBridgeSetWrapKey($0) }
 
         // Captcha trap: every slider captcha buffers its raw VK
         // response + decoded image in memory and only flushes to disk
@@ -129,10 +137,45 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             SharedLogger.info("Captcha trap dir: \(trapDir.path)", source: .tunnel)
         }
 
-        let manualCaptchaEnabled = UserDefaults(suiteName: CaptchaIPC.appGroupID)?
-            .bool(forKey: "manualCaptcha") ?? false
-        TurnBridgeSetManualCaptchaMode(manualCaptchaEnabled ? 1 : 0)
-        SharedLogger.info("Captcha mode: \(manualCaptchaEnabled ? "manual (browser sheet)" : "auto (in-tunnel solver)")", source: .tunnel)
+        // Captcha solve mode: 0=off (auto only), 1=forced (always manual),
+        // 2=fallback (auto first, manual on failure). Backwards-compat:
+        // if the new int key isn't set, fall back to the legacy bool
+        // (true → 1 forced, false → 0 off).
+        let defaults = UserDefaults(suiteName: CaptchaIPC.appGroupID)
+        let captchaModeRaw: Int = {
+            if let raw = defaults?.object(forKey: "manualCaptchaMode") as? Int {
+                return raw
+            }
+            return (defaults?.bool(forKey: "manualCaptcha") ?? false) ? 1 : 0
+        }()
+        TurnBridgeSetManualCaptchaMode(Int32(captchaModeRaw))
+        let captchaModeLabel: String
+        switch captchaModeRaw {
+        case 1: captchaModeLabel = "manual (forced — always browser sheet)"
+        case 2: captchaModeLabel = "manual fallback (browser sheet only when auto fails)"
+        default: captchaModeLabel = "auto (in-tunnel solver only)"
+        }
+        SharedLogger.info("Captcha mode: \(captchaModeLabel)", source: .tunnel)
+
+        // Remote captcha service: if the user configured a backend
+        // URL + API key in Settings, the Go side will offload
+        // getCreds to it after the first few local solves succeed —
+        // letting us pull a second per-IP rate-limit budget from a
+        // machine that isn't on the user's mobile IP. Empty values
+        // disable the feature (server's getCreds falls back to local
+        // every time).
+        let remoteURL = UserDefaults(suiteName: CaptchaIPC.appGroupID)?
+            .string(forKey: "remoteCaptchaServiceURL") ?? ""
+        let remoteKey = UserDefaults(suiteName: CaptchaIPC.appGroupID)?
+            .string(forKey: "remoteCaptchaServiceAPIKey") ?? ""
+        remoteURL.withCString { urlPtr in
+            remoteKey.withCString { keyPtr in
+                ProxySetRemoteCaptchaService(urlPtr, keyPtr)
+            }
+        }
+        if !remoteURL.isEmpty && !remoteKey.isEmpty {
+            SharedLogger.info("Remote captcha service configured (\(remoteURL))", source: .tunnel)
+        }
 
         // Scale the readiness budget by N: StartProxy on the Go side
         // now waits for ALL N TURN allocations to come up before it
@@ -152,16 +195,23 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // The old 12 s / 300 s constants assumed N=1 and were the
         // direct cause of "DTLS connection timeout (12s)" landing
         // mid-Step-2/4 when nValue>1.
-        let perSessionMs: Int32 = manualCaptchaEnabled ? 30_000 : 15_000
-        let floorMs:      Int32 = manualCaptchaEnabled ? 60_000 : 20_000
+        // Bump the per-session DTLS budget whenever a user prompt is
+        // POSSIBLE — forced (every session prompts) or fallback (auto
+        // first, prompt only on failure). Even in fallback mode we
+        // need to account for the wall-clock the user can take to
+        // tap "solve" on the small minority that does prompt.
+        let userPromptPossible = captchaModeRaw == 1 || captchaModeRaw == 2
+        let perSessionMs: Int32 = userPromptPossible ? 30_000 : 15_000
+        let floorMs:      Int32 = userPromptPossible ? 60_000 : 20_000
         let dtlsReadyTimeoutMs: Int32 = max(floorMs, perSessionMs * nValue)
-        SharedLogger.info("DTLS ready budget: \(dtlsReadyTimeoutMs / 1000)s for N=\(nValue) (\(manualCaptchaEnabled ? "manual" : "auto"))", source: .tunnel)
+        SharedLogger.info("DTLS ready budget: \(dtlsReadyTimeoutMs / 1000)s for N=\(nValue) (\(captchaModeLabel))", source: .tunnel)
 
         DispatchQueue.global(qos: .userInteractive).async {
             StartProxy(vkLink, peerAddr, listenAddr, nValue, udpFlag)
         }
 
         startCaptchaStatsPublisher()
+        Self.startMemoryLogger()
 
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             let ready = ProxyWaitReady(dtlsReadyTimeoutMs)
@@ -303,6 +353,12 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         sharedLogger.log("Stopping tunnel")
         SharedLogger.info("Stopping tunnel (reason: \(reason.rawValue))", source: .tunnel)
 
+        // Tear down any in-flight manual captcha prompt FIRST: after
+        // StopProxy the Go waiter is gone and the sheet can never
+        // resolve. The app observes the cancel Darwin notification and
+        // dismisses the sheet.
+        CaptchaBridge.teardown()
+
         pathMonitor?.cancel()
         pathMonitor = nil
         lastPathStatus = nil
@@ -349,10 +405,13 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         timer.setEventHandler {
             let direct = Int(TurnBridgeGetCaptchaDirectCount())
             let tunnel = Int(TurnBridgeGetCaptchaTunnelCount())
+            let remote = Int(TurnBridgeGetCaptchaRemoteCount())
             let directAttempts = Int(TurnBridgeGetCaptchaDirectAttempts())
             let tunnelAttempts = Int(TurnBridgeGetCaptchaTunnelAttempts())
+            let remoteAttempts = Int(TurnBridgeGetCaptchaRemoteAttempts())
             let directInFlight = Int(TurnBridgeGetCaptchaDirectInFlight())
             let tunnelInFlight = Int(TurnBridgeGetCaptchaTunnelInFlight())
+            let remoteInFlight = Int(TurnBridgeGetCaptchaRemoteInFlight())
             let sessionsReady = Int(TurnBridgeGetSessionsReady())
             let sessionsTarget = Int(TurnBridgeGetSessionsTarget())
             let directSat = TurnBridgeIsCaptchaDirectSaturated() != 0
@@ -360,10 +419,13 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             guard let defaults = UserDefaults(suiteName: CaptchaIPC.appGroupID) else { return }
             defaults.set(direct, forKey: "captchaDirectCount")
             defaults.set(tunnel, forKey: "captchaTunnelCount")
+            defaults.set(remote, forKey: "captchaRemoteCount")
             defaults.set(directAttempts, forKey: "captchaDirectAttempts")
             defaults.set(tunnelAttempts, forKey: "captchaTunnelAttempts")
+            defaults.set(remoteAttempts, forKey: "captchaRemoteAttempts")
             defaults.set(directInFlight, forKey: "captchaDirectInFlight")
             defaults.set(tunnelInFlight, forKey: "captchaTunnelInFlight")
+            defaults.set(remoteInFlight, forKey: "captchaRemoteInFlight")
             defaults.set(sessionsReady, forKey: "sessionsReady")
             defaults.set(sessionsTarget, forKey: "sessionsTarget")
             defaults.set(directSat, forKey: "captchaDirectSaturated")
@@ -379,10 +441,13 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         if let defaults = UserDefaults(suiteName: CaptchaIPC.appGroupID) {
             defaults.set(0, forKey: "captchaDirectCount")
             defaults.set(0, forKey: "captchaTunnelCount")
+            defaults.set(0, forKey: "captchaRemoteCount")
             defaults.set(0, forKey: "captchaDirectAttempts")
             defaults.set(0, forKey: "captchaTunnelAttempts")
+            defaults.set(0, forKey: "captchaRemoteAttempts")
             defaults.set(0, forKey: "captchaDirectInFlight")
             defaults.set(0, forKey: "captchaTunnelInFlight")
+            defaults.set(0, forKey: "captchaRemoteInFlight")
             defaults.set(0, forKey: "sessionsReady")
             defaults.set(0, forKey: "sessionsTarget")
             defaults.set(false, forKey: "captchaDirectSaturated")
@@ -401,17 +466,32 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     override func wake() {
-        // After a sleep iOS thaws our Go runtime, but the TURN allocation
-        // and DTLS session held by the embedded vk-turn-proxy client are
-        // almost certainly stale — VK TURN drops idle channels, NAT
-        // mappings on the cellular side have expired, and pion/dtls
-        // sequence numbers can be outside the replay window. Force a
-        // clean reconnect before WireGuard starts pumping packets through
-        // zombie sockets.
+        // After a sleep iOS thaws our Go runtime. The TURN allocation
+        // and DTLS session held by the embedded vk-turn-proxy client
+        // MAY be stale (VK TURN drops idle channels after ~50 s, NAT
+        // mappings on the cellular side expire, pion/dtls sequence
+        // numbers can drift out of the replay window), but only after
+        // a long enough suspension. Short sleeps — screen-off blink,
+        // brief task switch, lock-unlock cycle — leave every socket
+        // intact and we just lose a few hundred ms of keepalive RTT.
+        //
+        // ProxyForceReconnect cancels ALL live TURN+DTLS sessions
+        // (test logs showed 96–100 cancellations per wake on N=50,
+        // and the recovery storm immediately trips VK's per-IP
+        // ERROR_LIMIT). For short gaps we'd rather keep the work the
+        // captcha pipeline already invested in. wakeReconnectThreshold
+        // is set below VK's allocation rotation window so anything
+        // shorter is presumed survivable.
         let gap = Self.lastSleepAt.map { Date().timeIntervalSince($0) } ?? 0
-        sharedLogger.log("System wake — gap=\(String(format: "%.1f", gap))s, forcing TURN/DTLS reconnect")
-        SharedLogger.info("System wake — gap=\(String(format: "%.1f", gap))s, forcing TURN/DTLS reconnect", source: .tunnel)
-        ProxyForceReconnect()
+        let wakeReconnectThreshold: TimeInterval = 30
+        if gap < wakeReconnectThreshold {
+            sharedLogger.log("System wake — short gap=\(String(format: "%.1f", gap))s, keeping live sessions")
+            SharedLogger.info("System wake — short gap=\(String(format: "%.1f", gap))s, keeping live sessions", source: .tunnel)
+        } else {
+            sharedLogger.log("System wake — gap=\(String(format: "%.1f", gap))s ≥ \(Int(wakeReconnectThreshold))s, forcing TURN/DTLS reconnect")
+            SharedLogger.info("System wake — gap=\(String(format: "%.1f", gap))s ≥ \(Int(wakeReconnectThreshold))s, forcing TURN/DTLS reconnect", source: .tunnel)
+            ProxyForceReconnect()
+        }
         Self.lastSleepAt = nil
     }
 
@@ -419,4 +499,54 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     // Static because PacketTunnelProvider instances are owned by the system
     // and we want to survive whatever lifecycle iOS chooses.
     private static var lastSleepAt: Date?
+
+    // Memory logger — runs every 5 s while the extension is alive.
+    // Reports (a) the iOS-given remaining memory budget for this
+    // extension via os_proc_available_memory() — this is the number
+    // that, once it hits zero, makes iOS terminate us. (b) resident
+    // set size via mach_task_basic_info, so we can see WHAT our
+    // memory actually is in OS terms (not just Go heap, which the
+    // Go-side memstats logger reports separately). The pair tells
+    // us how much headroom we have for raising N, where N=50
+    // currently sits on the memory budget, and whether spikes
+    // come from Go (captcha pipeline) or non-Go (libdtls, mach
+    // ports, etc).
+    private static var memoryTimer: DispatchSourceTimer?
+
+    static func startMemoryLogger() {
+        // Re-arm on every StartProxy so it survives Stop/Start cycles
+        // without leaking the previous timer.
+        memoryTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        timer.schedule(deadline: .now(), repeating: .seconds(5))
+        timer.setEventHandler {
+            let avail = os_proc_available_memory()
+            let rss = currentResidentMemoryBytes()
+            // Numbers in MB for human-readable logs.
+            let availMB = Double(avail) / 1024.0 / 1024.0
+            let rssMB = Double(rss) / 1024.0 / 1024.0
+            let msg = String(
+                format: "memory: rss=%.1fMB available=%.1fMB",
+                rssMB, availMB
+            )
+            sharedLogger.log("\(msg, privacy: .public)")
+            SharedLogger.info(msg, source: .tunnel)
+        }
+        timer.resume()
+        memoryTimer = timer
+    }
+
+    private static func currentResidentMemoryBytes() -> UInt64 {
+        var info = mach_task_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / MemoryLayout<natural_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) { ptr -> kern_return_t in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+            }
+        }
+        if kr != KERN_SUCCESS {
+            return 0
+        }
+        return info.resident_size
+    }
 }

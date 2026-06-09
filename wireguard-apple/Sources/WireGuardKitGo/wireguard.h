@@ -38,12 +38,28 @@ extern void RestartProxy(void);
 extern void ProxyForceReconnect(void);
 extern void ProxySetLogger(void *context, logger_fn_t logger_fn);
 extern int ProxyWaitReady(int timeoutMs);
+extern void ProxySetRemoteCaptchaService(const char *url, const char *apiKey);
 
 typedef void (*manual_captcha_cb_t)(const char *request_id, const char *redirect_uri);
 extern void TurnBridgeSetManualCaptchaCallback(manual_captcha_cb_t cb);
 extern void TurnBridgeSubmitManualCaptchaToken(const char *request_id, const char *token);
 extern void TurnBridgeCancelManualCaptcha(const char *request_id, const char *reason);
 extern void TurnBridgeSetManualCaptchaMode(int enabled);
+
+/* Returns a JSON {"url":..., "body":...} describing the request the
+ * WebView should make after extracting success_token, inside its own
+ * browser session. Caller must free() the returned string. NULL when
+ * no retry is configured for this request_id (legacy token-only flow).
+ * Used by the network-extension's CaptchaBridge to populate the
+ * PendingRequest with retry params for the app. */
+extern char *TurnBridgeGetManualCaptchaRetryRequest(const char *request_id);
+
+/* Delivers the full JSON response from the WebView's in-session API
+ * replay. getCreds then skips its own redemption call. Pass a non-
+ * empty token via TurnBridgeSubmitManualCaptchaToken when the WebView
+ * couldn't do the replay (fetch failed) so the legacy path still
+ * runs. */
+extern void TurnBridgeSubmitManualCaptchaResponse(const char *request_id, const char *response_json);
 extern void TurnBridgeSetStreamAggregation(int enabled);
 extern void TurnBridgeSetCaptchaTrapDir(const char *path);
 extern int TurnBridgeGetCaptchaDirectCount(void);
@@ -52,9 +68,20 @@ extern int TurnBridgeGetCaptchaDirectAttempts(void);
 extern int TurnBridgeGetCaptchaTunnelAttempts(void);
 extern int TurnBridgeGetCaptchaDirectInFlight(void);
 extern int TurnBridgeGetCaptchaTunnelInFlight(void);
+extern int TurnBridgeGetCaptchaRemoteCount(void);
+extern int TurnBridgeGetCaptchaRemoteAttempts(void);
+extern int TurnBridgeGetCaptchaRemoteInFlight(void);
 extern int TurnBridgeIsCaptchaDirectSaturated(void);
 extern int TurnBridgeIsCaptchaTunnelSaturated(void);
 extern int TurnBridgeGetSessionsReady(void);
 extern int TurnBridgeGetSessionsTarget(void);
+
+/* SRTP/Opus mimicry layer (see wrap.go). Empty / NULL key disables the
+ * wrap and falls back to the legacy direct DTLS-over-TURN path. Set
+ * BEFORE StartProxy — already-live sessions don't pick up key changes.
+ * The matching server must be running vk-turn-proxy with the same key
+ * configured (-wrap -wrap-key=<hex>); without that, AEAD will fail on
+ * every packet and no traffic flows. */
+extern void TurnBridgeSetWrapKey(const char *hexKey);
 
 #endif
