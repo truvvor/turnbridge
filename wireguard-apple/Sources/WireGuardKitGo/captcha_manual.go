@@ -53,17 +53,18 @@ type manualCaptchaSlot struct {
 }
 
 // manualCaptchaQuotaPerSession bounds how many times the iOS UI may
-// be prompted within a single StartProxy session. Without this cap a
-// forced-mode user at N=60 would face up to 60 sequential captcha
-// sheets — past the first ~5 the perceived "stuck sheet" reports
-// flood in even though the pipeline is working as designed.
+// be prompted within a single StartProxy session. The user's
+// expectation, restated 1.3.28: solve at most 3 captchas yourself,
+// after that the remote captcha-service cluster picks up.
 //
 // Once the quota is exhausted, manualCaptchaForcedMode /
 // manualCaptchaFallbackAvailable return false for the remainder of
-// the session and the caller degrades gracefully (auto-only with
-// recycle on failure). Quota resets on the next StartProxy via the
+// the session and getCreds returns "quota exhausted"; the
+// per-session goroutine then either picks up creds from a recycled
+// identity OR (with the lowered remoteHandoverThreshold) gets routed
+// to the remote service. Quota resets on the next StartProxy via the
 // counter being reset there.
-const manualCaptchaQuotaPerSession = 5
+const manualCaptchaQuotaPerSession = 3
 
 var manualCaptchaInvocations atomic.Int64
 
@@ -132,27 +133,27 @@ func TurnBridgeSetManualCaptchaMode(mode C.int) {
 	manualCaptchaMode = int(mode)
 }
 
-// manualCaptchaForcedMode reports whether every captcha challenge
-// should bypass the auto solver and go straight to the UI prompt.
-// Returns false if mode is off, fallback, no UI callback is
-// installed (without a callback there's no way to display the
-// prompt), OR the per-session quota has been exhausted (see
-// manualCaptchaQuotaPerSession — without the cap a forced-mode user
-// at N=60 would face 60 sequential sheets in a row).
+// manualCaptchaForcedMode reports whether the user explicitly chose
+// forced mode AND a callback is available to display sheets. It does
+// NOT consult the per-session quota — caller dispatches to
+// requestManualCaptcha which handles quota + defer-to-remote inside.
+// That single-source-of-truth is what lets quota exhaustion route to
+// the server cluster instead of silently falling to the auto solver
+// (which would surprise a forced-mode user with auto behaviour).
 func manualCaptchaForcedMode() bool {
 	manualCaptchaMu.RLock()
 	defer manualCaptchaMu.RUnlock()
-	if manualCaptchaMode != manualCaptchaModeForced || manualCaptchaCB == nil {
-		return false
-	}
-	return manualCaptchaQuotaRemaining() > 0
+	return manualCaptchaMode == manualCaptchaModeForced && manualCaptchaCB != nil
 }
 
 // manualCaptchaFallbackAvailable reports whether the UI prompt can
 // be used as a last-resort fallback when both the auto solver and
 // the remote /cred path have given up on this captcha. Different
 // from forced mode: only consulted by solveVkCaptcha at the end of
-// the auto chain, not at the start. Same per-session quota applies.
+// the auto chain, not at the start. Quota is consulted here — if
+// exhausted there is no point asking the caller to invoke
+// requestManualCaptcha, since fallback mode's only escalation path
+// IS the sheet (no further auto-retry after this).
 func manualCaptchaFallbackAvailable() bool {
 	manualCaptchaMu.RLock()
 	defer manualCaptchaMu.RUnlock()
@@ -255,6 +256,18 @@ func requestManualCaptcha(redirectURI, retryURL, retryBody string, timeout time.
 	manualCaptchaSerialise <- struct{}{}
 	defer func() { <-manualCaptchaSerialise }()
 
+	// While we waited in the queue, another goroutine may have
+	// brought up the first WG session. If so, the remote
+	// captcha-service is now preferred (see remoteHandoverThreshold)
+	// and bothering the user with another sheet would defeat the
+	// "max 3 captchas per StartProxy" promise. Bail out with a
+	// sentinel error; getCredsRouted catches it and re-routes this
+	// call to the server cluster.
+	if shouldDeferToRemoteNow() {
+		log.Printf("[Captcha] deferring queued manual prompt to remote (sessions_ready=%d)", captchaSessionsReady.Load())
+		return "", "", errDeferToRemote
+	}
+
 	// Reserve a slot in the per-session quota AFTER acquiring the
 	// serialise lock. Without that ordering, all 60 goroutines
 	// could race past the quota gate at once (Add(1) returns a
@@ -265,6 +278,15 @@ func requestManualCaptcha(redirectURI, retryURL, retryBody string, timeout time.
 	used := manualCaptchaInvocations.Add(1)
 	if used > int64(manualCaptchaQuotaPerSession) {
 		manualCaptchaInvocations.Add(-1)
+		// User's hard ask: never see more than N sheets per
+		// StartProxy. If the remote captcha-service is available
+		// after we've exhausted the quota, route this one there
+		// instead of returning a hard error (which would cascade
+		// into auto-solver attempts that fail at slider step).
+		if shouldDeferToRemoteNow() {
+			log.Printf("[Captcha] manual quota exhausted (%d/%d), deferring to remote", used-1, manualCaptchaQuotaPerSession)
+			return "", "", errDeferToRemote
+		}
 		return "", "", fmt.Errorf("manual captcha quota exhausted (%d/%d)", used-1, manualCaptchaQuotaPerSession)
 	}
 	log.Printf("[Captcha] manual prompt %d/%d this session", used, manualCaptchaQuotaPerSession)

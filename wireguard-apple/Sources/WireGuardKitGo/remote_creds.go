@@ -38,16 +38,16 @@ import (
 
 // remoteHandoverThreshold — number of LOCAL successful captcha
 // solves before subsequent solves are offloaded to the remote
-// service. The first few sessions bootstrap the WG tunnel using
-// the mobile IP's fresh per-IP captcha budget; once WG is up we
-// hand off to the server cluster so the phone IP doesn't burn its
-// remaining ERROR_LIMIT budget on sessions 6+. 3 is lower than the
-// original 5 because the gap between "first session ready" and the
-// counter actually hitting the threshold is filled by other
-// in-flight getCreds calls that have already committed to local —
-// dropping the threshold by 2 buys ~4 more remote-routed solves at
-// no extra latency cost.
-const remoteHandoverThreshold = 3
+// service. ONE is the minimum: as soon as the user has paid for
+// the bootstrap captcha and the WG tunnel has actual data flowing,
+// every subsequent getCreds call routes to the server cluster.
+// The user's explicit ask (1.3.29): never see more than 3 captcha
+// sheets per StartProxy. The combination of threshold=1 here +
+// manualCaptchaQuotaPerSession=3 in captcha_manual.go gives us
+// that bound even in the worst case where the remote /cred path
+// is briefly degraded — local fallback can still produce up to
+// 3 prompts before the quota kicks in.
+const remoteHandoverThreshold = 1
 
 type remoteCaptchaConfig struct {
 	url    atomic.Value // string
@@ -55,6 +55,31 @@ type remoteCaptchaConfig struct {
 }
 
 var remoteCaptcha remoteCaptchaConfig
+
+// errDeferToRemote is returned from the local captcha path
+// (requestManualCaptcha specifically) when, by the time the goroutine
+// is about to actually inconvenience the user with a sheet, the
+// remote captcha-service is preferred (≥1 session ready, no
+// cooldown). The call bubbles back up to getCredsRouted which then
+// re-routes to the server cluster. The user only sees the sheet for
+// the captchas that genuinely have to happen on the device.
+var errDeferToRemote = errors.New("defer to remote captcha service")
+
+// shouldDeferToRemoteNow reports whether the remote captcha-service
+// is configured, has at least one local solve under its belt (so the
+// remote path's auth isn't going to fight ERROR_LIMIT alongside the
+// mobile IP for the bootstrap window), and isn't currently in a
+// 429-cooldown. Goroutines queued behind the serialise lock check
+// this AFTER they acquire the lock — see captcha_manual.go.
+func shouldDeferToRemoteNow() bool {
+	if !remoteCaptchaEnabled() {
+		return false
+	}
+	if captchaSessionsReady.Load() < int64(remoteHandoverThreshold) {
+		return false
+	}
+	return !remoteInCooldown()
+}
 
 func remoteCaptchaURL() string {
 	v, _ := remoteCaptcha.url.Load().(string)
@@ -233,7 +258,19 @@ func getCredsRouted(ctx context.Context, link string) (string, string, string, e
 		}
 		log.Printf("remote-captcha: server call failed (%v) — falling back to local", err)
 	}
-	return getCreds(ctx, link)
+	u, p, a, err := getCreds(ctx, link)
+	// Local path can defer to remote when the goroutine was queued
+	// behind manualCaptchaSerialise long enough for the first session
+	// to come up. Honour the deferral and try the server cluster.
+	if errors.Is(err, errDeferToRemote) && remoteCaptchaEnabled() && !remoteInCooldown() {
+		log.Printf("remote-captcha: local deferred to remote, retrying via server")
+		ru, rp, ra, rerr := getCredsRemote(ctx, link)
+		if rerr == nil {
+			return ru, rp, ra, nil
+		}
+		log.Printf("remote-captcha: deferred retry failed (%v) — returning original local error", rerr)
+	}
+	return u, p, a, err
 }
 
 // Compile-time sanity: keep "unsafe" import referenced if cgo tooling

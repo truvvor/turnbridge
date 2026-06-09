@@ -274,7 +274,9 @@ func getCreds(ctx context.Context, link string) (resUser string, resPass string,
 
                     successToken, manualResp, solveErr := solveVkCaptcha(ctx, captchaErr, retryURL, retryBody)
                     if solveErr != nil {
-                        return "", "", "", fmt.Errorf("captcha solve error: %v", solveErr)
+                        // %w not %v: lets getCredsRouted unwrap and
+                        // check for errDeferToRemote sentinel.
+                        return "", "", "", fmt.Errorf("captcha solve error: %w", solveErr)
                     }
 
                     if manualResp != "" {
