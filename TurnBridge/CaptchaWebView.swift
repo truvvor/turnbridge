@@ -77,8 +77,14 @@ struct CaptchaWebView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") {
-                        guard !didFinish else { return }
+                        // Cancel ALWAYS works, even if didFinish is
+                        // already true. This is the user's escape
+                        // hatch when something downstream wedges —
+                        // we'd rather double-cancel (idempotent on
+                        // both Swift and Go sides) than trap the
+                        // user staring at a frozen sheet.
                         didFinish = true
+                        SharedLogger.info("CaptchaWebView: user pressed Cancel (state.didFinish was \(didFinish))", source: .app)
                         Task {
                             await manager.cancel()
                             dismiss()
@@ -456,7 +462,16 @@ private struct CaptchaWKWebView: UIViewRepresentable {
             };
         }
 
-        // XHR hook
+        // XHR hook. Two hooks because VK sites use both:
+        //   - Override of xhr.onreadystatechange catches code that
+        //     sets the handler via property assignment.
+        //   - addEventListener('load', ...) catches code that
+        //     subscribes via the event listener API. Without this
+        //     second hook, sites that prefer addEventListener (which
+        //     is increasingly the norm for SPA frameworks) fire their
+        //     handlers without our knowledge — we miss the response
+        //     and the captcha sheet looks stuck even though VK has
+        //     already issued the success_token.
         const origOpen = XMLHttpRequest.prototype.open;
         const origSend = XMLHttpRequest.prototype.send;
         XMLHttpRequest.prototype.open = function(method, url) {
@@ -465,6 +480,19 @@ private struct CaptchaWKWebView: UIViewRepresentable {
         };
         XMLHttpRequest.prototype.send = function() {
             const xhr = this;
+            // load-event hook (independent of any onreadystatechange).
+            try {
+                xhr.addEventListener('load', function() {
+                    try {
+                        if (xhr.__cap_url &&
+                            String(xhr.__cap_url).indexOf('captchaNotRobot') !== -1) {
+                            const t = maybeTokenFromText(xhr.responseText);
+                            if (t) handleSuccessToken(t);
+                        }
+                    } catch (e) {}
+                });
+            } catch (e) {}
+            // onreadystatechange wrap (catches direct property assignment).
             const prev = xhr.onreadystatechange;
             xhr.onreadystatechange = function() {
                 if (xhr.readyState === 4 && xhr.__cap_url &&
