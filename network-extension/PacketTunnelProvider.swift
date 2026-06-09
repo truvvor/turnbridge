@@ -195,10 +195,16 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         // The old 12 s / 300 s constants assumed N=1 and were the
         // direct cause of "DTLS connection timeout (12s)" landing
         // mid-Step-2/4 when nValue>1.
-        let perSessionMs: Int32 = manualCaptchaEnabled ? 30_000 : 15_000
-        let floorMs:      Int32 = manualCaptchaEnabled ? 60_000 : 20_000
+        // Bump the per-session DTLS budget whenever a user prompt is
+        // POSSIBLE — forced (every session prompts) or fallback (auto
+        // first, prompt only on failure). Even in fallback mode we
+        // need to account for the wall-clock the user can take to
+        // tap "solve" on the small minority that does prompt.
+        let userPromptPossible = captchaModeRaw == 1 || captchaModeRaw == 2
+        let perSessionMs: Int32 = userPromptPossible ? 30_000 : 15_000
+        let floorMs:      Int32 = userPromptPossible ? 60_000 : 20_000
         let dtlsReadyTimeoutMs: Int32 = max(floorMs, perSessionMs * nValue)
-        SharedLogger.info("DTLS ready budget: \(dtlsReadyTimeoutMs / 1000)s for N=\(nValue) (\(manualCaptchaEnabled ? "manual" : "auto"))", source: .tunnel)
+        SharedLogger.info("DTLS ready budget: \(dtlsReadyTimeoutMs / 1000)s for N=\(nValue) (\(captchaModeLabel))", source: .tunnel)
 
         DispatchQueue.global(qos: .userInteractive).async {
             StartProxy(vkLink, peerAddr, listenAddr, nValue, udpFlag)

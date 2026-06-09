@@ -40,10 +40,14 @@ enum ManualCaptchaSetting {
         }
         set {
             UserDefaults(suiteName: suite)?.set(newValue.rawValue, forKey: key)
-            // Keep the legacy bool in sync so older NetworkExtension
-            // builds (if any are still around) still see the
-            // forced-vs-off distinction.
-            UserDefaults(suiteName: suite)?.set(newValue == .forced, forKey: legacyBoolKey)
+            // Keep the legacy bool in sync. Semantics: "the user wants
+            // the in-tunnel routing to leave room for a Safari captcha
+            // sheet to load" — true for BOTH forced (always) and
+            // fallback (occasionally), false only for the pure-auto
+            // mode. Older NetworkExtension builds that read just this
+            // bool (the routing-scope path in PacketTunnelProvider)
+            // then continue to disable the kill switch correctly.
+            UserDefaults(suiteName: suite)?.set(newValue != .off, forKey: legacyBoolKey)
         }
     }
 
