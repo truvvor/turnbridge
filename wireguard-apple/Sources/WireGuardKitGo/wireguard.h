@@ -46,6 +46,12 @@ extern void TurnBridgeSubmitManualCaptchaToken(const char *request_id, const cha
 extern void TurnBridgeCancelManualCaptcha(const char *request_id, const char *reason);
 extern void TurnBridgeSetManualCaptchaMode(int enabled);
 
+/* Per-StartProxy cap on user-facing manual captcha prompts. Default 1
+ * (set in init()), clamped >=0 by the Go side. Set BEFORE StartProxy;
+ * the read inside requestManualCaptcha picks up the latest value but
+ * the counter resets only at StartProxy. */
+extern void TurnBridgeSetManualCaptchaQuota(int quota);
+
 /* Returns a JSON {"url":..., "body":...} describing the request the
  * WebView should make after extracting success_token, inside its own
  * browser session. Caller must free() the returned string. NULL when
