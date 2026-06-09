@@ -5,23 +5,21 @@ struct GlobalSettingsView: View {
     @AppStorage("excludeCellularServices") private var excludeCellularServices = false
     @AppStorage("excludeLocalNetworks") private var excludeLocalNetworks = true
 
-    @State private var manualCaptcha: Bool = ManualCaptchaSetting.isEnabled
+    @State private var captchaMode: CaptchaMode = ManualCaptchaSetting.mode
     @State private var remoteCaptchaURL: String = RemoteCaptchaSetting.url
     @State private var remoteCaptchaAPIKey: String = RemoteCaptchaSetting.apiKey
 
     var body: some View {
         Form {
-            Section(header: Text("Captcha")) {
-                Toggle(isOn: $manualCaptcha) {
-                    VStack(alignment: .leading) {
-                        Text("Solve captcha manually")
-                        Text("Show the VK challenge in a browser sheet instead of running the auto solver. Disables the kill switch (includeAllNetworks) for the session — required so the captcha page can load while the tunnel is still coming up.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
+            Section(header: Text("Captcha"),
+                    footer: Text(captchaModeFooter)) {
+                Picker("Solve mode", selection: $captchaMode) {
+                    Text("Auto only").tag(CaptchaMode.off)
+                    Text("Manual fallback").tag(CaptchaMode.fallback)
+                    Text("Manual always").tag(CaptchaMode.forced)
                 }
-                .onChange(of: manualCaptcha) { newValue in
-                    ManualCaptchaSetting.isEnabled = newValue
+                .onChange(of: captchaMode) { newValue in
+                    ManualCaptchaSetting.mode = newValue
                 }
 
                 NavigationLink(destination: CapturedCaptchasView()) {
@@ -102,5 +100,16 @@ struct GlobalSettingsView: View {
         }
         .navigationTitle("Settings")
         .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private var captchaModeFooter: String {
+        switch captchaMode {
+        case .off:
+            return "Run the on-device solver and the remote /cred cluster. When both fail, recycle a previously-acquired identity. Zero browser prompts."
+        case .fallback:
+            return "Try the on-device solver and the remote /cred cluster first. Only when both fail does iOS open a Safari sheet for you to solve. Realistically ~15-20% of identities at N=60 will fall through."
+        case .forced:
+            return "Bypass the auto solver entirely — every captcha opens a Safari sheet for you to solve. Disables the kill switch (includeAllNetworks) so the page can load while the tunnel comes up. Brutal at N=60."
+        }
     }
 }

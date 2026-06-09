@@ -35,25 +35,53 @@ type manualCaptchaSlot struct {
 	errCh   chan error
 }
 
+// Captcha solve mode. 0 = off (auto only, on auto-fail the caller
+// recycles a previously-acquired identity). 1 = forced (every captcha
+// is handed to the UI immediately, auto solver is never tried). 2 =
+// fallback (auto solver runs first; if it fails AND the remote /cred
+// cluster has nothing for us either, the UI gets the prompt as a
+// last resort before we degrade to identity recycling). Values
+// preserved across the old 0/1 bool API: 1 still means "forced".
+const (
+	manualCaptchaModeOff      = 0
+	manualCaptchaModeForced   = 1
+	manualCaptchaModeFallback = 2
+)
+
 var (
 	manualCaptchaMu      sync.RWMutex
 	manualCaptchaCB      C.manual_captcha_cb
-	manualCaptchaEnabled bool
+	manualCaptchaMode    int
 	manualCaptchaSlotsMu sync.Mutex
 	manualCaptchaSlots   = make(map[string]*manualCaptchaSlot)
 )
 
 //export TurnBridgeSetManualCaptchaMode
-func TurnBridgeSetManualCaptchaMode(enabled C.int) {
+func TurnBridgeSetManualCaptchaMode(mode C.int) {
 	manualCaptchaMu.Lock()
 	defer manualCaptchaMu.Unlock()
-	manualCaptchaEnabled = enabled != 0
+	manualCaptchaMode = int(mode)
 }
 
+// manualCaptchaForcedMode reports whether every captcha challenge
+// should bypass the auto solver and go straight to the UI prompt.
+// Returns false if mode is off, fallback, or no UI callback is
+// installed (without a callback there's no way to display the prompt).
 func manualCaptchaForcedMode() bool {
 	manualCaptchaMu.RLock()
 	defer manualCaptchaMu.RUnlock()
-	return manualCaptchaEnabled && manualCaptchaCB != nil
+	return manualCaptchaMode == manualCaptchaModeForced && manualCaptchaCB != nil
+}
+
+// manualCaptchaFallbackAvailable reports whether the UI prompt can
+// be used as a last-resort fallback when both the auto solver and
+// the remote /cred path have given up on this captcha. Different
+// from forced mode: only consulted by solveVkCaptcha at the end of
+// the auto chain, not at the start.
+func manualCaptchaFallbackAvailable() bool {
+	manualCaptchaMu.RLock()
+	defer manualCaptchaMu.RUnlock()
+	return manualCaptchaMode == manualCaptchaModeFallback && manualCaptchaCB != nil
 }
 
 //export TurnBridgeSetManualCaptchaCallback

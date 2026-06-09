@@ -159,6 +159,22 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError) (string, er
 
     successToken, err := callCaptchaNotRobot(ctx, client, profile, sessionToken, hash, htmlSettings, isTunnel)
     if err != nil {
+        // Manual-fallback mode: hand the redirect_uri to the iOS UI
+        // and let the user solve in SFSafariViewController instead of
+        // returning failure to the caller (which would recycle a
+        // stale identity). Only consulted when the auto chain has
+        // actually run AND failed, so user only sees prompts for the
+        // 15-20% of identities the solver couldn't earn on its own.
+        if manualCaptchaFallbackAvailable() {
+            log.Printf("[Captcha] auto failed (%v) — escalating to manual prompt", err)
+            tok, mErr := requestManualCaptcha(captchaErr.RedirectUri, 180*time.Second)
+            if mErr == nil {
+                log.Printf("[Captcha] Success via manual fallback")
+                markCaptchaSuccess(isTunnel)
+                return tok, nil
+            }
+            return "", fmt.Errorf("captchaNotRobot API failed: %w (manual fallback also failed: %v)", err, mErr)
+        }
         return "", fmt.Errorf("captchaNotRobot API failed: %w", err)
     }
 

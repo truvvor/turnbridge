@@ -137,10 +137,25 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             SharedLogger.info("Captcha trap dir: \(trapDir.path)", source: .tunnel)
         }
 
-        let manualCaptchaEnabled = UserDefaults(suiteName: CaptchaIPC.appGroupID)?
-            .bool(forKey: "manualCaptcha") ?? false
-        TurnBridgeSetManualCaptchaMode(manualCaptchaEnabled ? 1 : 0)
-        SharedLogger.info("Captcha mode: \(manualCaptchaEnabled ? "manual (browser sheet)" : "auto (in-tunnel solver)")", source: .tunnel)
+        // Captcha solve mode: 0=off (auto only), 1=forced (always manual),
+        // 2=fallback (auto first, manual on failure). Backwards-compat:
+        // if the new int key isn't set, fall back to the legacy bool
+        // (true → 1 forced, false → 0 off).
+        let defaults = UserDefaults(suiteName: CaptchaIPC.appGroupID)
+        let captchaModeRaw: Int = {
+            if let raw = defaults?.object(forKey: "manualCaptchaMode") as? Int {
+                return raw
+            }
+            return (defaults?.bool(forKey: "manualCaptcha") ?? false) ? 1 : 0
+        }()
+        TurnBridgeSetManualCaptchaMode(Int32(captchaModeRaw))
+        let captchaModeLabel: String
+        switch captchaModeRaw {
+        case 1: captchaModeLabel = "manual (forced — always browser sheet)"
+        case 2: captchaModeLabel = "manual fallback (browser sheet only when auto fails)"
+        default: captchaModeLabel = "auto (in-tunnel solver only)"
+        }
+        SharedLogger.info("Captcha mode: \(captchaModeLabel)", source: .tunnel)
 
         // Remote captcha service: if the user configured a backend
         // URL + API key in Settings, the Go side will offload
