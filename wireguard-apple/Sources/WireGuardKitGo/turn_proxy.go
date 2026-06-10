@@ -1181,10 +1181,29 @@ func poolCreds(f getCredsFunc, poolSize int) getCredsFunc {
 		// another solve attempt. The 45 s budget lines up with VK's
 		// TURN rotation window so any cred in the pool was either
 		// just acquired or is in its useful lifetime.
+		//
+		// EXCEPT: always keep the most recently acquired cred even
+		// if it's past credMaxAge. Field log 1.3.37 (quota=1, remote
+		// 429-saturated) showed the failure mode: ~50 s after the
+		// bootstrap solve the cache was pruned to empty, the recycle
+		// fallback below had nothing to hand out, every reconnect
+		// died with "captcha solve error" and the tunnel stopped
+		// accepting traffic. A stale cred has maybe a few seconds
+		// left before VK rotates the allocation, but a few seconds
+		// of stale > 60 s of nothing. The next successful solve
+		// (manual or remote) refreshes the cache anyway.
 		if len(pool) > 0 {
+			// Find the most recently acquired entry so we can spare it
+			// even if it's past credMaxAge.
+			newestIdx := 0
+			for i := 1; i < len(pool); i++ {
+				if pool[i].acquiredAt.After(pool[newestIdx].acquiredAt) {
+					newestIdx = i
+				}
+			}
 			fresh := pool[:0]
-			for _, c := range pool {
-				if time.Since(c.acquiredAt) <= credMaxAge {
+			for i, c := range pool {
+				if time.Since(c.acquiredAt) <= credMaxAge || i == newestIdx {
 					fresh = append(fresh, c)
 				}
 			}

@@ -122,7 +122,20 @@ func (e *VkCaptchaError) IsCaptchaError() bool {
 func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, retryURL, retryBody string) (string, string, error) {
     if manualCaptchaForcedMode() {
         log.Printf("[Captcha] Manual mode enabled — handing the challenge to the UI")
-        return requestManualCaptcha(captchaErr.RedirectUri, retryURL, retryBody, 180*time.Second)
+        // Manual solves run inside the iOS WebView, which is bound to
+        // the user's mobile IP regardless of utun state — count them
+        // as Direct. Field log 1.3.37 showed the UI badge sitting at
+        // 0/0/0 even after a successful solve because requestManualCaptcha
+        // bypassed the stats path entirely. Wrap with the same
+        // markCaptchaAttemptStart/Done pair the auto-solver uses so the
+        // user sees their bootstrap solve credited to Direct.
+        isTunnel := markCaptchaAttemptStart(true /* forceDirect */)
+        defer markCaptchaAttemptDone(isTunnel)
+        tok, resp, err := requestManualCaptcha(captchaErr.RedirectUri, retryURL, retryBody, 180*time.Second)
+        if err == nil {
+            markCaptchaSuccess(isTunnel)
+        }
+        return tok, resp, err
     }
 
     // Bootstrap-manual-first. Under hard network blocking there is no
@@ -140,6 +153,14 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, retryURL, r
         log.Printf("[Captcha] bootstrap (sessions_ready=0) — manual-first, skipping auto solve to avoid poisoning the session")
         tok, resp, err := requestManualCaptcha(captchaErr.RedirectUri, retryURL, retryBody, 180*time.Second)
         if err == nil {
+            // Bootstrap manual SUCCESS: credit Direct. Bump both attempts
+            // and OK so the ratio renders cleanly (1/1 not 1/0). Skip
+            // the markCaptchaAttemptStart/Done pair the auto branch uses
+            // because this branch can fall through to auto on
+            // errDeferToRemote, and that branch has its own START — pre-
+            // marking would double-count attempts for one user action.
+            captchaDirectAttempts.Add(1)
+            captchaDirectOK.Add(1)
             return tok, resp, nil
         }
         // errDeferToRemote (quota exhausted / a session came up while we
