@@ -674,6 +674,12 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
 
             _, err1 = listenConn.WriteTo(buf[:n], addr1)
             if err1 != nil {
+                // Same ENOBUFS handling as relayConn.WriteTo — UDP is
+                // allowed to drop, and a momentary cellular buffer
+                // squeeze shouldn't kill an otherwise-healthy session.
+                if strings.Contains(err1.Error(), "no buffer space available") {
+                    continue
+                }
                 log.Printf("Failed: %s", err1)
                 return
             }
@@ -952,6 +958,19 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 
 			_, err1 = relayConn.WriteTo(out, peer)
 			if err1 != nil {
+				// "write: no buffer space available" is a transient kernel
+				// signal during throughput spikes (e.g. Speedtest pushing
+				// the cellular send buffer past SO_SNDBUF=4 MB). Field log
+				// 1.3.38: a single such failure killed the goroutine, the
+				// outer loop reconnected, all 10 sessions then collapsed
+				// in cascade because per-IP cooldown + remote 429 + TURN
+				// 486-Allocation-Quota-Reached blocked every reconnect.
+				// UDP drops are normal; treat ENOBUFS as a packet drop and
+				// keep the session alive. errors.Is doesn't catch this on
+				// iOS so check the message text.
+				if strings.Contains(err1.Error(), "no buffer space available") {
+					continue
+				}
 				log.Printf("Failed: %s", err1)
 				return
 			}
@@ -1006,6 +1025,9 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 
 			_, err1 = conn2.WriteTo(out, addr1)
 			if err1 != nil {
+				if strings.Contains(err1.Error(), "no buffer space available") {
+					continue
+				}
 				log.Printf("Failed: %s", err1)
 				return
 			}

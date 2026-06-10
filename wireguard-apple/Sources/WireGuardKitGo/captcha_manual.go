@@ -396,6 +396,20 @@ func requestManualCaptcha(redirectURI, retryURL, retryBody string, timeout time.
 	defer C.free(unsafe.Pointer(cReqID))
 	defer C.free(unsafe.Pointer(cURI))
 
+	// Stats: every time control reaches here, the WebView sheet is
+	// genuinely about to render. Moving the counter from
+	// solveVkCaptcha's forced-manual branch (where it lived in 1.3.38)
+	// to right here is what fixes the "Direct 1/23" UI bug — the
+	// forced branch is re-entered on every getCreds call, but only
+	// calls that pass cooldown + quota + defer-to-remote gates
+	// actually result in a sheet on screen, and only those should
+	// count. captchaDirectInFlight is bumped so the badge shows the
+	// active sheet; the deferred decrement covers every return path
+	// (success/cancel/timeout/empty-token).
+	captchaDirectAttempts.Add(1)
+	captchaDirectInFlight.Add(1)
+	defer captchaDirectInFlight.Add(-1)
+
 	C.invoke_manual_captcha_cb(cb, cReqID, cURI)
 
 	select {
@@ -403,12 +417,18 @@ func requestManualCaptcha(redirectURI, retryURL, retryBody string, timeout time.
 		if resp == "" {
 			return "", "", fmt.Errorf("manual captcha returned empty response")
 		}
+		captchaDirectOK.Add(1)
+		captchaDirectFailStreak.Store(0)
+		captchaDirectSatAt.Store(0)
 		manualCaptchaLastSolveUnix.Store(time.Now().Unix())
 		return "", resp, nil
 	case t := <-slot.tokenCh:
 		if t == "" {
 			return "", "", fmt.Errorf("manual captcha returned empty token")
 		}
+		captchaDirectOK.Add(1)
+		captchaDirectFailStreak.Store(0)
+		captchaDirectSatAt.Store(0)
 		manualCaptchaLastSolveUnix.Store(time.Now().Unix())
 		return t, "", nil
 	case e := <-slot.errCh:
