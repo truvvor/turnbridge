@@ -22,6 +22,16 @@ enum CaptchaIPC {
         /// solve and token redemption. Both fields are optional; the
         /// extension prefers responseJson when present.
         let responseJson: String?
+        /// New (1.3.40+): VK domain cookies harvested from the
+        /// WKWebsiteDataStore after the WebView's solve. JSON-encoded
+        /// array of `{"name":..., "value":..., "domain":...}`. The
+        /// extension forwards both this and `userAgent` into Go which
+        /// stores them globally; subsequent getCredsRemote calls attach
+        /// them to the /cred POST body so the remote captcha-service
+        /// can carry the same browser identity instead of solving
+        /// against a cold session.
+        let cookiesJson: String?
+        let userAgent: String?
     }
 
     struct PendingRequest: Codable {

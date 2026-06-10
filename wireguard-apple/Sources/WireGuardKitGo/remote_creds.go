@@ -180,6 +180,41 @@ type remoteCredResponse struct {
 	Error     string    `json:"error,omitempty"`
 }
 
+// VK browser-session state forwarded from the iOS WebView's
+// WKWebsiteDataStore after the user's manual solve, via
+// TurnBridgeSetVKCookies. Both fields are atomic-loaded on every
+// /cred call so updates from a subsequent solve take effect
+// immediately, without restarting the tunnel.
+//
+// Without this, the remote captcha-service starts every solve from a
+// cold session: zero VK cookies, generic UA, easy BOT classification.
+// With the WebView's cookies + matching Safari UA, the server's
+// outgoing captcha request looks like a continuation of the human-
+// verified browser the user just used. Same trade-off the in-WebView
+// replay path uses on the client side — single coherent actor
+// instead of fingerprint switch.
+var (
+	vkCookiesJSON atomic.Value // string — raw JSON array of {name,value,domain,path}
+	vkUserAgent   atomic.Value // string — full UA, e.g. "Mozilla/5.0 ... Safari/604.1"
+)
+
+//export TurnBridgeSetVKCookies
+func TurnBridgeSetVKCookies(cCookiesJSON *C.char, cUserAgent *C.char) {
+	cookies := ""
+	if cCookiesJSON != nil {
+		cookies = C.GoString(cCookiesJSON)
+	}
+	ua := ""
+	if cUserAgent != nil {
+		ua = C.GoString(cUserAgent)
+	}
+	vkCookiesJSON.Store(cookies)
+	vkUserAgent.Store(ua)
+	if cookies != "" {
+		log.Printf("remote-captcha: stored VK cookies (%d bytes JSON) + UA for future /cred calls", len(cookies))
+	}
+}
+
 func getCredsRemote(ctx context.Context, link string) (string, string, string, error) {
 	url := remoteCaptchaURL()
 	apiKey := remoteCaptchaAPIKey()
@@ -211,7 +246,23 @@ func getCredsRemote(ctx context.Context, link string) (string, string, string, e
 		_ = started
 	}()
 
-	body, _ := json.Marshal(map[string]string{"link": link})
+	// Build the /cred POST body. The link is required; cookies + UA
+	// are attached opportunistically — when the WebView has shipped
+	// them, the server uses them to continue the browser session
+	// instead of opening a cold one. When they're missing (no manual
+	// solve happened yet, or it was cancelled), the server falls back
+	// to its own session-bootstrap path.
+	bodyMap := map[string]interface{}{"link": link}
+	if c, _ := vkCookiesJSON.Load().(string); c != "" {
+		var parsed []map[string]string
+		if jerr := json.Unmarshal([]byte(c), &parsed); jerr == nil && len(parsed) > 0 {
+			bodyMap["cookies"] = parsed
+		}
+	}
+	if ua, _ := vkUserAgent.Load().(string); ua != "" {
+		bodyMap["user_agent"] = ua
+	}
+	body, _ := json.Marshal(bodyMap)
 	req, err := http.NewRequestWithContext(ctx, "POST", strings.TrimRight(url, "/")+"/cred", bytes.NewReader(body))
 	if err != nil {
 		log.Printf("remote-captcha: call #%d END error build_request elapsed=%s err=%v", attemptID, time.Since(started).Round(time.Millisecond), err)
