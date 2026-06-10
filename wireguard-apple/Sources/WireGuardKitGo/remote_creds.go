@@ -151,8 +151,19 @@ func setRemoteCooldown(d time.Duration) {
 // remoteCredsClient is dedicated to /cred calls. Its DialContext is
 // customDial so it benefits from DoH + fallback IPs when api.vk.com
 // is censored, but the actual target host is the user's own server.
+//
+// Timeout was 90 s originally ("server-side solve can take up to
+// 80 s"). Field log 1.3.36 (quota=1, N=10) showed the cost of being
+// patient when the server isn't actually replying: three concurrent
+// /cred calls held poolCreds's solveSlot semaphore (3 slots) for the
+// full 90 s, sessions 4…N starved on solveSlot acquire,
+// poolCreds's recycle-fallback never fired, and the user disconnected
+// after 84 s with 1/10 sessions up. 15 s is enough headroom for a
+// healthy server (typical p95 ~5 s) and short enough that a degraded
+// server surfaces in time for poolCreds to recycle the bootstrap
+// identity onto the remaining sessions.
 var remoteCredsClient = &http.Client{
-	Timeout: 90 * time.Second, // server-side solve can take up to 80 s; add slack.
+	Timeout: 15 * time.Second,
 	Transport: &http.Transport{
 		DialContext:         customDial,
 		MaxIdleConns:        20,
