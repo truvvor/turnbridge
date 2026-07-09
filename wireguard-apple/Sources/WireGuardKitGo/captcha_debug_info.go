@@ -80,14 +80,16 @@ func fetchDebugInfo(ctx context.Context, client tlsclient.HttpClient, profile Pr
 		return "", err
 	}
 	req = withCaptchaCtx(ctx, req)
-	req.Header.Set("User-Agent", profile.UserAgent)
 	req.Header.Set("Accept", "text/javascript,application/javascript,*/*;q=0.1")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("Referer", "https://id.vk.com/")
 	req.Header.Set("Sec-Fetch-Site", "same-site")
 	req.Header.Set("Sec-Fetch-Mode", "no-cors")
 	req.Header.Set("Sec-Fetch-Dest", "script")
-	applySafariHeaderOrder(req)
+	// Coherent desktop-Chrome identity — must match the auto-solver's
+	// other requests so VK sees one browser fetch the script then call
+	// the API.
+	applyCaptchaBrowserHeaders(req)
+	_ = profile
 
 	resp, err := client.Do(req)
 	if err != nil {

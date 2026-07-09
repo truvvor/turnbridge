@@ -16,6 +16,7 @@ import (
     "regexp"
     "strconv"
     "strings"
+    "sync"
     "time"
 
     fhttp "github.com/bogdanfinn/fhttp"
@@ -237,17 +238,15 @@ func fetchPowInput(ctx context.Context, client tlsclient.HttpClient, profile Pro
     }
     req = withCaptchaCtx(ctx, req)
 
-    req.Header.Set("User-Agent", profile.UserAgent)
     req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
-    req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-    // Safari iOS deliberately doesn't implement Client Hints — sending
-    // sec-ch-ua* from a Safari UA was itself a bot tell on the old
-    // net/http path. With Safari_IOS_18_0 fingerprint we mirror real
-    // Safari at every layer, so we drop these unconditionally.
     req.Header.Set("Sec-Fetch-Site", "none")
     req.Header.Set("Sec-Fetch-Mode", "navigate")
     req.Header.Set("Sec-Fetch-Dest", "document")
-    applySafariHeaderOrder(req)
+    // Coherent desktop-Chrome identity (UA + sec-ch-ua + header order).
+    // profile.UserAgent (iPhone) is deliberately NOT used here — see
+    // captcha_client.go for why the auto-solver presents Chrome.
+    applyCaptchaBrowserHeaders(req)
+    _ = profile
 
     resp, err := client.Do(req)
     if err != nil {
@@ -327,7 +326,11 @@ func solvePoW(powInput string, difficulty int) string {
 
 func callCaptchaNotRobot(ctx context.Context, client tlsclient.HttpClient, profile Profile, sessionToken, hash string, htmlSettings map[string]interface{}, isTunnel bool) (string, error) {
     vkReq := func(method string, postData string) (map[string]interface{}, error) {
-        requestURL := "https://api.vk.com/method/" + method + "?v=5.131"
+        // api.vk.ru, not api.vk.com: VK migrated to the .ru apex and
+        // the Moroka8 reference solver (which currently passes VK's
+        // classifier) targets .ru. The .com host appears to route
+        // through legacy/more-suspicious infra for captcha methods.
+        requestURL := "https://api.vk.ru/method/" + method + "?v=5.131"
 
         req, err := fhttp.NewRequest("POST", requestURL, strings.NewReader(postData))
         if err != nil {
@@ -335,19 +338,18 @@ func callCaptchaNotRobot(ctx context.Context, client tlsclient.HttpClient, profi
         }
         req = withCaptchaCtx(ctx, req)
 
-        req.Header.Set("User-Agent", profile.UserAgent)
         req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
         req.Header.Set("Accept", "*/*")
-        req.Header.Set("Accept-Language", "en-US,en;q=0.9")
         req.Header.Set("Origin", "https://id.vk.com")
         req.Header.Set("Referer", "https://id.vk.com/")
-        // No sec-ch-ua* — Safari doesn't send them; sending from a
-        // Safari fingerprint is itself a classifier tell.
         req.Header.Set("Sec-Fetch-Site", "same-site")
         req.Header.Set("Sec-Fetch-Mode", "cors")
         req.Header.Set("Sec-Fetch-Dest", "empty")
         req.Header.Set("Priority", "u=1, i")
-        applySafariHeaderOrder(req)
+        // Coherent desktop-Chrome UA + sec-ch-ua client hints. Chrome
+        // ALWAYS sends sec-ch-ua; omitting them under a Chrome UA is
+        // the tell, so we send them (unlike the old Safari path).
+        applyCaptchaBrowserHeaders(req)
 
         httpResp, err := client.Do(req)
         if err != nil {
@@ -383,9 +385,15 @@ func callCaptchaNotRobot(ctx context.Context, client tlsclient.HttpClient, profi
     // Step 2: componentDone
     log.Printf("[Captcha] Step 2/4: componentDone")
 
-    // crypto/rand-backed 32-hex-char browser fingerprint. The pre-v2
-    // version used math/rand which is seeded weakly and predictably.
-    browserFp := randomHex(16)
+    // STABLE browser fingerprint, reused across every solve in this
+    // process (see stableBrowserFp). VK correlates browser_fp against
+    // the stable TLS fingerprint + source IP: a fresh random fp on
+    // every call reads as "N scripted browsers behind one machine",
+    // whereas one consistent fp reads as "a single returning user".
+    // Moroka8 persists this to disk (vk_profile.json); we keep it
+    // process-stable, which already kills the per-call churn that was
+    // the bot tell.
+    browserFp := stableBrowserFp()
 
     // v2 device shape: 11 fixed fields matching what a real desktop
     // browser reports through navigator.* probes. The pre-v2 version
@@ -548,9 +556,18 @@ func callCaptchaNotRobot(ctx context.Context, client tlsclient.HttpClient, profi
     return sliderToken, nil
 }
 
-func buildCaptchaDeviceJSON(profile Profile) string {
-    return fmt.Sprintf(
-        `{"screenWidth":1920,"screenHeight":1080,"screenAvailWidth":1920,"screenAvailHeight":1040,"innerWidth":1920,"innerHeight":969,"devicePixelRatio":1,"language":"en-US","languages":["en-US"],"webdriver":false,"hardwareConcurrency":8,"deviceMemory":8,"connectionEffectiveType":"4g","notificationsPermission":"default","userAgent":"%s","platform":"Win32"}`,
-        profile.UserAgent,
-    )
+// stableBrowserFp returns a 32-hex-char browser fingerprint that is
+// generated once and reused for the lifetime of the process. See the
+// call site for the anti-correlation rationale. sync.Once guards the
+// crypto/rand generation so concurrent solves share one value.
+var (
+    stableBrowserFpValue string
+    stableBrowserFpOnce  sync.Once
+)
+
+func stableBrowserFp() string {
+    stableBrowserFpOnce.Do(func() {
+        stableBrowserFpValue = randomHex(16)
+    })
+    return stableBrowserFpValue
 }
