@@ -343,6 +343,20 @@ func getCredsRemote(ctx context.Context, link string) (string, string, string, e
 // burning 90 s timeouts on each session-spawn while the cluster
 // recovers.
 func getCredsRouted(ctx context.Context, link string) (string, string, string, error) {
+	// Captcha-FREE fast path first (VK Calls / VK Connect via api.vk.me).
+	// It mints an equivalent anon call token without VK's captcha gate,
+	// so when it works we never touch the solver stack at all. On ANY
+	// error it falls through to the existing remote/local captcha flow
+	// below — worst case is unchanged behaviour. See creds_vkcalls.go.
+	if vkCallsBypassEnabled() {
+		u, p, a, err := getCredsViaVKCalls(ctx, link)
+		if err == nil {
+			log.Printf("vkcalls: cred via captcha-free path (no solver needed)")
+			return u, p, a, nil
+		}
+		log.Printf("vkcalls: captcha-free path failed (%v) — falling back to captcha flow", err)
+	}
+
 	useRemote := remoteCaptchaEnabled() && captchaSessionsReady.Load() >= int64(remoteHandoverThreshold)
 	if useRemote && !remoteInCooldown() {
 		u, p, a, err := getCredsRemote(ctx, link)

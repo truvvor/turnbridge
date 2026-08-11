@@ -64,7 +64,12 @@ func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
     code := int(codeFloat)
 
     redirectUri, _ := errData["redirect_uri"].(string)
-    captchaSid, _ := errData["captcha_sid"].(string)
+    // captcha_sid: VK returns it as a string on the SmartCaptcha
+    // redirect flow but as a JSON number on some legacy/image-captcha
+    // responses. Reading it as string-only silently yielded "" for the
+    // numeric form, which then broke the captcha_sid retry-URL param.
+    // vkFlexStr handles both. (Robustness from Moroka8@c95a9e3.)
+    captchaSid := vkFlexStr(errData["captcha_sid"])
     captchaImg, _ := errData["captcha_img"].(string)
     errorMsg, _ := errData["error_msg"].(string)
 
@@ -106,6 +111,22 @@ func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
 
 func (e *VkCaptchaError) IsCaptchaError() bool {
     return e.ErrorCode == 14 && e.RedirectUri != "" && e.SessionToken != ""
+}
+
+// vkFlexStr coerces a VK JSON field to a string whether VK sent it as
+// a string or a number (VK is inconsistent per method/version). Empty
+// string for anything else.
+func vkFlexStr(v interface{}) string {
+    switch t := v.(type) {
+    case string:
+        return t
+    case float64:
+        return fmt.Sprintf("%.0f", t)
+    case json.Number:
+        return t.String()
+    default:
+        return ""
+    }
 }
 
 // solveVkCaptcha returns either a success_token (legacy path: caller
