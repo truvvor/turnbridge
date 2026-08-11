@@ -32,6 +32,8 @@ import (
     "unsafe"
     "strings"
 
+    "github.com/amnezia-vpn/amneziawg-apple/internal/wrap"
+    "github.com/amnezia-vpn/amneziawg-apple/sessionproto"
     "github.com/google/uuid"
     "github.com/pion/dtls/v3"
     "github.com/pion/dtls/v3/pkg/crypto/selfsign"
@@ -401,6 +403,19 @@ type dtlsBootstrap struct {
 	conn2     net.PacketConn
 	turnReady chan struct{}
 	once      *sync.Once
+	// relayWrap is the StatefulConn wrapping the current TURN relay
+	// conn. oneTurnConnection creates and stores it (per relay
+	// (re)connect) before signalReady; oneDtlsConnection loads it after
+	// the WRAP handshake to Enable the negotiated cipher on the initial
+	// connect. Shared pointer so both goroutines see the same slot.
+	relayWrap *atomic.Pointer[wrap.StatefulConn]
+	// wrapCipher holds the negotiated sessionproto.WrapCipher enum once
+	// oneDtlsConnection completes the handshake (0 = pending, before
+	// negotiation). On relay reconnect the DTLS/mu session persists
+	// (DTLS Connection ID), so oneTurnConnection re-derives and
+	// re-enables the cipher on its fresh relay StatefulConn from this
+	// value instead of waiting for a fresh (never-sent) hello.
+	wrapCipher *atomic.Int32
 }
 
 func (b dtlsBootstrap) signalReady() {
@@ -440,9 +455,11 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
     // closed-channel that both pipeConns select on.
     defer conn1.Close()
     bootstrap := dtlsBootstrap{
-        conn2:     conn2,
-        turnReady: make(chan struct{}),
-        once:      &sync.Once{},
+        conn2:      conn2,
+        turnReady:  make(chan struct{}),
+        once:       &sync.Once{},
+        relayWrap:  &atomic.Pointer[wrap.StatefulConn]{},
+        wrapCipher: &atomic.Int32{},
     }
     go func() {
         for {
@@ -484,28 +501,43 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
     }()
     log.Printf("Established DTLS connection!\n")
 
-    // Stream-Aggregation preamble: if enabled, write the 17-byte
-    // [sessionID, streamID] header BEFORE WireGuard packets start
-    // flowing through dtlsConn. The receiver-side aggregator
-    // (kiper292/vk-turn-proxy fork on the WG server's box) reads
-    // this once per stream and fuses every stream sharing the same
-    // session ID into a single endpoint for WG, stopping the WG
-    // server from endpoint-thrashing when N parallel TURN
-    // allocations deliver packets from N distinct VK relay ports.
-    // Without the flag set (default), nothing is written and the
-    // stream looks exactly like our pre-aggregation transport.
-    if streamAggIsEnabled() {
-        sid, ok := currentStreamAggSession()
-        if ok {
-            preamble := make([]byte, 17)
-            copy(preamble[:16], sid[:])
-            preamble[16] = byte(streamID)
-            if _, werr := dtlsConn.Write(preamble); werr != nil {
-                log.Printf("stream-agg: preamble write failed on stream %d: %s", streamID, werr)
-                err = fmt.Errorf("stream-agg preamble: %s", werr)
-                return
+    // WINGS-N in-band WRAP negotiation (see wrap_handshake.go). The mu
+    // SESSION ClientHello is the FIRST DTLS application-data record on
+    // this stream; the server replies with a ServerHello selecting the
+    // WRAP cipher, after which we enable it on the relay. The hello's
+    // session_id + stream_id also carry what the old 17-byte
+    // stream-agg preamble used to: streams sharing a session_id are
+    // fused server-side, so this call replaces the preamble entirely.
+    //
+    // session_id: reuse the stream-agg session when aggregation is on
+    // (so N streams form one mu session, one WG endpoint); otherwise a
+    // fresh per-stream 16-byte id (independent sessions, matching the
+    // pre-aggregation behaviour).
+    {
+        var sid []byte
+        if s, ok := currentStreamAggSession(); ok {
+            sid = append([]byte(nil), s[:]...)
+        } else {
+            id := uuid.New()
+            sid = id[:]
+        }
+        cipher, selected, herr := negotiateWrap(dtlsConn, sid, streamID, currentWrapKey())
+        if herr != nil {
+            err = fmt.Errorf("wrap handshake (stream %d): %w", streamID, herr)
+            return
+        }
+        // Publish the selection so oneTurnConnection can re-enable WRAP
+        // on relay reconnect (the mu session persists via DTLS CID).
+        bootstrap.wrapCipher.Store(int32(selected))
+        if cipher != nil {
+            if sc := bootstrap.relayWrap.Load(); sc != nil {
+                sc.Enable(cipher)
+                log.Printf("stream %d: WRAP enabled in-band (cipher=%s, sessionID=%x)", streamID, selected, sid[:4])
+            } else {
+                // Should not happen: oneTurnConnection stores the sc
+                // before signalReady, which gates this handshake.
+                log.Printf("stream %d: WRAP negotiated (%s) but relay wrap conn missing", streamID, selected)
             }
-            log.Printf("stream-agg: stream %d preamble sent (sessionID=%x)", streamID, sid[:4])
         }
     }
 
@@ -899,23 +931,30 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 			log.Printf("Failed to set upstream deadline: %s", err)
 		}
 	})
-	// SRTP/Opus mimicry layer (see wrap.go). Built per session
-	// because each wrapConn has its own random SSRC/sessionID/counter
-	// init — if all sessions shared a wrapConn, the SSRC + monotonic
-	// seq would tag every TURN allocation as "the same call leg",
-	// which is a coarser fingerprint than what real VK call traffic
-	// looks like. nil wrap = bypass and use the legacy direct
-	// conn2↔relayConn path; the key takes effect on the NEXT
-	// allocation after the user changes it, not on already-live
-	// ones (mid-stream AEAD key rotation isn't worth the complexity).
-	var wrap *wrapConn
-	if key := currentWrapKey(); key != nil {
-		if w, werr := newWrapConn(key, false); werr != nil {
-			log.Printf("wrap: session disabled — newWrapConn: %v", werr)
-		} else {
-			wrap = w
+	// SRTP/Opus mimicry via a StatefulConn wrapping the TURN relay
+	// (internal/wrap, the same code the server runs — identical wire
+	// bytes, no format-mismatch risk). It starts in PASS-THROUGH so the
+	// DTLS ClientHello/ServerHello handshake records flow unwrapped;
+	// oneDtlsConnection calls sc.Enable() with the negotiated cipher
+	// once the handshake completes (see wrap_handshake.go). On relay
+	// reconnect the mu session persists (DTLS Connection ID), so
+	// re-derive and re-enable the already-negotiated cipher here from
+	// the shared selection rather than waiting for a fresh hello. The
+	// cipher carries its own random SSRC/sessionID/counter per conn, so
+	// each relay flow looks like a distinct call leg.
+	sc := wrap.NewStateful(relayConn)
+	if c := sessionproto.WrapCipher(bootstrap.wrapCipher.Load()); c == sessionproto.WrapCipher_WRAP_CIPHER_SRTP_CHACHA20_POLY1305 ||
+		c == sessionproto.WrapCipher_WRAP_CIPHER_SRTP_AES_256_GCM {
+		if key := currentWrapKey(); key != nil {
+			if cipher, cerr := wrap.New(c, key, false); cerr != nil {
+				log.Printf("wrap: reconnect re-enable failed: %v", cerr)
+			} else if cipher != nil {
+				sc.Enable(cipher)
+				log.Printf("wrap: re-enabled on relay reconnect (cipher=%s)", c)
+			}
 		}
 	}
+	bootstrap.relayWrap.Store(sc)
 
 	var addr atomic.Value
 	// Start read-loop on conn2 (output of DTLS)
@@ -924,14 +963,6 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 		defer turncancel()
 		buf := borrowReadBuf()
 		defer returnReadBuf(buf)
-		// wireBuf carries the wrapped (SRTP-shaped) bytes when wrap
-		// is on. +wrapOverhead headroom over the DTLS payload max.
-		// Allocated once per goroutine — borrowing from readBufPool
-		// won't help because the pool's slices are exactly 1600.
-		var wireBuf []byte
-		if wrap != nil {
-			wireBuf = make([]byte, len(buf)+wrapOverhead)
-		}
 		for {
 			select {
 			case <-turnctx.Done():
@@ -946,17 +977,9 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 
 			addr.Store(addr1) // store peer
 
-			out := buf[:n]
-			if wrap != nil {
-				wn, werr := wrap.wrapInto(wireBuf, buf[:n])
-				if werr != nil {
-					log.Printf("wrap: wrapInto failed: %v", werr)
-					return
-				}
-				out = wireBuf[:wn]
-			}
-
-			_, err1 = relayConn.WriteTo(out, peer)
+			// sc seals into the SRTP-mimicry frame when WRAP is enabled,
+			// and passes bytes through verbatim before/without it.
+			_, err1 = sc.WriteTo(buf[:n], peer)
 			if err1 != nil {
 				// "write: no buffer space available" is a transient kernel
 				// signal during throughput spikes (e.g. Speedtest pushing
@@ -978,25 +1001,24 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 		}
 	}()
 
-	// Start read-loop on relayConn
+	// Start read-loop on the relay StatefulConn
 	go func() {
 		defer wg.Done()
 		defer turncancel()
 		buf := borrowReadBuf()
 		defer returnReadBuf(buf)
-		// plainBuf carries the unwrapped DTLS bytes when wrap is on.
-		// Unwrapped is always smaller than wrapped, so 1600 is plenty.
-		var plainBuf []byte
-		if wrap != nil {
-			plainBuf = make([]byte, len(buf))
-		}
 		for {
 			select {
 			case <-turnctx.Done():
 				return
 			default:
 			}
-			n, _, err1 := relayConn.ReadFrom(buf)
+			// sc.ReadFrom auto-detects per packet: SRTP-shaped frames
+			// (first byte 0x80) are opened with the enabled cipher;
+			// raw DTLS records (0x14..0x1A) pass through. A packet that
+			// fails AEAD open is dropped inside ReadFrom, so a stray
+			// unwrapped packet at bring-up never tears down the session.
+			n, _, err1 := sc.ReadFrom(buf)
 			if err1 != nil {
 				log.Printf("Failed: %s", err1)
 				return
@@ -1007,23 +1029,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 				return
 			}
 
-			out := buf[:n]
-			if wrap != nil {
-				un, werr := wrap.unwrapPacket(buf[:n], plainBuf)
-				if werr != nil {
-					// AEAD failure here means the peer end didn't
-					// wrap (server-side wrap not configured / wrong
-					// key) — drop the packet rather than tear down
-					// the whole session, since a stray non-wrapped
-					// packet on a wrap-enabled session is a real
-					// possibility right at session bring-up.
-					log.Printf("wrap: unwrap dropped: %v", werr)
-					continue
-				}
-				out = plainBuf[:un]
-			}
-
-			_, err1 = conn2.WriteTo(out, addr1)
+			_, err1 = conn2.WriteTo(buf[:n], addr1)
 			if err1 != nil {
 				if strings.Contains(err1.Error(), "no buffer space available") {
 					continue
