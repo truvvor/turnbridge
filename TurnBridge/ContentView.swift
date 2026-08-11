@@ -38,18 +38,6 @@ struct ContentView: View {
                     Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")")
                         .font(.system(size: 14, weight: .medium, design: .rounded))
                         .foregroundColor(.secondary)
-
-                    Text("Станислав Кузнецов суперзвезда")
-                        .font(.system(size: 15, weight: .semibold, design: .rounded))
-                        .foregroundStyle(
-                            LinearGradient(
-                                colors: [.pink, .orange],
-                                startPoint: .leading,
-                                endPoint: .trailing
-                            )
-                        )
-                        .multilineTextAlignment(.center)
-                        .padding(.top, 6)
                 }
                 .padding(.top, 30)
 
