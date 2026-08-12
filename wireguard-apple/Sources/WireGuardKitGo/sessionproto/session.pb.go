@@ -1129,7 +1129,7 @@ const file_proto_session_proto_rawDesc = "" +
 	"\"WRAP_CIPHER_SRTP_CHACHA20_POLY1305\x10\x03*J\n" +
 	"\fRoomProvider\x12\x1d\n" +
 	"\x19ROOM_PROVIDER_UNSPECIFIED\x10\x00\x12\x1b\n" +
-	"\x17ROOM_PROVIDER_WB_STREAM\x10\x01B=Z;github.com/amnezia-vpn/amneziawg-apple/sessionproto;sessionprotob\x06proto3"
+	"\x17ROOM_PROVIDER_WB_STREAM\x10\x01B=Z;github.com/cacggghp/vk-turn-proxy/sessionproto;sessionprotob\x06proto3"
 
 var (
 	file_proto_session_proto_rawDescOnce sync.Once
