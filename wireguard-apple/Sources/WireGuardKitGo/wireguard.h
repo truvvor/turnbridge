@@ -46,6 +46,22 @@ extern void TurnBridgeSubmitManualCaptchaToken(const char *request_id, const cha
 extern void TurnBridgeCancelManualCaptcha(const char *request_id, const char *reason);
 extern void TurnBridgeSetManualCaptchaMode(int enabled);
 
+/* Per-StartProxy cap on user-facing manual captcha prompts. Default 1
+ * (set in init()), clamped >=0 by the Go side. Set BEFORE StartProxy;
+ * the read inside requestManualCaptcha picks up the latest value but
+ * the counter resets only at StartProxy. */
+extern void TurnBridgeSetManualCaptchaQuota(int quota);
+
+/* VK browser-session state captured from the iOS WebView's
+ * WKWebsiteDataStore after a manual solve, forwarded to Go so that
+ * subsequent getCredsRemote calls can attach cookies + UA to the
+ * /cred POST. cookies_json is the raw JSON array of {name, value,
+ * domain, path}; user_agent is the full UA string used by the
+ * WebView. Either argument may be empty / NULL to clear the
+ * corresponding slot. Safe to call at any time; values are stored
+ * atomically and read on every remote call. */
+extern void TurnBridgeSetVKCookies(const char *cookies_json, const char *user_agent);
+
 /* Returns a JSON {"url":..., "body":...} describing the request the
  * WebView should make after extracting success_token, inside its own
  * browser session. Caller must free() the returned string. NULL when

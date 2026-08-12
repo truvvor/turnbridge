@@ -18,6 +18,12 @@ enum CaptchaIPC {
         /// the failing VK call inside its own session. See the
         /// matching field in TurnBridge/CaptchaIPC.swift.
         let responseJson: String?
+        /// New (1.3.40+): VK cookies + Safari iOS UA harvested from the
+        /// WebView's WKWebsiteDataStore. Forwarded to Go via
+        /// TurnBridgeSetVKCookies and attached to subsequent /cred
+        /// POSTs to the remote captcha-service.
+        let cookiesJson: String?
+        let userAgent: String?
     }
 
     /// Persistent payload the extension writes when it needs the app to solve a captcha.
@@ -102,6 +108,23 @@ enum CaptchaBridge {
 
         switch msg.type {
         case "captcha_answer":
+            // Forward the harvested VK cookies + UA to Go BEFORE the
+            // token/response is delivered. getCredsRemote pulls these
+            // from atomic storage on every /cred POST, so wiring them
+            // up first means the remote captcha-service has them
+            // available the next time it solves. Empty cookies are
+            // still set (resets any stale state from a previous solve
+            // session).
+            let cookiesJson = msg.cookiesJson ?? ""
+            let userAgent = msg.userAgent ?? ""
+            cookiesJson.withCString { cookiesC in
+                userAgent.withCString { uaC in
+                    TurnBridgeSetVKCookies(cookiesC, uaC)
+                }
+            }
+            if !cookiesJson.isEmpty {
+                SharedLogger.info("CaptchaBridge: forwarded VK cookies+UA to Go (\(cookiesJson.count) bytes JSON)", source: .tunnel)
+            }
             // Prefer the full JSON response (the WebView did the retry
             // itself, so getCreds can skip its own redemption call).
             // Fall through to the legacy token-only path when the

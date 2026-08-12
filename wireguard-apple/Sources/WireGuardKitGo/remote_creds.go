@@ -151,8 +151,19 @@ func setRemoteCooldown(d time.Duration) {
 // remoteCredsClient is dedicated to /cred calls. Its DialContext is
 // customDial so it benefits from DoH + fallback IPs when api.vk.com
 // is censored, but the actual target host is the user's own server.
+//
+// Timeout was 90 s originally ("server-side solve can take up to
+// 80 s"). Field log 1.3.36 (quota=1, N=10) showed the cost of being
+// patient when the server isn't actually replying: three concurrent
+// /cred calls held poolCreds's solveSlot semaphore (3 slots) for the
+// full 90 s, sessions 4…N starved on solveSlot acquire,
+// poolCreds's recycle-fallback never fired, and the user disconnected
+// after 84 s with 1/10 sessions up. 15 s is enough headroom for a
+// healthy server (typical p95 ~5 s) and short enough that a degraded
+// server surfaces in time for poolCreds to recycle the bootstrap
+// identity onto the remaining sessions.
 var remoteCredsClient = &http.Client{
-	Timeout: 90 * time.Second, // server-side solve can take up to 80 s; add slack.
+	Timeout: 15 * time.Second,
 	Transport: &http.Transport{
 		DialContext:         customDial,
 		MaxIdleConns:        20,
@@ -169,6 +180,41 @@ type remoteCredResponse struct {
 	Error     string    `json:"error,omitempty"`
 }
 
+// VK browser-session state forwarded from the iOS WebView's
+// WKWebsiteDataStore after the user's manual solve, via
+// TurnBridgeSetVKCookies. Both fields are atomic-loaded on every
+// /cred call so updates from a subsequent solve take effect
+// immediately, without restarting the tunnel.
+//
+// Without this, the remote captcha-service starts every solve from a
+// cold session: zero VK cookies, generic UA, easy BOT classification.
+// With the WebView's cookies + matching Safari UA, the server's
+// outgoing captcha request looks like a continuation of the human-
+// verified browser the user just used. Same trade-off the in-WebView
+// replay path uses on the client side — single coherent actor
+// instead of fingerprint switch.
+var (
+	vkCookiesJSON atomic.Value // string — raw JSON array of {name,value,domain,path}
+	vkUserAgent   atomic.Value // string — full UA, e.g. "Mozilla/5.0 ... Safari/604.1"
+)
+
+//export TurnBridgeSetVKCookies
+func TurnBridgeSetVKCookies(cCookiesJSON *C.char, cUserAgent *C.char) {
+	cookies := ""
+	if cCookiesJSON != nil {
+		cookies = C.GoString(cCookiesJSON)
+	}
+	ua := ""
+	if cUserAgent != nil {
+		ua = C.GoString(cUserAgent)
+	}
+	vkCookiesJSON.Store(cookies)
+	vkUserAgent.Store(ua)
+	if cookies != "" {
+		log.Printf("remote-captcha: stored VK cookies (%d bytes JSON) + UA for future /cred calls", len(cookies))
+	}
+}
+
 func getCredsRemote(ctx context.Context, link string) (string, string, string, error) {
 	url := remoteCaptchaURL()
 	apiKey := remoteCaptchaAPIKey()
@@ -176,13 +222,50 @@ func getCredsRemote(ctx context.Context, link string) (string, string, string, e
 		return "", "", "", errors.New("remote captcha not configured")
 	}
 
-	captchaRemoteAttempts.Add(1)
-	captchaRemoteInFlight.Add(1)
+	attemptID := captchaRemoteAttempts.Add(1)
+	inFlight := captchaRemoteInFlight.Add(1)
 	defer captchaRemoteInFlight.Add(-1)
+	started := time.Now()
+	// Field log 1.3.34 showed 3 defer-to-remote calls firing in the
+	// same second after the user's manual solve, then 50+ s of
+	// silence — no TURN allocate, no DTLS, no "deferred retry failed"
+	// log. The calls were stuck inside remoteCredsClient.Do (90 s
+	// HTTP timeout) without any indication to the operator. Log
+	// every remote call's start and end with duration + outcome so
+	// the next field log shows exactly whether the server is slow,
+	// erroring, or simply not reached. The shorter "deferred retry
+	// failed" line still fires from getCredsRouted on error; this is
+	// the per-call ground truth.
+	log.Printf("remote-captcha: call #%d START (in_flight=%d, url=%s)", attemptID, inFlight, url)
+	defer func() {
+		// elapsed captured at defer-time; success/error is inferred
+		// from the named return values, but we don't have access to
+		// those from a plain defer — instead the END log lives at
+		// each return path below, and this just covers the panic
+		// case (which shouldn't happen but is cheap insurance).
+		_ = started
+	}()
 
-	body, _ := json.Marshal(map[string]string{"link": link})
+	// Build the /cred POST body. The link is required; cookies + UA
+	// are attached opportunistically — when the WebView has shipped
+	// them, the server uses them to continue the browser session
+	// instead of opening a cold one. When they're missing (no manual
+	// solve happened yet, or it was cancelled), the server falls back
+	// to its own session-bootstrap path.
+	bodyMap := map[string]interface{}{"link": link}
+	if c, _ := vkCookiesJSON.Load().(string); c != "" {
+		var parsed []map[string]string
+		if jerr := json.Unmarshal([]byte(c), &parsed); jerr == nil && len(parsed) > 0 {
+			bodyMap["cookies"] = parsed
+		}
+	}
+	if ua, _ := vkUserAgent.Load().(string); ua != "" {
+		bodyMap["user_agent"] = ua
+	}
+	body, _ := json.Marshal(bodyMap)
 	req, err := http.NewRequestWithContext(ctx, "POST", strings.TrimRight(url, "/")+"/cred", bytes.NewReader(body))
 	if err != nil {
+		log.Printf("remote-captcha: call #%d END error build_request elapsed=%s err=%v", attemptID, time.Since(started).Round(time.Millisecond), err)
 		return "", "", "", fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -190,6 +273,7 @@ func getCredsRemote(ctx context.Context, link string) (string, string, string, e
 
 	httpResp, err := remoteCredsClient.Do(req)
 	if err != nil {
+		log.Printf("remote-captcha: call #%d END error transport elapsed=%s err=%v", attemptID, time.Since(started).Round(time.Millisecond), err)
 		return "", "", "", fmt.Errorf("call server: %w", err)
 	}
 	defer httpResp.Body.Close()
@@ -197,6 +281,8 @@ func getCredsRemote(ctx context.Context, link string) (string, string, string, e
 	rawBody, _ := io.ReadAll(httpResp.Body)
 	var resp remoteCredResponse
 	if jsonErr := json.Unmarshal(rawBody, &resp); jsonErr != nil {
+		log.Printf("remote-captcha: call #%d END error decode elapsed=%s status=%d body_len=%d err=%v",
+			attemptID, time.Since(started).Round(time.Millisecond), httpResp.StatusCode, len(rawBody), jsonErr)
 		return "", "", "", fmt.Errorf("decode server response (status=%d): %w", httpResp.StatusCode, jsonErr)
 	}
 	if httpResp.StatusCode == http.StatusTooManyRequests {
@@ -219,6 +305,8 @@ func getCredsRemote(ctx context.Context, link string) (string, string, string, e
 		if msg == "" {
 			msg = "all peers saturated"
 		}
+		log.Printf("remote-captcha: call #%d END saturated elapsed=%s status=429 cooldown=%v msg=%q",
+			attemptID, time.Since(started).Round(time.Millisecond), cooldown, msg)
 		return "", "", "", fmt.Errorf("server: %s", msg)
 	}
 	if httpResp.StatusCode != http.StatusOK {
@@ -226,12 +314,18 @@ func getCredsRemote(ctx context.Context, link string) (string, string, string, e
 		if msg == "" {
 			msg = fmt.Sprintf("HTTP %d", httpResp.StatusCode)
 		}
+		log.Printf("remote-captcha: call #%d END http_error elapsed=%s status=%d msg=%q",
+			attemptID, time.Since(started).Round(time.Millisecond), httpResp.StatusCode, msg)
 		return "", "", "", fmt.Errorf("server: %s", msg)
 	}
 	if resp.User == "" || resp.Pass == "" || resp.Addr == "" {
+		log.Printf("remote-captcha: call #%d END incomplete elapsed=%s user=%q pass=%q addr=%q",
+			attemptID, time.Since(started).Round(time.Millisecond), resp.User, resp.Pass, resp.Addr)
 		return "", "", "", fmt.Errorf("server returned incomplete creds")
 	}
 	captchaRemoteOK.Add(1)
+	log.Printf("remote-captcha: call #%d END ok elapsed=%s addr=%s",
+		attemptID, time.Since(started).Round(time.Millisecond), resp.Addr)
 	return resp.User, resp.Pass, resp.Addr, nil
 }
 
@@ -249,6 +343,20 @@ func getCredsRemote(ctx context.Context, link string) (string, string, string, e
 // burning 90 s timeouts on each session-spawn while the cluster
 // recovers.
 func getCredsRouted(ctx context.Context, link string) (string, string, string, error) {
+	// Captcha-FREE fast path first (VK Calls / VK Connect via api.vk.me).
+	// It mints an equivalent anon call token without VK's captcha gate,
+	// so when it works we never touch the solver stack at all. On ANY
+	// error it falls through to the existing remote/local captcha flow
+	// below — worst case is unchanged behaviour. See creds_vkcalls.go.
+	if vkCallsBypassEnabled() {
+		u, p, a, err := getCredsViaVKCalls(ctx, link)
+		if err == nil {
+			log.Printf("vkcalls: cred via captcha-free path (no solver needed)")
+			return u, p, a, nil
+		}
+		log.Printf("vkcalls: captcha-free path failed (%v) — falling back to captcha flow", err)
+	}
+
 	useRemote := remoteCaptchaEnabled() && captchaSessionsReady.Load() >= int64(remoteHandoverThreshold)
 	if useRemote && !remoteInCooldown() {
 		u, p, a, err := getCredsRemote(ctx, link)

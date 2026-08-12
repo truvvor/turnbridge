@@ -21,9 +21,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"regexp"
 	"sync"
 
@@ -49,6 +51,60 @@ var scriptURLRe = regexp.MustCompile(`<script[^>]+src="([^"]+not_robot_captcha\.
 // const, embedded in a larger string with || operators); the regex
 // tolerates both.
 var debugInfoRe = regexp.MustCompile(`debug_info\s*:\s*(?:[^"]*\|\|\s*)?"([a-fA-F0-9]{64})"`)
+
+// hex64Re matches a bare 64-hex-char literal — the windowed fallback
+// when the structured debug_info pattern misses because VK renamed the
+// `window.vk.X` wrapper between builds (script-format drift). Idea
+// ported from WINGS-N/vk-turn-proxy@cc712ba (via samosvalishe).
+var hex64Re = regexp.MustCompile(`"([a-fA-F0-9]{64})"`)
+
+// scriptVersionRe extracts the version segment from the script URL
+// (`/vkid/<version>/not_robot_captcha.js`) so we can log once per
+// distinct build and correlate a rise in BOT rejections with a VK
+// script push we can actually see in the field logs.
+var scriptVersionRe = regexp.MustCompile(`/vkid/([^/]+)/not_robot_captcha\.js`)
+
+// scriptVersionSeen dedupes the once-per-version drift log.
+var scriptVersionSeen sync.Map
+
+// warnScriptVersionDrift logs the observed not_robot_captcha.js version
+// once per distinct value. We have no single hard-coded "tested"
+// baseline (VK ships often), so instead of asserting against one we
+// surface every new version we see — if BOT rates climb, the log shows
+// which build shipped just before.
+func warnScriptVersionDrift(scriptURL string) {
+	m := scriptVersionRe.FindStringSubmatch(scriptURL)
+	if len(m) < 2 || m[1] == "" {
+		return
+	}
+	if _, seen := scriptVersionSeen.LoadOrStore(m[1], struct{}{}); seen {
+		return
+	}
+	log.Printf("[Captcha] not_robot_captcha.js version %s observed; wire unverified against this build — re-check if BOT rejections rise", m[1])
+}
+
+// extractDebugInfoHash pulls the 64-hex debug_info constant from the
+// script body. Primary: the structured debug_info regex. Fallback
+// (returns usedFallback=true): the first bare 64-hex literal within a
+// window right after the `debug_info` marker, for when VK's wrapper
+// name drifted and the structured pattern missed.
+func extractDebugInfoHash(body []byte) (hash string, usedFallback bool, err error) {
+	if m := debugInfoRe.FindSubmatch(body); len(m) >= 2 {
+		return string(m[1]), false, nil
+	}
+	idx := bytes.Index(body, []byte("debug_info"))
+	if idx < 0 {
+		return "", false, fmt.Errorf("debug_info marker not found in script")
+	}
+	end := idx + 400
+	if end > len(body) {
+		end = len(body)
+	}
+	if m := hex64Re.FindSubmatch(body[idx:end]); len(m) >= 2 {
+		return string(m[1]), true, nil
+	}
+	return "", false, fmt.Errorf("debug_info hash not found near marker")
+}
 
 // extractScriptURL finds the not_robot_captcha.js URL in the bootstrap
 // HTML. Returns "" if not present (typical when VK responds with a
@@ -80,14 +136,16 @@ func fetchDebugInfo(ctx context.Context, client tlsclient.HttpClient, profile Pr
 		return "", err
 	}
 	req = withCaptchaCtx(ctx, req)
-	req.Header.Set("User-Agent", profile.UserAgent)
 	req.Header.Set("Accept", "text/javascript,application/javascript,*/*;q=0.1")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	req.Header.Set("Referer", "https://id.vk.com/")
 	req.Header.Set("Sec-Fetch-Site", "same-site")
 	req.Header.Set("Sec-Fetch-Mode", "no-cors")
 	req.Header.Set("Sec-Fetch-Dest", "script")
-	applySafariHeaderOrder(req)
+	// Coherent desktop-Chrome identity — must match the auto-solver's
+	// other requests so VK sees one browser fetch the script then call
+	// the API.
+	applyCaptchaBrowserHeaders(req)
+	_ = profile
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -100,11 +158,15 @@ func fetchDebugInfo(ctx context.Context, client tlsclient.HttpClient, profile Pr
 		return "", fmt.Errorf("read script: %w", err)
 	}
 
-	m := debugInfoRe.FindSubmatch(body)
-	if len(m) < 2 {
-		return "", fmt.Errorf("debug_info constant not found in %s", scriptURL)
+	warnScriptVersionDrift(scriptURL)
+
+	di, usedFallback, err := extractDebugInfoHash(body)
+	if err != nil {
+		return "", fmt.Errorf("%w in %s", err, scriptURL)
 	}
-	di := string(m[1])
+	if usedFallback {
+		log.Printf("[Captcha] debug_info primary pattern missed; used windowed fallback (script-format drift) for %s", scriptURL)
+	}
 	debugInfoCache.Store(scriptURL, di)
 	return di, nil
 }

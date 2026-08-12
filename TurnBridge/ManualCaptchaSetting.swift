@@ -22,8 +22,37 @@ enum CaptchaMode: Int {
 
 enum ManualCaptchaSetting {
     static let key = "manualCaptchaMode"
+    static let quotaKey = "manualCaptchaQuota"
     private static let legacyBoolKey = "manualCaptcha"
     private static let suite = "group.com.truvvor.turnbridge"
+
+    /// Per-StartProxy cap on how many captcha sheets the user is willing
+    /// to solve in the WebView before everything else gets handed to the
+    /// remote captcha-service. 0 ⇒ never solve on the device (defer
+    /// immediately); 1 ⇒ bootstrap solve only, then offload (default
+    /// since 1.3.35 after the field report that VK refuses to mint a
+    /// second token on the same IP for ~1 min). Reads default to 1 when
+    /// unset so upgrades from older builds don't silently regress.
+    /// Mirrored to Go via TurnBridgeSetManualCaptchaQuota at tunnel
+    /// start; updates during a live tunnel don't take effect until the
+    /// next reconnect.
+    static let quotaDefault: Int = 1
+    static let quotaRange: ClosedRange<Int> = 0...10
+
+    static var quota: Int {
+        get {
+            let d = UserDefaults(suiteName: suite)
+            // object(forKey:) so we can distinguish "unset" from "0".
+            if let raw = d?.object(forKey: quotaKey) as? Int {
+                return max(quotaRange.lowerBound, min(quotaRange.upperBound, raw))
+            }
+            return quotaDefault
+        }
+        set {
+            let clamped = max(quotaRange.lowerBound, min(quotaRange.upperBound, newValue))
+            UserDefaults(suiteName: suite)?.set(clamped, forKey: quotaKey)
+        }
+    }
 
     static var mode: CaptchaMode {
         get {

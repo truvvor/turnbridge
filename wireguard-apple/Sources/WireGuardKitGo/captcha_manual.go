@@ -53,20 +53,41 @@ type manualCaptchaSlot struct {
 }
 
 // manualCaptchaQuotaPerSession bounds how many times the iOS UI may
-// be prompted within a single StartProxy session. The user's
-// expectation, restated 1.3.28: solve at most 3 captchas yourself,
-// after that the remote captcha-service cluster picks up.
+// be prompted within a single StartProxy session. User-configurable
+// via Settings (TurnBridgeSetManualCaptchaQuota); default 1 since
+// 1.3.35 — after the bootstrap solve, everything else routes to the
+// remote captcha-service cluster.
+//
+// Why atomic var instead of const: the value is set from Swift at
+// tunnel start (PacketTunnelProvider → TurnBridgeSetManualCaptchaQuota)
+// so each connect picks up whatever the user last picked in Settings,
+// without rebuilding the binary. Stored as atomic so the read in
+// manualCaptchaQuotaRemaining doesn't need to lock manualCaptchaMu.
 //
 // Once the quota is exhausted, manualCaptchaForcedMode /
 // manualCaptchaFallbackAvailable return false for the remainder of
 // the session and getCreds returns "quota exhausted"; the
 // per-session goroutine then either picks up creds from a recycled
 // identity OR (with the lowered remoteHandoverThreshold) gets routed
-// to the remote service. Quota resets on the next StartProxy via the
-// counter being reset there.
-const manualCaptchaQuotaPerSession = 3
+// to the remote service. Quota counter resets on the next StartProxy
+// via the counter being reset there.
+const manualCaptchaQuotaDefault = 1
 
+var manualCaptchaQuotaPerSession atomic.Int64
 var manualCaptchaInvocations atomic.Int64
+
+func init() {
+	manualCaptchaQuotaPerSession.Store(manualCaptchaQuotaDefault)
+}
+
+//export TurnBridgeSetManualCaptchaQuota
+func TurnBridgeSetManualCaptchaQuota(quota C.int) {
+	q := int64(quota)
+	if q < 0 {
+		q = 0
+	}
+	manualCaptchaQuotaPerSession.Store(q)
+}
 
 // manualCaptchaLastSolveUnix records when the last manual solve
 // SUCCEEDED. VK rate-limits NotRobot success per source IP: once one
@@ -90,7 +111,7 @@ func resetManualCaptchaQuota() {
 
 func manualCaptchaQuotaRemaining() int64 {
 	used := manualCaptchaInvocations.Load()
-	rem := int64(manualCaptchaQuotaPerSession) - used
+	rem := manualCaptchaQuotaPerSession.Load() - used
 	if rem < 0 {
 		return 0
 	}
@@ -335,8 +356,9 @@ func requestManualCaptcha(redirectURI, retryURL, retryBody string, timeout time.
 	// to acquire the lock actually run. The remaining 55 would
 	// have already burned a slot. With this ordering, only as
 	// many slots are spent as sheets are actually shown.
+	quota := manualCaptchaQuotaPerSession.Load()
 	used := manualCaptchaInvocations.Add(1)
-	if used > int64(manualCaptchaQuotaPerSession) {
+	if used > quota {
 		manualCaptchaInvocations.Add(-1)
 		// User's hard ask: never see more than N sheets per
 		// StartProxy. If the remote captcha-service is available
@@ -344,12 +366,12 @@ func requestManualCaptcha(redirectURI, retryURL, retryBody string, timeout time.
 		// instead of returning a hard error (which would cascade
 		// into auto-solver attempts that fail at slider step).
 		if shouldDeferToRemoteNow() {
-			log.Printf("[Captcha] manual quota exhausted (%d/%d), deferring to remote", used-1, manualCaptchaQuotaPerSession)
+			log.Printf("[Captcha] manual quota exhausted (%d/%d), deferring to remote", used-1, quota)
 			return "", "", errDeferToRemote
 		}
-		return "", "", fmt.Errorf("manual captcha quota exhausted (%d/%d)", used-1, manualCaptchaQuotaPerSession)
+		return "", "", fmt.Errorf("manual captcha quota exhausted (%d/%d)", used-1, quota)
 	}
-	log.Printf("[Captcha] manual prompt %d/%d this session", used, manualCaptchaQuotaPerSession)
+	log.Printf("[Captcha] manual prompt %d/%d this session", used, quota)
 
 	reqID := randomHex(8)
 	slot := &manualCaptchaSlot{
@@ -374,6 +396,20 @@ func requestManualCaptcha(redirectURI, retryURL, retryBody string, timeout time.
 	defer C.free(unsafe.Pointer(cReqID))
 	defer C.free(unsafe.Pointer(cURI))
 
+	// Stats: every time control reaches here, the WebView sheet is
+	// genuinely about to render. Moving the counter from
+	// solveVkCaptcha's forced-manual branch (where it lived in 1.3.38)
+	// to right here is what fixes the "Direct 1/23" UI bug — the
+	// forced branch is re-entered on every getCreds call, but only
+	// calls that pass cooldown + quota + defer-to-remote gates
+	// actually result in a sheet on screen, and only those should
+	// count. captchaDirectInFlight is bumped so the badge shows the
+	// active sheet; the deferred decrement covers every return path
+	// (success/cancel/timeout/empty-token).
+	captchaDirectAttempts.Add(1)
+	captchaDirectInFlight.Add(1)
+	defer captchaDirectInFlight.Add(-1)
+
 	C.invoke_manual_captcha_cb(cb, cReqID, cURI)
 
 	select {
@@ -381,12 +417,18 @@ func requestManualCaptcha(redirectURI, retryURL, retryBody string, timeout time.
 		if resp == "" {
 			return "", "", fmt.Errorf("manual captcha returned empty response")
 		}
+		captchaDirectOK.Add(1)
+		captchaDirectFailStreak.Store(0)
+		captchaDirectSatAt.Store(0)
 		manualCaptchaLastSolveUnix.Store(time.Now().Unix())
 		return "", resp, nil
 	case t := <-slot.tokenCh:
 		if t == "" {
 			return "", "", fmt.Errorf("manual captcha returned empty token")
 		}
+		captchaDirectOK.Add(1)
+		captchaDirectFailStreak.Store(0)
+		captchaDirectSatAt.Store(0)
 		manualCaptchaLastSolveUnix.Store(time.Now().Unix())
 		return t, "", nil
 	case e := <-slot.errCh:
